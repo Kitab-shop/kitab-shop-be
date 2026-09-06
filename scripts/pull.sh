@@ -7,7 +7,7 @@
 # the unit covers the gap.
 #
 # Usage, on the server:
-#   cd /srv/kitab/kitab-shop-be && ./pull.sh
+#   cd /srv/kitab/kitab-shop-be && ./scripts/pull.sh
 #
 # ── Git credentials ────────────────────────────────────────────────────────
 # This script does NOT contain a token, and no token should ever be committed
@@ -39,7 +39,11 @@ ok()   { printf '    %s✓%s %s\n' "${GREEN}" "${RESET}" "$*"; }
 warn() { printf '    %s!%s %s\n' "${YELLOW}" "${RESET}" "$*"; }
 die()  { printf '\n%serror:%s %s\n' "${RED}" "${RESET}" "$*" >&2; exit 1; }
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolved as the PARENT of this script's directory: pull.sh lives in scripts/
+# but every path below — .env, node_modules, uploads, the git checkout itself —
+# is relative to the repo root, and the script must behave identically whether
+# it is invoked as ./scripts/pull.sh or by absolute path from a cron entry.
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE="${SERVICE:-kitab-api}"
 API_PORT="${API_PORT:-3000}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/kitab}"
