@@ -88,7 +88,7 @@ npm run test:smtp                   # Send a standalone SMTP diagnostic email
 npm run admin:upsert                # Create or update an admin user
 npm run db:backup                   # Create MongoDB backup archive
 npm run db:restore                  # Restore MongoDB backup archive
-npm run assets:static               # Fetch/static image assets
+npm run assets:static               # Verify uploads/static/ is complete
 ```
 
 There are also focused regression scripts for inventory, returns, shipping, Razorpay amount guard, coupons, refunds, and fulfillment in `package.json`.

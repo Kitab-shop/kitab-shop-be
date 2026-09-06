@@ -7,7 +7,8 @@ dotenv.config();
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
-// Images live on the VPS disk, not on Cloudinary. UPLOADS_DIR is absolute in
+// Images live on the VPS disk, served from the backend's own /uploads.
+// UPLOADS_DIR is absolute in
 // production (a mounted volume, kept out of the deploy directory so a redeploy
 // cannot wipe the catalogue) and defaults to ./uploads for local development.
 export const uploadsRoot = process.env.UPLOADS_DIR
@@ -19,7 +20,7 @@ export const uploadsRoot = process.env.UPLOADS_DIR
 export const uploadsPublicPath = "/uploads";
 
 // Every asset type gets its own subfolder. Keys are the folder names callers
-// pass to saveImageAsset; the historical Cloudinary names are accepted too so
+// pass to saveImageAsset; the historical folder names are accepted too so
 // that a caller missed during the migration still lands somewhere sensible.
 // The astro-* aliases predate the bookstore conversion and stay for
 // back-compat with any stored URLs; book-* are the current-era equivalents.

@@ -21,10 +21,9 @@ export const slugify = (value = "image") => {
 /**
  * Resize to webp and write under uploads/<folder>/.
  *
- * Returns `{ image, public_id }` — the same shape the Cloudinary version
- * returned, so call sites and schemas are unchanged. Both fields now hold the
- * relative path (`/uploads/products/x.webp`); `public_id` is kept only because
- * five schemas and the delete path already reference it by that name.
+ * Returns `{ image, public_id }`. Both fields hold the same relative path
+ * (`/uploads/products/x.webp`); `public_id` is a historical field name kept
+ * only because five schemas and the delete path already reference it.
  */
 export const saveImageAsset = async ({
   file,
@@ -58,8 +57,8 @@ export const saveImageAsset = async ({
 
 /**
  * Delete a stored asset. Accepts the relative path written by saveImageAsset;
- * a leftover Cloudinary public_id from before the migration has no local file
- * and is ignored rather than treated as an error.
+ * a legacy value from before images moved to local disk resolves to no file on
+ * disk and is ignored rather than treated as an error.
  */
 export const deleteImageAsset = async (storedPath) => {
   const absolutePath = resolveStoragePath(storedPath);
