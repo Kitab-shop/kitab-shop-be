@@ -53,6 +53,10 @@ export const mailConfig = () => {
     pass,
     from,
     fromName: str(process.env.SMTP_FROM_NAME, "Rivermoss Books"),
+    // Where customer replies land. Split from the sender on purpose: mail goes
+    // out from the brand address, while "reply" reaches the inbox a human
+    // actually watches. Defaults to the sender when unset.
+    replyTo: str(process.env.SMTP_REPLY_TO) || from,
     configured: Boolean(user && pass),
   };
 };
@@ -86,6 +90,7 @@ const gmailFallbackConfig = () => {
     // an emergency path, or add DMARC only after doing so.
     from: primary.from || user,
     fromName: str(process.env.SMTP_FROM_NAME, "Rivermoss Books"),
+    replyTo: primary.replyTo || user,
     // The Gmail account address, used if Gmail refuses the From above.
     ownedFrom: user,
     configured: true,
@@ -126,7 +131,7 @@ const RETRYABLE = new Set([
 const deliver = async (config, { to, subject, html, text, replyTo }) =>
   transportFor(config).sendMail({
     from: `"${config.fromName}" <${config.from}>`,
-    replyTo: replyTo || config.from,
+    replyTo: replyTo || config.replyTo || config.from,
     to,
     subject,
     text,
