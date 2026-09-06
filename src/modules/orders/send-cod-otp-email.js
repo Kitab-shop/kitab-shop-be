@@ -1,4 +1,4 @@
-import nodemailer from "nodemailer";
+import { sendMail } from "../../utils/mailer.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -43,18 +43,7 @@ export const SendCodOtpEmail = async (email, otp) => {
   </body>
 </html>`;
 
-  const transporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    auth: {
-      user: process.env.EMAIL,
-      pass: process.env.EMAIL_PASSWORD,
-    },
-  });
-
-  await transporter.sendMail({
-    from: `"Kitab Shop" <${process.env.EMAIL}>`,
+  await sendMail({
     to: email,
     subject: "Your Cash on Delivery verification code",
     html,

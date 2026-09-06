@@ -14,6 +14,7 @@ import {
 } from "../notifications/notification.service.js";
 import {
   sendOrderCancelledEmail,
+  sendOrderPlacedEmail,
   sendOrderClosedEmail,
   sendOrderCompletedEmail,
 } from "../notifications/order-emails.js";
@@ -342,6 +343,12 @@ export const PlaceOrder = async (req, res) => {
 
     await syncOrderToShiprocketIfEnabled(order);
     await notifyOrderPlaced(order);
+
+    // The confirmation. Fire-and-forget, after the order is durable — a mail
+    // failure must not fail a placed order.
+    emailForOrder(order)
+      .then((email) => sendOrderPlacedEmail({ order, email }))
+      .catch(() => {});
 
     return res.status(201).json({
       success: true,

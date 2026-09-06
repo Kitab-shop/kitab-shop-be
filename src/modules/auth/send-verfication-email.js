@@ -1,4 +1,4 @@
-import nodemailer from "nodemailer";
+import { sendMail } from "../../utils/mailer.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -81,20 +81,7 @@ export const SendVerficationEmail = async (email, token, otp) => {
   </body>
 </html>`;
 
-    // Create transporter
-    const transporter = nodemailer.createTransport({
-      host: "smtp.gmail.com",
-      port: 465,
-      secure: true,
-      auth: {
-        user: process.env.EMAIL,
-        pass: process.env.EMAIL_PASSWORD,
-      },
-    });
-
-    // Send mail
-    await transporter.sendMail({
-      from: `"Kitab Shop" <${process.env.EMAIL}>`,
+    await sendMail({
       to: email,
       subject: "Verify Your Email",
       html,

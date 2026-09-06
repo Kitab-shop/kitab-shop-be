@@ -11,6 +11,8 @@ import {
   notifyPaymentSuccess,
 } from "../notifications/notification.service.js";
 import { orderError } from "../orders/order-pricing.service.js";
+import UserAuthModel from "../../model/User.model.js";
+import { sendOrderPlacedEmail } from "../notifications/order-emails.js";
 import {
   commitReservation,
   findActiveReservationForIntent,
@@ -262,6 +264,17 @@ export const completeCapturedIntent = async ({ intent, capturedPayment, signatur
   await syncOrderToShiprocketIfEnabled(storeOrder);
   await notifyPaymentSuccess(storeOrder);
   await notifyOrderPlaced(storeOrder);
+
+  // The confirmation. Fire-and-forget, and after the order is durable: a mail
+  // failure must never fail a payment that has already been captured. This is
+  // the single funnel for both Razorpay paths, so the browser flow and the
+  // webhook both send exactly one.
+  UserAuthModel.findById(storeOrder.user)
+    .select("email")
+    .lean()
+    .then((customer) => sendOrderPlacedEmail({ order: storeOrder, email: customer?.email }))
+    .catch(() => {});
+
   logLifecycleEvent("payment", "complete_captured_intent_finished", {
     intentId: intent?._id,
     paymentId: capturedPayment?.id,

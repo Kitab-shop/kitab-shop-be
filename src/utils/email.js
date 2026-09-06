@@ -1,21 +1,7 @@
-import nodemailer from "nodemailer";
-
-import dotenv from "dotenv";
-
-dotenv.config();
+import { sendMail } from "./mailer.js";
 // const html = emailTemplate.replace("{{verificationLink}}", verificationLink);
 export const SendEmail = async (email, token) => {
   try {
-    const transporter = nodemailer.createTransport({
-      host: "smtp.gmail.com", // ✅ SMTP config add kiya
-      port: 587,
-      secure: false,
-      auth: {
-        user: process.env.EMAIL,
-        pass: process.env.EMAIL_PASSWORD,
-      },
-    });
-
     // "/reset-password", NOT "/reset-password.html". The frontend is a single-page
     // React app whose route is `/reset-password` (App.jsx) — there is no
     // reset-password.html anywhere in the project, so every reset email sent so far
@@ -35,9 +21,7 @@ export const SendEmail = async (email, token) => {
     ).replace(/\/+$/, "");
     const resetLink = `${resetBase}?token=${encodeURIComponent(token)}`;
 
-    await transporter.sendMail({
-      from: `"Kitab Shop" <${process.env.EMAIL}>`,
-      replyTo: process.env.EMAIL,
+    await sendMail({
       to: email,
       subject: "Reset Your Password",
       text: `Reset Your Password\n\nWe received a request to reset your password. Click the link below to create a new password:\n\n${resetLink}\n\nIf you did not request this, please ignore this email.`,
