@@ -74,11 +74,20 @@ const gmailFallbackConfig = () => {
     secure: false,
     user,
     pass,
-    // Must be the Gmail address, not SMTP_FROM: Gmail rejects a From it does
-    // not own. The brand name is kept, so a fallback send is visibly from a
-    // different address — which is the point of it being noticeable.
-    from: user,
+    // Keeps SMTP_FROM — the domain address — rather than exposing the Gmail
+    // account, because that address is verified under "Send mail as" on this
+    // Gmail account and Gmail therefore permits it. Customers see the right
+    // sender even while the primary provider is down.
+    //
+    // NOTE ON DELIVERABILITY: the domain's SPF is `include:spf.titan.email`
+    // only, so a message sent this way does not SPF-align. It still delivers
+    // today because there is no DMARC policy. Add Google to the record —
+    // `include:_spf.google.com` — if this fallback is meant to be more than
+    // an emergency path, or add DMARC only after doing so.
+    from: primary.from || user,
     fromName: str(process.env.SMTP_FROM_NAME, "Rivermoss Books"),
+    // The Gmail account address, used if Gmail refuses the From above.
+    ownedFrom: user,
     configured: true,
   };
 };
@@ -149,8 +158,21 @@ export const sendMail = async (message) => {
     console.warn(
       `[mailer] ${primary.host} failed (${error.code} ${error.responseCode || ""}) — retrying via ${fallback.host}`,
     );
-    await deliver(fallback, message);
-    console.warn(`[mailer] delivered via fallback as ${fallback.from}`);
+
+    try {
+      await deliver(fallback, message);
+      console.warn(`[mailer] delivered via fallback as ${fallback.from}`);
+    } catch (fallbackError) {
+      // Gmail refuses a From it does not own, so an unverified "Send mail as"
+      // alias fails here. Retrying with the account's own address is better
+      // than sending nothing — a visibly wrong sender still beats silence.
+      if (fallback.from === fallback.ownedFrom) throw fallbackError;
+      console.warn(
+        `[mailer] ${fallback.host} refused From ${fallback.from} (${fallbackError.responseCode || fallbackError.code}) — resending as ${fallback.ownedFrom}`,
+      );
+      await deliver({ ...fallback, from: fallback.ownedFrom }, message);
+      console.warn(`[mailer] delivered via fallback as ${fallback.ownedFrom}`);
+    }
     return true;
   }
 };
