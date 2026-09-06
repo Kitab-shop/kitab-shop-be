@@ -38,7 +38,7 @@ referralSettingSchema.statics.getSettings = async function() {
   return this.findOneAndUpdate(
     { singletonId: "default" },
     { $setOnInsert: { singletonId: "default" } },
-    { upsert: true, new: true, setDefaultsOnInsert: true },
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
   );
 };
 

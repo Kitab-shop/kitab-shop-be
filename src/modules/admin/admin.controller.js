@@ -25,6 +25,11 @@ import {
   buildSalesReportData,
 } from "./admin-report.service.js";
 import { buildCodReconciliation } from "./cod-reconciliation.service.js";
+import { buildSeoFields } from "../products/product-seo.service.js";
+// The storefront catalogue is served from a cached, pre-serialised body; a bulk
+// write that skips this leaves the shop showing the old catalogue until the TTL
+// lapses. See GetAllProduct in products/product.controller.js.
+import { invalidateCatalogueCache } from "../products/product.controller.js";
 
 export const GetDashboard = async (req, res) => {
   try {
@@ -345,16 +350,35 @@ export const BulkImportProducts = async (req, res) => {
       if (!product.producthightlight) missing.push("producthightlight");
       if (!product.image) missing.push("image");
 
-      if (missing.length > 0) {
+      // Parity with CreateProduct, which refuses this outright. Without the same
+      // check here, bulk import was an open door to the exact bad data the
+      // single-product endpoint rejects: a selling price above the printed MRP,
+      // which makes the storefront's (mrp - price) / mrp discount badge negative
+      // and, in India, is not merely a presentation problem.
+      const priceAboveMrp =
+        Number.isFinite(product.price) &&
+        Number.isFinite(product.mrp) &&
+        product.price > product.mrp;
+
+      if (missing.length > 0 || priceAboveMrp) {
+        const notes = missing.map((field) => BULK_IMPORT_FIELD_HINTS[field] || field);
+        if (priceAboveMrp) {
+          notes.push(
+            `price (₹${product.price}) is above mrp (₹${product.mrp}) — MRP is the maximum retail price, so the selling price must be equal to or below it`,
+          );
+        }
         // +2: CSV rows are 1-indexed and row 1 is the header, so this matches
         // the row number an admin would count in their spreadsheet.
         errors.push({
           row: index + 2,
-          fields: missing,
-          message: missing.map((field) => BULK_IMPORT_FIELD_HINTS[field] || field).join("; "),
+          fields: [...new Set(priceAboveMrp ? [...missing, "price", "mrp"] : missing)],
+          message: notes.join("; "),
         });
       } else {
-        payload.push(product);
+        // Imported products get the same derived SEO fields a created one does.
+        // Without this they land with an empty slug, so the sitemap lists them
+        // less readably than anything added through the admin form.
+        payload.push({ ...product, ...buildSeoFields({ name: product.name }) });
       }
     });
 
@@ -378,6 +402,7 @@ export const BulkImportProducts = async (req, res) => {
       });
     }
 
+    invalidateCatalogueCache();
     await createAuditLog({
       admin: req.user?.id,
       action: "BULK_IMPORT_PRODUCTS",
@@ -452,14 +477,20 @@ export const BulkUpdateProducts = async (req, res) => {
     const targetIds = updates
       .map((item) => item.productId || item._id || item.id)
       .filter((id) => mongoose.Types.ObjectId.isValid(id));
+    // One read, not two: the stored price and mrp are needed as well, because a
+    // bulk row may set only one side of the pair and the guard has to compare
+    // what the product will actually be saved with.
+    const targets = await Product.find({ _id: { $in: targetIds } })
+      .select("_id price mrp variants")
+      .lean();
     const variantManaged = new Set(
-      (
-        await Product.find({ _id: { $in: targetIds }, "variants.0": { $exists: true } })
-          .select("_id")
-          .lean()
-      ).map((product) => String(product._id)),
+      targets
+        .filter((product) => (product.variants?.length || 0) > 0)
+        .map((product) => String(product._id)),
     );
+    const storedById = new Map(targets.map((product) => [String(product._id), product]));
     const stockSkipped = [];
+    const priceRejected = [];
 
     const operations = [];
     for (const item of updates) {
@@ -488,6 +519,24 @@ export const BulkUpdateProducts = async (req, res) => {
       }
       if (item.bestseller !== undefined) $set.bestseller = Boolean(item.bestseller);
 
+      // The same price <= mrp rule CreateProduct and UpdateProduct enforce, and
+      // for the same reason: selling above the printed MRP is not merely a
+      // negative discount badge. The case that matters is the ONE-SIDED row —
+      // raising price without mentioning mrp, or lowering mrp without mentioning
+      // price — so this compares the values the product will end up with, not
+      // just the two numbers that happened to be in the row.
+      const stored = storedById.get(String(productId));
+      const nextPrice = $set.price !== undefined ? $set.price : Number(stored?.price);
+      const nextMrp = $set.mrp !== undefined ? $set.mrp : Number(stored?.mrp);
+      if (Number.isFinite(nextPrice) && Number.isFinite(nextMrp) && nextPrice > nextMrp) {
+        // Reported, not silently dropped — and the whole pricing pair is backed
+        // out rather than half-applied, which would leave the product in exactly
+        // the state being refused.
+        priceRejected.push({ productId: String(productId), price: nextPrice, mrp: nextMrp });
+        delete $set.price;
+        delete $set.mrp;
+      }
+
       if (Object.keys($set).length > 0) {
         operations.push({
           updateOne: {
@@ -499,10 +548,18 @@ export const BulkUpdateProducts = async (req, res) => {
     }
 
     if (operations.length === 0) {
-      return res.status(400).json({ success: false, message: "No valid updates provided" });
+      return res.status(400).json({
+        success: false,
+        message:
+          priceRejected.length > 0
+            ? "No updates were applied: every row asked for a price above its MRP."
+            : "No valid updates provided",
+        ...(priceRejected.length > 0 ? { priceRejected } : {}),
+      });
     }
 
     const result = await Product.bulkWrite(operations);
+    invalidateCatalogueCache();
     await createAuditLog({
       admin: req.user?.id,
       action: "BULK_UPDATE_PRODUCTS",
@@ -520,6 +577,13 @@ export const BulkUpdateProducts = async (req, res) => {
         ? {
             stockSkipped,
             stockSkippedReason: VARIANT_MANAGED_STOCK_MESSAGE,
+          }
+        : {}),
+      ...(priceRejected.length > 0
+        ? {
+            priceRejected,
+            priceRejectedReason:
+              "Price cannot be greater than MRP. These rows kept their existing price and MRP; every other field in them was still applied.",
           }
         : {}),
     });

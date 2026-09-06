@@ -251,37 +251,96 @@ export const resolvePackage = async (overrides = {}) => {
   };
 };
 
+/** Grams / tenths of a millimetre are the useful precision; the rest is float noise. */
+const round3 = (value) => Math.round(value * 1000) / 1000;
+
+/** The industry-standard divisor. ARAMEX uses 6000, FedEx Surface 4500. */
+export const VOLUMETRIC_DIVISOR = 5000;
+
+/**
+ * Volumetric (dimensional) weight of a box, in kg.
+ *
+ * Couriers bill on APPLIED weight — the greater of what a parcel actually weighs
+ * and what its size says it should weigh — so a light book in an oversized box is
+ * charged as though it were heavy. Shiprocket applies this itself from the
+ * dimensions we send it, which is why the fix for accurate billing is accurate
+ * measurements rather than any adjustment on our side. This is exported so the
+ * admin panel can SHOW what a product's box will be billed as, instead of an
+ * admin discovering it in a passbook entry a week later.
+ */
+export const volumetricWeightKg = ({ length, breadth, height } = {}, divisor = VOLUMETRIC_DIVISOR) => {
+  const l = Number(length);
+  const b = Number(breadth);
+  const h = Number(height);
+  const d = Number(divisor);
+  if (![l, b, h, d].every((n) => Number.isFinite(n) && n > 0)) return 0;
+  return round3((l * b * h) / d);
+};
+
+/** What the courier will actually charge for: the greater of the two. */
+export const appliedWeightKg = (packageDetails = {}, divisor = VOLUMETRIC_DIVISOR) =>
+  Math.max(Number(packageDetails.weight) || 0, volumetricWeightKg(packageDetails, divisor));
+
 // Auto-computed from the products actually in the order (weight/length/
-// breadth/height set on Product.model.js). Only fields with real product
-// data are returned — resolvePackage() falls back to the admin-configured
-// (or .env) default for anything left out, e.g. an order containing a
-// product nobody has set a weight/size for yet.
+// breadth/height set on Product.model.js).
+//
+// `defaults` is the admin/env-configured package, and it now stands in PER UNIT
+// for any product with no measurement of its own. The substitution used to be
+// all-or-nothing: a field was omitted only when NO item in the order carried
+// data, leaving resolvePackage() to supply the default. So in a mixed order —
+// one book measured, one not — the total was returned as-is and the unmeasured
+// book contributed NOTHING. A two-book parcel shipped declared at one book's
+// weight. Shiprocket weighs it at pickup, bills the heavier slab and raises an
+// excess-weight charge, and the declaration being ours is what loses the
+// dispute. Under-declaring costs money on every shipment it touches, so
+// substituting the store default for the missing unit is the safe direction.
+//
 // Dimensions aren't truly additive (that's a 3D bin-packing problem), so this
 // uses a simple, deliberately conservative approximation: the widest single
 // item's footprint (length/breadth), with items assumed stacked on top of
 // each other for height. Good enough for courier booking; not exact packing.
-export const computeOrderPackage = (order) => {
+export const computeOrderPackage = (order, defaults = {}) => {
+  const substitute = {
+    weight: Math.max(Number(defaults.defaultWeightKg) || 0, 0),
+    length: Math.max(Number(defaults.defaultLengthCm) || 0, 0),
+    breadth: Math.max(Number(defaults.defaultBreadthCm) || 0, 0),
+    height: Math.max(Number(defaults.defaultHeightCm) || 0, 0),
+  };
+  // A product's own figure when it has one, the store default when it does not.
+  const measure = (value, fallback) => (Number(value) > 0 ? Number(value) : fallback);
+
   let totalWeight = 0;
   let maxLength = 0;
   let maxBreadth = 0;
   let totalHeight = 0;
+  let units = 0;
+  let unmeasuredUnits = 0;
 
   for (const item of order.items || []) {
     const product = item.product;
     const quantity = Number(item.quantity) || 0;
-    if (!product || quantity <= 0) continue;
+    if (quantity <= 0) continue;
+    units += quantity;
+    if (!(Number(product?.weight) > 0)) unmeasuredUnits += quantity;
 
-    if (Number(product.weight) > 0) totalWeight += Number(product.weight) * quantity;
-    if (Number(product.length) > maxLength) maxLength = Number(product.length);
-    if (Number(product.breadth) > maxBreadth) maxBreadth = Number(product.breadth);
-    if (Number(product.height) > 0) totalHeight += Number(product.height) * quantity;
+    totalWeight += measure(product?.weight, substitute.weight) * quantity;
+    totalHeight += measure(product?.height, substitute.height) * quantity;
+    maxLength = Math.max(maxLength, measure(product?.length, substitute.length));
+    maxBreadth = Math.max(maxBreadth, measure(product?.breadth, substitute.breadth));
   }
 
+  // No items to measure at all: return nothing and let resolvePackage() apply the
+  // configured default parcel whole, exactly as before.
+  if (units === 0) return {};
+
   return {
-    ...(totalWeight > 0 ? { weight: totalWeight } : {}),
-    ...(maxLength > 0 ? { length: maxLength } : {}),
-    ...(maxBreadth > 0 ? { breadth: maxBreadth } : {}),
-    ...(totalHeight > 0 ? { height: totalHeight } : {}),
+    ...(totalWeight > 0 ? { weight: round3(totalWeight) } : {}),
+    ...(maxLength > 0 ? { length: round3(maxLength) } : {}),
+    ...(maxBreadth > 0 ? { breadth: round3(maxBreadth) } : {}),
+    ...(totalHeight > 0 ? { height: round3(totalHeight) } : {}),
+    // Not a package field — resolvePackage() reads only the four above and drops
+    // this. It is here so a caller can say how much of the parcel was guessed.
+    unmeasuredUnits,
   };
 };
 
@@ -324,7 +383,7 @@ const splitName = (fullName) => {
 
 export const createShiprocketOrder = async (order, packageOverrides = {}) => {
   const credentials = await getShiprocketCredentials();
-  const computedPackage = computeOrderPackage(order);
+  const computedPackage = computeOrderPackage(order, credentials);
   // Precedence: an explicit per-request override wins, then the per-order
   // total computed from actual product data, then the admin/env default.
   const packageDetails = await resolvePackage({ ...computedPackage, ...packageOverrides });

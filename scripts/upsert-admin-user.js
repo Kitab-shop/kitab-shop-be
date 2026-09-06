@@ -60,7 +60,7 @@ try {
       blockedAt: null,
       deletedAt: null,
     },
-    { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true },
+    { upsert: true, returnDocument: "after", runValidators: true, setDefaultsOnInsert: true },
   ).select("email roles isVerified isActive isBlocked");
 
   console.log(`Admin account ready: ${user.email} (${user.roles.join(", ")})`);

@@ -99,7 +99,7 @@ export const prepareOrderData = async ({
     }
 
     const product = await ProductModel.findById(productId).select(
-      "name image price stock variants",
+      "name image price stock variants author",
     );
     if (!product) throw orderError("Product not found", 404);
 
@@ -152,6 +152,9 @@ export const prepareOrderData = async ({
     orderItems.push({
       product: product._id,
       name: product.name,
+      // Snapshotted for the same reason as `name`: a line item is what was sold,
+      // and it has to survive the product being renamed, re-attributed or deleted.
+      author: product.author || "",
       image: product.image || "",
       price,
       quantity,

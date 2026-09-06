@@ -146,6 +146,58 @@ UPLOADS_DIR=/data/uploads
 
 Without a persistent volume, uploaded images can disappear after redeploys.
 
+## Render Deployment
+
+This backend also includes a Render blueprint:
+
+```text
+render.yaml
+npm start
+/health
+process.env.PORT
+```
+
+Deploy checklist:
+
+1. Push `kitab-shop-be` to GitHub, or connect the parent repository and set Render root directory to `kitab-shop-be`.
+2. Create a Render Web Service or use the `render.yaml` blueprint.
+3. Build command: `npm install`.
+4. Start command: `npm start`.
+5. Health check path: `/health`.
+6. Add environment variables in Render. Do not upload `.env`.
+7. Set frontend `VITE_BACKEND_URL` to the Render backend URL.
+8. Set backend `FRONTEND_URL` and `CORS_ALLOWED_ORIGINS` to the deployed frontend URL.
+9. Open `https://your-backend.onrender.com/health` and confirm it returns `{"status":"ok"}`.
+
+Minimum Render variables:
+
+```env
+NODE_ENV=production
+SECRET_KEY=replace_me
+mango_url=mongodb+srv://...
+FRONTEND_URL=https://kitab-shop-fe.vercel.app
+CORS_ALLOWED_ORIGINS=https://kitab-shop-fe.vercel.app
+EMAIL=info.kitabshop@gmail.com
+EMAIL_PASSWORD=gmail_app_password
+PAYMENTS_ENABLED=false
+PAYMENT_PROVIDER=razorpay
+PAYMENT_MODE=demo
+RAZORPAY_KEY_ID=
+RAZORPAY_KEY_SECRET=
+AUTH_SECURITY_ENABLED=true
+REFRESH_TOKEN_COOKIE_ENABLED=true
+RATE_LIMIT_STORE=memory
+```
+
+Do not set `PORT` manually in Render. Render injects it.
+
+Render free-tier sleep warning: Free web services spin down after idle time. The `/health` endpoint lets Render check deploy health, but it does not guarantee the service stays awake for client demos. For a reliable demo, use one of these:
+
+- Best: upgrade the Render service to a paid instance for the demo window.
+- Demo workaround: create an external uptime ping to `https://your-backend.onrender.com/health` every 5-10 minutes using a service such as cron-job.org or UptimeRobot.
+
+Do not add an internal cron/self-ping inside this Node app for sleep prevention. Once the Render service sleeps, in-process cron code is also asleep and cannot wake it.
+
 ## SMTP Email Test
 
 The backend includes a standalone SMTP diagnostic script:

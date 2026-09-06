@@ -541,7 +541,7 @@ try {
 
       const response = await sendWebhook({
         sr_order_id: 7040001,
-        shipment_status_id: 43,
+        shipment_status_id: 10,
         shipment_status: "RTO DELIVERED",
       });
 
@@ -571,7 +571,7 @@ try {
     });
     await sendWebhook({
       sr_order_id: 7040010,
-      shipment_status_id: 43,
+      shipment_status_id: 10,
       shipment_status: "RTO DELIVERED",
     });
     const after = await snapshot(order._id);

@@ -208,7 +208,7 @@ export const AdminSettleOwedRefundManually = async (req, res) => {
           "refunds.$.paymentProvider": "manual",
         },
       },
-      { new: true },
+      { returnDocument: "after" },
     );
 
     if (!claimed) {

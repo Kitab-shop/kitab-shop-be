@@ -16,7 +16,7 @@ const ADMIN_PURCHASE_MESSAGE =
   "Admin accounts cannot add products to cart or place orders. Please use a customer account.";
 // `variants` is loaded because availability is variant-binding: product.stock is
 // the TOTAL across variants, so it cannot answer "can I buy this Blue one?".
-const CART_PRODUCT_SELECT = "name image price mrp brand category_id stock variants";
+const CART_PRODUCT_SELECT = "name image price mrp brand author category_id stock variants";
 
 const assertCustomerCanPurchase = (user = {}) => {
   if (hasAdminRole(user)) {

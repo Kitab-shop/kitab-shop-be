@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import Product from "./Product.model.js";
 import productModel from "./Product.model.js";
 import { deleteImageAsset, saveImageAsset } from "../../utils/image-upload.js";
@@ -69,6 +71,7 @@ export const CreateProduct = async (req, res) => {
       returnPolicyKind,
       returnPolicyWindowDays,
       author,
+      authorBio,
       publisher,
       isbn,
       language,
@@ -195,6 +198,7 @@ export const CreateProduct = async (req, res) => {
       },
 
       author: typeof author === "string" ? author.trim() : "",
+      authorBio: typeof authorBio === "string" ? authorBio.trim() : "",
       publisher: typeof publisher === "string" ? publisher.trim() : "",
       isbn: typeof isbn === "string" ? isbn.trim() : "",
       language: typeof language === "string" && language.trim() ? language.trim() : "English",
@@ -219,6 +223,7 @@ export const CreateProduct = async (req, res) => {
       });
     }
 
+    invalidateCatalogueCache();
     return res.status(200).json({
       message: "Product created successfully",
       data: product,
@@ -232,24 +237,100 @@ export const CreateProduct = async (req, res) => {
   }
 };
 
+/**
+ * The whole catalogue, byte-identical for every caller: the route carries no
+ * auth middleware and the storefront fetches it unauthenticated on app boot.
+ * Rebuilding it per visitor was the entire cost — a few thousand products is a
+ * multi-megabyte payload plus a review aggregate, serialised on one vCPU, for
+ * every first page load. So build it once and hand out the same bytes until a
+ * product changes.
+ *
+ * Coherent because this API is deliberately a single process (see the systemd
+ * unit in provision-vps.sh). Add workers and each keeps its own copy — the same
+ * caveat that already applies to RATE_LIMIT_STORE=memory.
+ */
+let catalogueCache = null;
+
+/**
+ * Backstop for the writes this controller never sees: order placement
+ * decrements stock, GetProductById bumps viewCount. Both appear in this
+ * payload and neither is worth invalidating on — a view counter would clear
+ * the cache every time a product page opened. Slightly stale stock in the
+ * *list* is safe; the product page and checkout both re-read live.
+ */
+const CATALOGUE_CACHE_TTL_MS = 60_000;
+
+export const invalidateCatalogueCache = () => {
+  catalogueCache = null;
+};
+
 export const GetAllProduct = async (req, res) => {
   try {
-    const product = await productModel.find().sort({ createdAt: -1 }).populate("category_id").lean();
-    if (!product) {
-      return res.status(400).json({
-        message: "Product not found",
+    const expired =
+      catalogueCache && Date.now() - catalogueCache.builtAt > CATALOGUE_CACHE_TTL_MS;
+
+    if (!catalogueCache || expired) {
+      const product = await productModel
+        .find()
+        .sort({ createdAt: -1 })
+        .populate("category_id")
+        .lean();
+      const body = JSON.stringify({
+        message: "Product found successfully",
+        data: await attachReviewSummary(product),
       });
+      catalogueCache = {
+        body,
+        etag: `W/"${createHash("sha1").update(body).digest("base64url")}"`,
+        builtAt: Date.now(),
+      };
     }
-    return res.status(200).json({
-      message: "Product found successfully",
-      data: await attachReviewSummary(product),
-    });
+
+    // no-cache means "revalidate", not "do not store": a conditional request
+    // still reaches here, but an unchanged catalogue answers with a 304 instead
+    // of megabytes. Anything longer-lived would serve a stale catalogue past an
+    // admin edit, which is what invalidateCatalogueCache() exists to prevent.
+    res.set("Cache-Control", "no-cache");
+    res.set("ETag", catalogueCache.etag);
+
+    if (req.headers?.["if-none-match"] === catalogueCache.etag) {
+      return res.status(304).end();
+    }
+
+    // Already serialised — res.json() would stringify the same object again.
+    return res.status(200).type("application/json").send(catalogueCache.body);
   } catch (ex) {
     console.log(ex);
     return res.status(500).json({
       message: ex.message,
     });
   }
+};
+
+/**
+ * Both ranking paths below score in JavaScript, which used to mean fetching
+ * whole documents — images, variants, reviews and all — for every candidate.
+ * That is what forced the old row caps (1000 for relevance, 300 for fuzzy), and
+ * those caps were silent: past them the results *and* the reported total were
+ * simply wrong, so page numbers lied. Scoring only reads a handful of short
+ * text fields, so rank on a projection across the full match set and hydrate
+ * only the page actually being returned.
+ */
+const RELEVANCE_RANKING_FIELDS =
+  "name brand author producthightlight description bestseller viewCount createdAt";
+const FUZZY_RANKING_FIELDS = "name brand author producthightlight viewCount category_id";
+
+/** Re-reads a ranked page of products in full, preserving the ranked order. */
+const hydrateRankedPage = async (rankedIds) => {
+  if (rankedIds.length === 0) return [];
+  const documents = await productModel
+    .find({ _id: { $in: rankedIds } })
+    .populate("category_id")
+    .lean();
+  const byId = new Map(documents.map((document) => [String(document._id), document]));
+  // $in does not return documents in the order it was given, and here that
+  // order is the ranking — so reorder rather than trusting the driver.
+  return rankedIds.map((id) => byId.get(String(id))).filter(Boolean);
 };
 
 export const SearchProducts = async (req, res) => {
@@ -310,13 +391,10 @@ export const SearchProducts = async (req, res) => {
       // search-with-a-query case, rank matches by text relevance first
       // (exact/prefix/word-match on name beats a weaker brand-only match),
       // falling back to popularity only to break ties within the same
-      // relevance tier. The catalog here is small enough that fetching all
-      // filter-matching rows into memory to sort them is cheap; still capped
-      // defensively for safety.
+      // relevance tier.
       const candidates = await productModel
         .find(filter)
-        .populate("category_id")
-        .limit(1000)
+        .select(RELEVANCE_RANKING_FIELDS)
         .lean();
       candidates.sort((a, b) => {
         const relevanceDiff = computeRelevanceScore(q, a) - computeRelevanceScore(q, b);
@@ -328,7 +406,9 @@ export const SearchProducts = async (req, res) => {
         return new Date(b.createdAt) - new Date(a.createdAt);
       });
       total = candidates.length;
-      products = candidates.slice((page - 1) * limit, page * limit);
+      products = await hydrateRankedPage(
+        candidates.slice((page - 1) * limit, page * limit).map((candidate) => candidate._id),
+      );
     } else {
       [products, total] = await Promise.all([
         productModel
@@ -344,11 +424,16 @@ export const SearchProducts = async (req, res) => {
 
     let usedFuzzy = false;
     if (q && products.length < 3) {
+      // Typo tolerance cannot be index-backed, so this scores the whole
+      // catalogue — cheap on a projection, and the only way a misspelling finds
+      // a book that is not already among the most-viewed. The DB sort stays
+      // because Array.sort is stable: it is what breaks ties between equal
+      // score and view count.
       const candidates = await productModel
         .find({})
-        .populate("category_id")
+        .select(FUZZY_RANKING_FIELDS)
+        .populate("category_id", "name")
         .sort({ viewCount: -1, createdAt: -1 })
-        .limit(300)
         .lean();
       const fuzzyMatches = candidates
         .map((product) => ({ product, score: fuzzyScore(q, product) }))
@@ -356,8 +441,10 @@ export const SearchProducts = async (req, res) => {
         .sort((a, b) => a.score - b.score || (b.product.viewCount || 0) - (a.product.viewCount || 0))
         .map(({ product }) => product);
       if (fuzzyMatches.length > products.length) {
-        products = fuzzyMatches.slice((page - 1) * limit, page * limit);
         total = fuzzyMatches.length;
+        products = await hydrateRankedPage(
+          fuzzyMatches.slice((page - 1) * limit, page * limit).map((match) => match._id),
+        );
         usedFuzzy = true;
       }
     }
@@ -593,6 +680,7 @@ export const DeleteProduct = async (req, res) => {
 
     await deleteImageAsset(product.public_id);
 
+    invalidateCatalogueCache();
     return res.status(200).json({
       message: "Product deleted successfully",
       data: product,
@@ -636,6 +724,7 @@ export const UpdateProduct = async (req, res) => {
       expectedStock,
       expectedVariantStocks,
       author,
+      authorBio,
       publisher,
       isbn,
       language,
@@ -760,6 +849,7 @@ export const UpdateProduct = async (req, res) => {
     if (season !== undefined) product.season = season;
     if (festival !== undefined) product.festival = festival;
     if (author !== undefined) product.author = String(author).trim();
+    if (authorBio !== undefined) product.authorBio = String(authorBio).trim();
     if (publisher !== undefined) product.publisher = String(publisher).trim();
     if (isbn !== undefined) product.isbn = String(isbn).trim();
     if (language !== undefined) product.language = String(language).trim() || "English";
@@ -861,6 +951,7 @@ export const UpdateProduct = async (req, res) => {
     }
     if (bestseller !== undefined) product.bestseller = toBoolean(bestseller);
     await product.save();
+    invalidateCatalogueCache();
     return res.status(200).json({
       message: "Product updated successfully",
       data: product,

@@ -352,14 +352,18 @@ try {
       "utf8",
     );
     const mapper = shippingSource.slice(shippingSource.indexOf("const mapOrderStatus"));
-    const mapped = [...mapper.slice(0, 900).matchAll(/return "([^"]+)"/g)].map((m) => m[1]);
+    // Bounded by the function's own closing brace, not a fixed character count —
+    // a 900-char window stopped covering the whole body once the status-code
+    // tables were added, so the assertion was reading a partial function.
+    const body = mapper.slice(0, mapper.indexOf("\n};") + 3);
+    const mapped = [...body.matchAll(/return "([^"]+)"/g)].map((m) => m[1]);
     ok("mapOrderStatus cannot produce Closed, so no courier event can close an order",
       !mapped.includes("Closed"), JSON.stringify(mapped));
 
     const { order } = await makeOrder({ orderStatus: "RTO Received" });
     const viaWebhook = await sendWebhook({
       order_id: String(order._id),
-      shipment_status_id: 43,
+      shipment_status_id: 10,
       shipment_status: "RTO DELIVERED",
     });
     ok("an RTO arrival event is still accepted", viaWebhook.statusCode === 200);
@@ -387,7 +391,7 @@ try {
 
     await sendWebhook({
       sr_order_id: order.shiprocket.orderId,
-      shipment_status_id: 43,
+      shipment_status_id: 10,
       shipment_status: "RTO DELIVERED",
     });
     const withRto = await fresh(order._id);
@@ -448,7 +452,7 @@ try {
     });
     await sendWebhook({
       sr_order_id: cod.shiprocket.orderId,
-      shipment_status_id: 43,
+      shipment_status_id: 10,
       shipment_status: "RTO DELIVERED",
     });
     const codFresh = await fresh(cod._id);
@@ -476,7 +480,7 @@ try {
 
     await sendWebhook({
       sr_order_id: settled.shiprocket.orderId,
-      shipment_status_id: 43,
+      shipment_status_id: 10,
       shipment_status: "RTO DELIVERED",
     });
     const afterSettledRto = await fresh(settled._id);

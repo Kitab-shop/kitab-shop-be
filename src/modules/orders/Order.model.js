@@ -29,6 +29,20 @@ const OrderItemSchema = new mongoose.Schema(
       trim: true,
     },
 
+    // For a bookstore the author is half the product's identity, so an order line
+    // that names only the title is incomplete. Snapshotted alongside `name` rather
+    // than read live, so correcting a book's author later cannot rewrite what an
+    // old invoice says was sold.
+    //
+    // Optional with a "" default on purpose: every order placed before this field
+    // existed stays valid, and the read paths fall back to the populated product
+    // for those — see the `items.product` selects in order.controller.js.
+    author: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
     image: {
       type: String,
       default: "",

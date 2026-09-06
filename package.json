@@ -31,6 +31,8 @@
     "test:variant-cart": "node tests/variant-cart.regression.mjs",
     "test:shipment-cancel": "node tests/shipment-cancel.regression.mjs",
     "test:webhook-identity": "node tests/webhook-identity.regression.mjs",
+    "test:shipment-status-mapping": "node tests/shipment-status-mapping.regression.mjs",
+    "test:order-package": "node tests/order-package.regression.mjs",
     "test:return-uniqueness": "node tests/return-uniqueness.regression.mjs",
     "test:shipping-tax-refund": "node tests/shipping-tax-refund.regression.mjs",
     "test:refund-state-gate": "node tests/refund-state-gate.regression.mjs",
@@ -49,7 +51,9 @@
     "test:shipping-rates": "node tests/shipping-rates.regression.mjs",
     "test:intent-amount-guard": "node tests/intent-amount-guard.regression.mjs",
     "test:price-mrp": "node tests/price-mrp.regression.mjs",
-    "test:coupon-dates": "node tests/coupon-dates.regression.mjs"
+    "test:coupon-dates": "node tests/coupon-dates.regression.mjs",
+    "test:catalogue-scale": "node tests/catalogue-scale.regression.mjs",
+    "test:bulk-products": "node tests/bulk-products.regression.mjs"
   },
   "keywords": [],
   "author": "",

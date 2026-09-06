@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 import ProductModel from "../products/Product.model.js";
 
 const WISHLIST_PRODUCT_SELECT =
-  "name image price mrp brand category_id stock description producthightlight bestseller";
+  "name image price mrp brand author category_id stock description producthightlight bestseller";
 
 const populateWishlist = async (wishlist) => {
   await wishlist.populate({

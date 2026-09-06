@@ -142,6 +142,10 @@ export const normalizeBulkProduct = (item = {}, categoryIdByName = new Map()) =>
     // brand when brand is blank, and normalization here keeps that possible
     // by defaulting brand from publisher for CSV rows too.
     author: String(item.author || "").trim(),
+    // The bulk template and its field guide have always listed authorBio, but
+    // it was never read here — every imported bio was silently discarded while
+    // the UI said the column was supported.
+    authorBio: String(item.authorBio || item.authorbio || "").trim(),
     publisher: String(item.publisher || "").trim(),
     isbn: String(item.isbn || "").trim(),
     language: String(item.language || "").trim() || "English",

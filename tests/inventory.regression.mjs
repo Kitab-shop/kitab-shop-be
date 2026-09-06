@@ -281,10 +281,32 @@ try {
     (await ProductModel.findById(returnedProduct._id)).stock === stockBeforeDamaged,
   );
 
-  const shippingSource = await readFile("src/modules/shipping/shipping.controller.js", "utf8");
+  // Behavioural, not a source-text match. This used to grep for the literal
+  // `statusCode === 43` — which pinned a bug in place: 43 is SELF FULFILLED in
+  // Shiprocket's list, and RTO DELIVERED is 10. Correcting the code therefore
+  // broke the assertion, which is backwards. It now exercises the function.
+  const { isRtoReceived, mapOrderStatus } = await import(
+    "../src/modules/shipping/shipping.controller.js"
+  );
   ok(
-    "the RTO restock fires on RTO-DELIVERED, not on RTO-initiated",
-    /statusCode === 43/.test(shippingSource) && /rto\[.*\]\*\(delivered\|received\)/i.test(shippingSource),
+    "RTO DELIVERED (10) counts as the parcel being physically back",
+    isRtoReceived(10, "") === true,
+  );
+  ok(
+    "RTO initiated (9) does not — restocking a parcel still on a truck is wrong",
+    isRtoReceived(9, "") === false,
+  );
+  ok(
+    "SELF FULFILLED (43) is not mistaken for a returned parcel",
+    isRtoReceived(43, "") === false,
+  );
+  ok(
+    "a courier sending readable text instead of a code still resolves",
+    isRtoReceived(0, "RTO Delivered") === true,
+  );
+  ok(
+    "the arrival maps to RTO Received, distinct from in-transit RTO",
+    mapOrderStatus(10, "") === "RTO Received" && mapOrderStatus(9, "") === "RTO",
   );
 
   // ═══ H-10 / H-11: reservation atomicity ═══════════════════════════════════

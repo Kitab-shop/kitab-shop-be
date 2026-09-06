@@ -22,6 +22,8 @@ const suites = [
   "variant-cart.regression.mjs",
   "shipment-cancel.regression.mjs",
   "webhook-identity.regression.mjs",
+  "shipment-status-mapping.regression.mjs",
+  "order-package.regression.mjs",
   "return-uniqueness.regression.mjs",
   "shipping-tax-refund.regression.mjs",
   "refund-state-gate.regression.mjs",
@@ -41,6 +43,8 @@ const suites = [
   "intent-amount-guard.regression.mjs",
   "price-mrp.regression.mjs",
   "coupon-dates.regression.mjs",
+  "catalogue-scale.regression.mjs",
+  "bulk-products.regression.mjs",
 ];
 
 const run = (file) =>

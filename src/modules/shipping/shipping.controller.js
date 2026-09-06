@@ -247,7 +247,10 @@ export const GetCourierOptions = async (req, res) => {
       });
     }
 
-    const packageDetails = await resolvePackage(computeOrderPackage(order));
+    // Same defaults the shipment itself will use, so the rates quoted here are for
+    // the parcel that actually ships rather than a differently-measured one.
+    const packageDefaults = await getShiprocketCredentials();
+    const packageDetails = await resolvePackage(computeOrderPackage(order, packageDefaults));
     const data = await checkServiceability({
       ...packageDetails,
       deliveryPostcode,
@@ -698,17 +701,67 @@ const safeTokenMatch = (received, expected) => {
 };
 
 /**
+ * Shiprocket's numeric shipment status codes, grouped by what each family means
+ * for an order here.
+ *
+ * Every courier event carries `status_code`. The human string beside it is
+ * written by the courier and varies, so matching on text alone loses events:
+ * Shiprocket calls a failed delivery "UNDELIVERED" (code 21), which contains
+ * neither "ndr" nor "non-delivery". No event ever produced the "NDR" status, and
+ * ResolveNdr refuses any order not already at NDR — so the re-attempt and
+ * send-it-back actions were unreachable from the automatic path entirely.
+ *
+ * Codes are therefore matched first, with the text kept as a fallback for
+ * couriers whose numeric code differs from the published list.
+ */
+const RTO_RECEIVED_CODES = [10]; // RTO DELIVERED — the parcel is physically back
+const RTO_CODES = [9, 14, 40, 41, 46]; // initiated, acknowledged, RTO NDR / OFD / in transit
+const NDR_CODES = [21]; // UNDELIVERED — a delivery attempt failed
+const DELIVERED_CODES = [7];
+const OUT_FOR_DELIVERY_CODES = [17];
+const SHIPPED_CODES = [6, 18, 19, 27, 38, 42];
+
+/**
+ * Codes that mean the parcel's journey went wrong in a way no status of ours
+ * expresses.
+ *
+ * Deliberately NOT mapped to an order status. "Cancelled" carries restock and
+ * refund compensation that a bare status write does not perform — which is why
+ * ORDER_STATUS_TRANSITIONS documents the webhook as never mapping to it — and
+ * there is no status at all for goods lost or destroyed in transit. What was
+ * wrong before was the SILENCE: these fell through to null, so the order simply
+ * stopped moving and nothing said why. Each one is now recorded against the
+ * order it belongs to, for an operator to act on.
+ */
+export const SHIPMENT_EXCEPTIONS = {
+  8: "cancelled at Shiprocket",
+  12: "lost in transit",
+  23: "partially delivered",
+  24: "destroyed",
+  25: "damaged",
+  39: "misrouted",
+  45: "cancelled before dispatch",
+  76: "untraceable",
+};
+
+/**
  * True only once the RTO parcel is physically back with the seller.
  *
  * mapOrderStatus collapses the whole RTO sequence ("RTO Initiated", "RTO In
  * Transit", "RTO Delivered") into the single order status "RTO", which is right
  * for what the customer sees but useless for inventory: restocking on
  * "RTO Initiated" would put units on sale while they are still on a truck.
- * Shiprocket's status_id 43 is "RTO DELIVERED"; the text match covers accounts
- * where the numeric code differs.
+ *
+ * The code checked here used to be 43 — which is SELF FULFILLED in Shiprocket's
+ * list, not RTO Delivered (that is 10). One wrong number caused two failures in
+ * opposite directions: a genuine RTO arrival was recognised only when the courier
+ * happened to send readable text, and a self-fulfilled shipment, had one ever
+ * reported, was treated as a returned parcel — recording a refund liability
+ * against an order that had actually been delivered and paid for.
  */
-const isRtoReceived = (statusCode, currentStatus) =>
-  statusCode === 43 || /rto[\s_-]*(delivered|received)/i.test(currentStatus || "");
+export const isRtoReceived = (statusCode, currentStatus) =>
+  RTO_RECEIVED_CODES.includes(statusCode) ||
+  /rto[\s_-]*(delivered|received)/i.test(currentStatus || "");
 
 /**
  * Records what a returned-to-origin parcel means for the customer's money.
@@ -753,16 +806,23 @@ const recordRtoRefundObligation = async (order) => {
   return { owed: created ? refund?.amount || 0 : 0, alreadyRecorded: !created };
 };
 
-const mapOrderStatus = (statusCode, currentStatus) => {
+export const mapOrderStatus = (statusCode, currentStatus) => {
+  const text = currentStatus || "";
   // Checked BEFORE the generic RTO test, which would otherwise swallow it — the
   // arrival event's text also contains "RTO".
-  if (isRtoReceived(statusCode, currentStatus)) return "RTO Received";
-  if (/rto|return to origin/i.test(currentStatus || "")) return "RTO";
-  if (/ndr|non[- ]delivery/i.test(currentStatus || "")) return "NDR";
-  if (statusCode === 7) return "Delivered";
-  if (statusCode === 17) return "Out For Delivery";
-  if ([6, 18, 19, 27, 38, 42].includes(statusCode)) return "Shipped";
-  if (/packed|ready to ship/i.test(currentStatus || "")) return "Packed";
+  if (isRtoReceived(statusCode, text)) return "RTO Received";
+  if (RTO_CODES.includes(statusCode) || /rto|return to origin/i.test(text)) return "RTO";
+  // "undelivered" is Shiprocket's own wording for a failed attempt and has to be
+  // matched explicitly: it contains neither "ndr" nor "non-delivery".
+  if (NDR_CODES.includes(statusCode) || /ndr|non[- ]delivery|undelivered/i.test(text)) {
+    return "NDR";
+  }
+  if (DELIVERED_CODES.includes(statusCode)) return "Delivered";
+  if (OUT_FOR_DELIVERY_CODES.includes(statusCode)) return "Out For Delivery";
+  if (SHIPPED_CODES.includes(statusCode)) return "Shipped";
+  if (/packed|ready to ship/i.test(text)) return "Packed";
+  // Includes every SHIPMENT_EXCEPTIONS code. Returning null is the point: the
+  // caller logs them instead of writing a status the compensation logic never ran.
   return null;
 };
 
@@ -1067,6 +1127,21 @@ export const ShippingWebhook = async (req, res) => {
       "orderStatus deliveredAt shipment.provider",
     );
     if (!existing) return res.status(200).json({ success: true });
+
+    // An exception code changes no status (see SHIPMENT_EXCEPTIONS) but must not
+    // pass unnoticed — a lost or destroyed parcel is exactly the event an operator
+    // needs to see, and it is the one an order silently stalling looks like.
+    const exceptionMeaning = SHIPMENT_EXCEPTIONS[statusCode];
+    if (exceptionMeaning) {
+      logLifecycleEvent("shipping", "shiprocket_shipment_exception", {
+        orderId: String(resolution.orderId),
+        orderStatus: existing.orderStatus,
+        statusCode,
+        currentStatus,
+        meaning: exceptionMeaning,
+        awbCode: awbCode || null,
+      });
+    }
 
     // ── PROVIDER-NEUTRAL MIRROR ─────────────────────────────────────────────
     // Skipped entirely for an order recorded as MANUAL. A courier feed must not

@@ -379,7 +379,7 @@ export const GetMyOrders = async (req, res) => {
     // returnPolicy included so the customer's return-eligibility UI runs on
     // the real per-product policy, not the frontend's hardcoded fallback.
     const orders = await OrderModel.find({ user: userId, ...EXCLUDE_AWAITING_PAYMENT })
-      .populate("items.product", "name image price mrp brand category_id returnPolicy")
+      .populate("items.product", "name image price mrp brand author category_id returnPolicy")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -431,7 +431,7 @@ export const GetAllOrders = async (req, res) => {
     const [orders, total] = await Promise.all([
       OrderModel.find(filter)
         .populate("user", "email roles")
-        .populate("items.product", "name image price mrp brand category_id returnPolicy")
+        .populate("items.product", "name image price mrp brand author category_id returnPolicy")
         .sort({ createdAt: sortDir })
         .limit(limit)
         .lean(),
@@ -458,7 +458,7 @@ export const GetSingleOrder = async (req, res) => {
 
     const order = await OrderModel.findById(orderId)
       .populate("user", "email roles")
-      .populate("items.product", "name image price mrp brand category_id returnPolicy")
+      .populate("items.product", "name image price mrp brand author category_id returnPolicy")
       .lean();
 
     if (!order) {

@@ -132,6 +132,17 @@ const productSchema = new mango.Schema(
       default: "",
     },
 
+    // Free-text biography shown under "About the author" on the product page.
+    // Uncapped on purpose: a publisher-supplied bio runs anywhere from one line
+    // to several paragraphs, and a maxlength here would reject the long ones
+    // with a validation error the admin cannot act on. The storefront clamps it
+    // visually instead.
+    authorBio: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
     publisher: {
       type: String,
       trim: true,
