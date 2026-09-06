@@ -1,24 +1,18 @@
 /**
- * The one SMTP transport for the whole app.
+ * The one SMTP transport for the whole app, with a Gmail fallback.
  *
  * Four modules used to build their own nodemailer transport with
- * smtp.gmail.com hardcoded — and they disagreed with each other on port (two
- * on 587, two on 465), so "email works" depended on which email it was.
- * Changing provider meant editing four files, and the SMTP_* variables in
- * .env.example were read by nothing at all.
+ * smtp.gmail.com hardcoded, disagreeing on port (two on 587, two on 465), so
+ * "email works" depended on which email it was.
  *
  * Config, SMTP_* first so a provider swap is env-only:
+ *   SMTP_HOST / SMTP_PORT / SMTP_SECURE / SMTP_USER / SMTP_PASSWORD
+ *   SMTP_FROM / SMTP_FROM_NAME
  *
- *   SMTP_HOST       default smtp.gmail.com
- *   SMTP_PORT       default 587
- *   SMTP_SECURE     default: true only on 465
- *   SMTP_USER       falls back to EMAIL
- *   SMTP_PASSWORD   falls back to EMAIL_PASSWORD
- *   SMTP_FROM       falls back to the auth user
- *   SMTP_FROM_NAME  default "Rivermoss Books"
- *
- * The EMAIL/EMAIL_PASSWORD fallback exists so an existing deployment keeps
- * working after this change with no .env edit.
+ * FALLBACK: if the primary fails at the transport level — bad credentials,
+ * unreachable host, TLS failure — the message is retried through Gmail using
+ * EMAIL/EMAIL_PASSWORD. A provider that is not fully provisioned yet must not
+ * mean a customer gets no order confirmation.
  */
 import nodemailer from "nodemailer";
 import dotenv from "dotenv";
@@ -27,86 +21,143 @@ dotenv.config();
 
 const str = (value, fallback = "") => String(value ?? "").trim() || fallback;
 
-export const mailConfig = () => {
-  const host = str(process.env.SMTP_HOST, "smtp.gmail.com");
-  const port = Number(process.env.SMTP_PORT) || 587;
-  // 465 is implicit TLS; 587 is STARTTLS and must be secure:false or the
-  // connection hangs until it times out. Deriving it from the port stops that
-  // being a per-provider footgun, while SMTP_SECURE still wins if set.
-  const secure =
-    process.env.SMTP_SECURE !== undefined && str(process.env.SMTP_SECURE) !== ""
-      ? str(process.env.SMTP_SECURE).toLowerCase() === "true"
-      : port === 465;
+// 465 is implicit TLS; 587 is STARTTLS and must be secure:false or the
+// connection hangs until it times out. Derived from the port so that is not a
+// per-provider footgun, while SMTP_SECURE still wins when set.
+const secureForPort = (port, explicit) =>
+  explicit !== undefined && str(explicit) !== ""
+    ? str(explicit).toLowerCase() === "true"
+    : Number(port) === 465;
 
-  const user = str(process.env.SMTP_USER) || str(process.env.EMAIL);
+const GMAIL = { host: "smtp.gmail.com", port: 587 };
+
+/** What SMTP_* asks for, falling back to Gmail when SMTP_* is unset. */
+export const mailConfig = () => {
+  const host = str(process.env.SMTP_HOST, GMAIL.host);
+  const port = Number(process.env.SMTP_PORT) || (host === GMAIL.host ? GMAIL.port : 465);
+  const explicitUser = str(process.env.SMTP_USER);
+  const user = explicitUser || str(process.env.EMAIL);
   const pass = String(process.env.SMTP_PASSWORD || process.env.EMAIL_PASSWORD || "");
+
+  // SMTP_FROM only applies when SMTP_USER supplied the account. Half-configured
+  // otherwise — SMTP_USER commented out while SMTP_FROM is left set — would
+  // have Gmail authenticate as one address and claim another, which it rejects
+  // for a From it does not own.
+  const from = explicitUser ? str(process.env.SMTP_FROM) || user : user;
 
   return {
     host,
     port,
-    secure,
+    secure: secureForPort(port, process.env.SMTP_SECURE),
     user,
     pass,
-    from: str(process.env.SMTP_FROM) || user,
+    from,
     fromName: str(process.env.SMTP_FROM_NAME, "Rivermoss Books"),
     configured: Boolean(user && pass),
   };
 };
 
-let transporter;
-
 /**
- * Built once and reused. The old code created a transport per email, so every
- * message paid for a fresh TLS handshake.
+ * Gmail, from EMAIL/EMAIL_PASSWORD. Null when unavailable, or when it IS the
+ * primary — retrying the server that just refused us is pointless.
  */
-const getTransporter = () => {
-  const { host, port, secure, user, pass, configured } = mailConfig();
-  if (!configured) return null;
+const gmailFallbackConfig = () => {
+  const user = str(process.env.EMAIL);
+  const pass = String(process.env.EMAIL_PASSWORD || "");
+  if (!user || !pass) return null;
 
-  if (!transporter) {
-    transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure,
-      auth: { user, pass },
-    });
-  }
-  return transporter;
+  const primary = mailConfig();
+  if (primary.host === GMAIL.host && primary.user === user) return null;
+
+  return {
+    ...GMAIL,
+    secure: false,
+    user,
+    pass,
+    // Must be the Gmail address, not SMTP_FROM: Gmail rejects a From it does
+    // not own. The brand name is kept, so a fallback send is visibly from a
+    // different address — which is the point of it being noticeable.
+    from: user,
+    fromName: str(process.env.SMTP_FROM_NAME, "Rivermoss Books"),
+    configured: true,
+  };
 };
 
-/**
- * Send one message. Returns false rather than throwing when SMTP is not
- * configured or the recipient is missing, so a caller that treats email as
- * fire-and-forget cannot be broken by an unconfigured mailer.
- *
- * Delivery failures DO throw — the caller decides whether that matters.
- * Signup, for one, needs to know: it used to tell people to check their inbox
- * for a mail that was never sent.
- */
-export const sendMail = async ({ to, subject, html, text, replyTo }) => {
-  const { from, fromName } = mailConfig();
-  const mailer = getTransporter();
+const transports = new Map();
 
-  if (!mailer) {
-    console.warn("[mailer] SMTP is not configured — skipping:", subject);
-    return false;
+const transportFor = (config) => {
+  const key = `${config.host}:${config.port}:${config.user}`;
+  if (!transports.has(key)) {
+    transports.set(
+      key,
+      nodemailer.createTransport({
+        host: config.host,
+        port: config.port,
+        secure: config.secure,
+        auth: { user: config.user, pass: config.pass },
+      }),
+    );
   }
-  if (!to) return false;
+  return transports.get(key);
+};
 
-  await mailer.sendMail({
-    from: `"${fromName}" <${from}>`,
-    replyTo: replyTo || from,
+// Transport-level failures only. Each happens BEFORE the server accepts the
+// message, so a retry cannot duplicate a delivery. A rejection of the recipient
+// itself (550, 553) is deliberately absent: Gmail would reject it too, and
+// retrying would only produce a second bounce.
+const RETRYABLE = new Set([
+  "EAUTH",
+  "ECONNECTION",
+  "ETIMEDOUT",
+  "ESOCKET",
+  "EDNS",
+  "ECONNREFUSED",
+]);
+
+const deliver = async (config, { to, subject, html, text, replyTo }) =>
+  transportFor(config).sendMail({
+    from: `"${config.fromName}" <${config.from}>`,
+    replyTo: replyTo || config.from,
     to,
     subject,
     text,
     html,
   });
-  return true;
+
+/**
+ * Send one message. Returns false when SMTP is unconfigured or the recipient is
+ * missing, so a fire-and-forget caller cannot be broken by a missing config.
+ * A failure with no usable fallback still throws — signup needs to know, having
+ * previously told people to check an inbox for mail that was never sent.
+ */
+export const sendMail = async (message) => {
+  const primary = mailConfig();
+
+  if (!primary.configured) {
+    console.warn("[mailer] SMTP is not configured — skipping:", message?.subject);
+    return false;
+  }
+  if (!message?.to) return false;
+
+  try {
+    await deliver(primary, message);
+    return true;
+  } catch (error) {
+    const fallback = RETRYABLE.has(error?.code) ? gmailFallbackConfig() : null;
+    if (!fallback) throw error;
+
+    console.warn(
+      `[mailer] ${primary.host} failed (${error.code} ${error.responseCode || ""}) — retrying via ${fallback.host}`,
+    );
+    await deliver(fallback, message);
+    console.warn(`[mailer] delivered via fallback as ${fallback.from}`);
+    return true;
+  }
 };
 
 /** For the SMTP diagnostic script and the admin health panel. */
 export const verifyMailer = async () => {
-  const mailer = getTransporter();
-  if (!mailer) throw new Error("SMTP is not configured");
-  return mailer.verify();
+  const primary = mailConfig();
+  if (!primary.configured) throw new Error("SMTP is not configured");
+  return transportFor(primary).verify();
 };
