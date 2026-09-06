@@ -159,3 +159,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Git credentials must never be committed. pull.sh reads them from git's own
+# credential store in the deploy user's home directory, outside this repo —
+# these patterns are a second line of defence in case one is ever created here.
+.git-credentials
+.netrc
+*.token
