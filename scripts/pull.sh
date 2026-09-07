@@ -44,7 +44,7 @@ die()  { printf '\n%serror:%s %s\n' "${RED}" "${RESET}" "$*" >&2; exit 1; }
 # is relative to the repo root, and the script must behave identically whether
 # it is invoked as ./scripts/pull.sh or by absolute path from a cron entry.
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVICE="${SERVICE:-kitab-api}"
+SERVICE="${SERVICE:-rivermossbooks-api}"   # PM2 app name; also the systemd unit name if used
 API_PORT="${API_PORT:-3000}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/kitab}"
 
@@ -98,7 +98,21 @@ if git --no-pager diff --name-only "${BEFORE}..${AFTER}" 2>/dev/null | grep -q '
 fi
 
 step "Restarting ${SERVICE}"
-sudo systemctl restart "${SERVICE}"
+# PM2 if the process is registered there, systemd otherwise. Both exist on this
+# box: provision-vps.sh installs kitab-api.service, and PM2 was adopted later.
+# Restarting the wrong one leaves the old code serving traffic while the deploy
+# reports success, so this asks which is actually running the app.
+if command -v pm2 >/dev/null 2>&1 && pm2 describe "${SERVICE}" >/dev/null 2>&1; then
+  # reload, not restart: it waits for the new process to come up before
+  # dropping the old one.
+  pm2 reload "${SERVICE}" --update-env
+  ok "reloaded via pm2"
+elif systemctl list-unit-files "${SERVICE}.service" >/dev/null 2>&1; then
+  sudo systemctl restart "${SERVICE}"
+  ok "restarted via systemd"
+else
+  die "neither pm2 nor a systemd unit knows about '${SERVICE}'"
+fi
 
 # Poll rather than sleep-then-check: the app connects to mongo and calls
 # ensureUploadDirs() before it listens, so the port is not up instantly.
@@ -112,4 +126,6 @@ for attempt in $(seq 1 30); do
 done
 
 printf '\n'
-die "service did not answer /health within 30s. Inspect: journalctl -u ${SERVICE} -n 50 --no-pager"
+die "service did not answer /health within 30s. Inspect:
+  pm2 logs ${SERVICE} --lines 50
+  journalctl -u ${SERVICE} -n 50 --no-pager"

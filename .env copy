@@ -1,0 +1,184 @@
+# Server port the Express app listens on.
+port=3000
+
+# JWT signing secrets. ("acess_token" is misspelled, but the code reads
+# process.env.acess_token literally — don't "fix" the spelling here without
+# also changing every place that reads it, e.g. auth.middleware.js.)
+acess_token=YO8ZgpR_HtC_ySDm7sTsO8aHiGWzHOuSNFoeUMLCBpOlrNwBj5qRVnm13qjj3VXy
+
+refresh_token=UWrlGsIZLGoYSS2pVJxdN7M82Lvk4Rn0lRhcUi_Wxl30e9g7T29ygHwVMuY0Uh3RV7NX9EBzjw6dzcC99a3DtA
+
+
+# ── Leftover Postgres/Supabase config — not read by this backend at all ──
+# This app is Express + MongoDB (see mongo_url below). Nothing in
+# kitab-shop-be reads DATABASE_URL/DIRECT_URL/supabaseurl/project_url.
+# Connect to Postgres via the shared transaction-mode pooler (IPv4-only)
+# DATABASE_URL="postgresql://postgres.wqhaohmjrucdrkccvscn:aMN0VAIn4GkEcaVA@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres?pgbouncer=true"
+
+# # Connect to Postgres via the shared session-mode pooler (used for migrations)
+# DIRECT_URL="postgresql://postgres.wqhaohmjrucdrkccvscn:aMN0VAIn4GkEcaVA@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres"
+
+# supabaseurl=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxaGFvaG1qcnVjZHJrY2N2c2NuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MjI2ODIyNCwiZXhwIjoyMDk3ODQ0MjI0fQ.9ZDOG8BP0Jvm-trVDxWyatfuK8vQWG5kmIbcblj13CE
+
+# project_url=https://wqhaohmjrucdrkccvscn.supabase.co
+
+
+
+
+
+# Gmail SMTP credentials (nodemailer) — used to send verification/reset
+# emails once NOTIFICATIONS_ENABLED is on. EMAIL_PASSWORD is a Gmail App
+# Password, not the real account password.
+# ── SMTP ─────────────────────────────────────────────────────────────────────
+# One transport for every email the app sends (src/utils/mailer.js). Set these
+# to move provider without touching code.
+#
+# SMTP_SECURE is derived from the port when left unset: true on 465 (implicit
+# TLS), false on 587 (STARTTLS). Setting it true on 587 makes the connection
+# hang until it times out.
+#
+# SMTP_USER/SMTP_PASSWORD fall back to EMAIL/EMAIL_PASSWORD below, so a
+# deployment that predates this block keeps working on Gmail unchanged.
+#
+# Titan (what rivermossbooks.com uses):
+#   SMTP_HOST=smtp.titan.email
+#   SMTP_PORT=465
+#   SMTP_SECURE=true
+SMTP_HOST=smtp.titan.email
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=info@rivermossbooks.com
+SMTP_PASSWORD=Rivermoss@books@09876
+SMTP_FROM=info@rivermossbooks.com
+SMTP_FROM_NAME=Rivermoss Books
+# Customer replies go here, not to the sender.
+SMTP_REPLY_TO=support@rivermossbooks.com
+
+# Gmail fallback, used when SMTP_* above is unset. EMAIL_PASSWORD is a Gmail
+# App Password, not the account password.
+EMAIL=info.kitabshop@gmail.com
+EMAIL_PASSWORD=sbys rpli asfj nctw
+# FRONTEND_URL=http://localhost:3000
+# The JWT secret actually in effect — see the dead duplicate above.
+# Used by src/passwordhash/password.js as the HMAC key for password hashing.
+# IMPORTANT: dotenv truncates any unquoted value at its first "#" — the
+# runtime value is actually just "MySuperSecret@Key", not the full string
+# below. Every existing user's password hash was computed against that
+# truncated value. Do NOT "fix" this by quoting it (or changing this value at
+# all) without a plan for existing accounts — the moment the effective value
+# changes, every current user's stored password hash stops matching and they
+# are locked out until they reset their password.
+SECRET_KEY=MySuperSecret@Key#2024!
+# Base URL of the storefront — used to build links inside emails
+# (verification, password reset, etc.).
+# FRONTEND_URL=http://localhost:5173
+
+# Was FRONtEND_URL (capital T) — read by nothing, so verification and reset
+# links silently fell back to http://localhost:5173. Correct for local dev;
+# .env.prod carries the live domain.
+FRONTEND_URL=http://localhost:5173
+
+
+
+# MongoDB connection string. Needs a replica set (even a single-node one like
+# this) — order/payment placement uses multi-document transactions (stock
+# decrement + coupon redeem + wallet debit committing together), which plain
+# standalone MongoDB doesn't support.
+# mango_url=mongodb://akshit:1234567890@ac-1oimfhq-shard-00-00.eq90pwy.mongodb.net:27017,ac-1oimfhq-shard-00-01.eq90pwy.mongodb.net:27017,ac-1oimfhq-shard-00-02.eq90pwy.mongodb.net:27017/E-commerce?tls=true&replicaSet=atlas-hk4rcp-shard-0&authSource=admin&retryWrites=true&w=majority
+# Fresh database for the bookstore conversion — the old astrology catalogue
+# lives on untouched in the "E-commerce" database.
+
+# mongo_url=mongodb://127.0.0.1:27017/book-commerce?replicaSet=rs0
+
+mongo_url=mongodb+srv://vishnutripathiai_db_user:Vishnu%408529135468@cluster0.l7nekxi.mongodb.net/kitab-shop?retryWrites=true&w=majority&appName=Cluster0
+
+# Razorpay API credentials (test-mode keys) — only actually called when
+# PAYMENTS_ENABLED=true below.
+RAZORPAY_KEY_ID=rzp_test_TAUzzDXPfz0gta
+RAZORPAY_KEY_SECRET=D6Ixg3gqtrXHixMix2ZMaGLo
+# OAuth client ID for "Sign in with Google" on the storefront.
+GOOGLE_CLIENT_ID=1054095305045-diou60ku8atpsqf9fqep86gg190ifnnu.apps.googleusercontent.com
+
+# ── Payments (Razorpay) — src/config/features.config.js `payments` ──
+# Master switch. false = Razorpay checkout is unavailable; only Cash on
+# Delivery works, and only if the admin-panel "Cash on Delivery" toggle
+# (Admin > Operations > Checkout) is also on. CONFIRMED LIVE: with this false
+# and Cash on Delivery also off (the admin-panel default), checkout has zero
+# working payment method — verified by actually clicking through the
+# storefront, not just reading the code. Set to true before any demo/testing
+# that needs to place a real order through the UI.
+PAYMENTS_ENABLED=true
+# Only "razorpay" is actually implemented — isPaymentEnabled() requires this
+# exact value in addition to PAYMENTS_ENABLED=true.
+PAYMENT_PROVIDER=razorpay
+# Read into config as payments.mode, but nothing in the codebase actually
+# checks that value — it has no effect currently, "demo" or otherwise. What
+# actually keeps this safe from a real charge is RAZORPAY_KEY_ID starting
+# with rzp_test_ (Razorpay's own test/live key separation, not this app).
+# Corrected here — an earlier version of this comment incorrectly implied
+# PAYMENT_MODE itself gates real-vs-test charging.
+PAYMENT_MODE=demo
+# Whether POST /payment/razorpay/webhook processes Razorpay's webhook events
+# at all. Also needs the webhook configured on Razorpay's own dashboard.
+RAZORPAY_WEBHOOK_ENABLED=false
+
+# ── Shipping (Shiprocket) — src/config/features.config.js `shipping` ──
+# Master switch. false = every Shiprocket action (create shipment, AWB,
+# pickup, label, invoice, live tracking) is blocked with a clean "disabled"
+# response; order status must then be moved forward manually from the admin
+# order-detail page instead of updating itself automatically.
+# Note: Shiprocket also needs an email/password to actually log in — this
+# file intentionally has no SHIPROCKET_EMAIL/SHIPROCKET_PASSWORD lines at
+# all, since those are now set from Admin > Operations > Shipping and stored
+# in the database instead (see ShiprocketSetting.model.js). If that panel has
+# never been filled in, Shiprocket still can't be reached even with this
+# flag on — but that's a database state to check, not something to look for
+# in this file anymore.
+
+SHIPROCKET_ENABLED=false
+# SHIPROCKET_ENABLED=true
+
+# Only "shiprocket" is actually implemented — isShippingEnabled() requires
+# this exact value in addition to SHIPROCKET_ENABLED=true.
+SHIPPING_PROVIDER=shiprocket
+# If true, a Shiprocket order is created automatically right after a local
+# order is placed, instead of requiring an admin to click "Create Shipment".
+# SHIPROCKET_AUTO_CREATE_ORDER=false
+SHIPROCKET_AUTO_CREATE_ORDER=true
+
+# Restricts who can trigger Shiprocket actions to admin roles only.
+SHIPROCKET_ADMIN_ONLY=true
+# Whether incoming Shiprocket status-update webhooks are processed. Also
+# needs SHIPROCKET_ENABLED=true — isShippingWebhookEnabled() checks both.
+SHIPROCKET_WEBHOOK_ENABLED=false
+
+# ── Inventory — src/config/features.config.js `inventory` ──
+# If true, stock is actually checked and decremented at checkout (an order
+# fails if there isn't enough). If false, stock numbers are cosmetic only.
+INVENTORY_ENFORCE_STOCK=true
+# If true, stock is temporarily reserved while a Razorpay payment is in
+# progress, so two shoppers can't both "win" the last unit mid-checkout.
+INVENTORY_RESERVE_DURING_PAYMENT=true
+# Below this stock number, a product is flagged "low stock" in the admin.
+# Now also editable live from the Inventory page (Admin > Inventory) — an
+# admin-set value there always wins; this is only the fallback before that's
+# ever been used.
+LOW_STOCK_THRESHOLD=5
+
+# Gates token revocation on logout/refresh, stricter signup/account-deletion/
+# 2FA checks, and (redundantly with RATE_LIMIT_ENABLED, which already
+# defaults on even when unset here) rate limiting. Off by default for easier
+# local development.
+AUTH_SECURITY_ENABLED=false
+
+# ── Notifications — src/config/features.config.js `notifications` ──
+# Master switch for the notification-event system in general.
+NOTIFICATIONS_ENABLED=true
+# All three still resolve to a no-op in the code regardless of value — there
+# is no real SMS/WhatsApp/phone provider wired up yet. Only email actually
+# sends (via EMAIL/EMAIL_PASSWORD above).
+NOTIFY_SMS_ENABLED=false
+NOTIFY_WHATSAPP_ENABLED=false
+NOTIFY_PHONE_ENABLED=false
+# Where a password-reset email's link points the user to.
+RESET_PASSWORD_FRONTEND_URL=https://kitab-shop-fe.vercel.app/reset-password.html
