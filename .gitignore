@@ -166,3 +166,9 @@ vite.config.ts.timestamp-*
 .git-credentials
 .netrc
 *.token
+
+# Throwaway scripts with credentials pasted straight in. This repository is
+# PUBLIC, so a hardcoded password committed here is a published password.
+*.local.cjs
+*.local.js
+*.local.mjs
