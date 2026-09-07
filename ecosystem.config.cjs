@@ -18,7 +18,11 @@ module.exports = {
     {
       name: "rivermossbooks-api",
       script: "src/index.js",
-      cwd: "/srv/kitab/kitab-shop-be",
+      // __dirname, not a hardcoded path: the checkout has already moved once
+      // and a stale absolute path here means PM2 fails with "Script not found"
+      // — which is exactly what happened. This config is always beside the code
+      // it describes, so it can just point at itself.
+      cwd: __dirname,
 
       // ONE process in fork mode, deliberately — NOT cluster.
       // RATE_LIMIT_STORE=memory counts per process, so every worker gets its own
