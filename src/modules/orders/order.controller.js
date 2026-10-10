@@ -375,34 +375,68 @@ export const PlaceOrder = async (req, res) => {
         return res.status(200).json({ success: true, message: "Order already placed", order });
       }
     }
-    console.log(error);
+    // Structured, like every other lifecycle failure, instead of a bare console.log
+    // in the checkout hot path.
+    logLifecycleError("orders", "place_order_failed", error, {
+      userId: req.user?.id,
+      idempotencyKey: req.body?.idempotencyKey,
+    });
 
-    return res.status(error.statusCode || 500).json({
+    // A thrown `statusCode` means the message was written FOR the customer — "…no
+    // longer has enough stock", "Wallet balance is no longer sufficient…" — and it
+    // has to reach them to be actionable. Anything without one is an unexpected
+    // failure whose message is internal detail, so it gets a fixed reply.
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
       success: false,
-      message: error.message,
+      message:
+        statusCode === 500
+          ? "We could not place your order just now. Please try again."
+          : error.message,
     });
   } finally {
     if (session) await session.endSession();
   }
 };
 
+// One customer's own history is realistically small — but "realistically small" is an
+// assumption about data, not a guarantee, and this response populates every line item
+// of every order ever placed. The cap makes the worst case bounded. It is generous on
+// purpose: the Orders page paginates and filters client-side within whatever it is
+// given, so anything under the cap behaves exactly as before and needs no frontend
+// change. Same shape as DEFAULT_ORDERS_LIMIT / MAX_ORDERS_LIMIT below.
+const DEFAULT_MY_ORDERS_LIMIT = 200;
+const MAX_MY_ORDERS_LIMIT = 1000;
+
 export const GetMyOrders = async (req, res) => {
   try {
     const userId = req.user.id;
+    const limit = Math.min(
+      Math.max(Number.parseInt(req.query.limit, 10) || DEFAULT_MY_ORDERS_LIMIT, 1),
+      MAX_MY_ORDERS_LIMIT,
+    );
 
     // A checkout the customer abandoned is not something they ordered, so it does
     // not belong in "My Orders". They still reach it by id if the payment later
     // completes and it is promoted.
     // returnPolicy included so the customer's return-eligibility UI runs on
     // the real per-product policy, not the frontend's hardcoded fallback.
-    const orders = await OrderModel.find({ user: userId, ...EXCLUDE_AWAITING_PAYMENT })
+    const filter = { user: userId, ...EXCLUDE_AWAITING_PAYMENT };
+    const orders = await OrderModel.find(filter)
       .populate("items.product", "name image price mrp brand author category_id returnPolicy")
       .sort({ createdAt: -1 })
+      .limit(limit)
       .lean();
+
+    // The true total, not `orders.length`, so a customer past the cap is not told
+    // they have fewer orders than they do.
+    const total = await OrderModel.countDocuments(filter);
 
     return res.status(200).json({
       success: true,
-      total: orders.length,
+      total,
+      returned: orders.length,
+      limit,
       orders,
     });
   } catch (error) {
