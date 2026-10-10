@@ -69,6 +69,10 @@ web_modules/
 .env
 .env.*
 !.env.example
+# A file manager's duplicate is ".env copy", which `.env.*` does not match —
+# that is how a full set of production credentials got committed once.
+.env copy*
+.env (copy)*
 
 # Local editor settings
 .vscode/
