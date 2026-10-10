@@ -3,7 +3,6 @@ import {
   AddOrderNote,
   AdminCancelOrder,
   CancelOrder,
-  CreateSplitShipment,
   GetAllOrders,
   GetMyOrders,
   GetSingleOrder,
@@ -42,7 +41,6 @@ import {
   partialCancelSchema,
   placeOrderSchema,
   manualShipmentSchema,
-  splitShipmentSchema,
   updateOrderStatusSchema,
 } from "./order.schema.js";
 import { ADMIN_PERMISSIONS } from "../../config/admin-permissions.config.js";
@@ -98,7 +96,6 @@ routes.patch(
   validate(orderIdParamSchema),
   RecordRtoDisposition,
 );
-routes.post("/:orderId/split-shipments", TokenVerify, canManageOrders, validate(splitShipmentSchema), CreateSplitShipment);
 routes.patch("/:orderId/partial-cancel", TokenVerify, canManageOrders, validate(partialCancelSchema), PartialCancelOrder);
 // Recovery for a refund whose gateway response was lost. Rate-limited like the
 // refund endpoint because it can end in a real gateway call — though only after

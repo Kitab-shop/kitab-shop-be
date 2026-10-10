@@ -125,12 +125,6 @@ export const partialCancelSchema = {
   }),
 };
 
-export const splitShipmentSchema = {
-  params: looseBody({ orderId: objectId("Order id") }),
-  body: looseBody({
-    items: z.array(z.unknown()).min(1, "At least one item is required"),
-  }),
-};
 
 /**
  * Recording a hand-shipped parcel: who carried it, under what tracking number.

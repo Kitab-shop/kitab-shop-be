@@ -410,37 +410,6 @@ const OrderSchema = new mongoose.Schema(
       default: [],
     },
 
-    shipments: {
-      type: [
-        {
-          shipmentNumber: { type: String, required: true },
-          items: [
-            {
-              product: {
-                type: mongoose.Schema.Types.ObjectId,
-                ref: "ProductModel",
-                required: true,
-              },
-              quantity: { type: Number, required: true, min: 1 },
-            },
-          ],
-          status: {
-            type: String,
-            enum: ["planned", "created", "shipped", "delivered", "cancelled"],
-            default: "planned",
-          },
-          awbCode: { type: String, default: "" },
-          courierName: { type: String, default: "" },
-          createdBy: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "UserAuthenticationModel",
-            required: true,
-          },
-          createdAt: { type: Date, default: Date.now },
-        },
-      ],
-      default: [],
-    },
 
     refunds: {
       type: [
@@ -839,9 +808,12 @@ OrderSchema.index({ "shiprocket.awbCode": 1, orderStatus: 1 });
  * data cleanup was required.
  *
  * `shiprocket.orderId` is 1:1 with an order by construction — createShiprocketOrder
- * posts `order_id: String(order._id)`. `shiprocket.awbCode` is a single scalar for
- * the order's one shipment; per-shipment AWBs would live in `shipments[].awbCode`,
- * which nothing writes today.
+ * posts `order_id: String(order._id)`, and `shiprocket.awbCode` is a single scalar
+ * for the order's one shipment. One parcel per order is therefore a property of the
+ * integration, not just of this index: a `shipments[]` array once existed for
+ * splitting an order across parcels, but nothing ever read it and it has been
+ * removed. Supporting real split shipments means a shipment entity with its own
+ * identifiers, not a second field here.
  *
  * EXPLICITLY NAMED, and that matters for deployment. The plain indexes these
  * replace already own the auto-generated names `shiprocket.orderId_1` /

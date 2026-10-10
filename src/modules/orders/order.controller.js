@@ -1339,58 +1339,6 @@ export const RecordRtoDisposition = async (req, res) => {
   }
 };
 
-export const CreateSplitShipment = async (req, res) => {
-  try {
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    if (items.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Shipment items are required",
-      });
-    }
-
-    const order = await OrderModel.findById(req.params.orderId);
-    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
-    if (["Cancelled", "Delivered"].includes(order.orderStatus)) {
-      return res.status(409).json({
-        success: false,
-        message: "Cannot split this order in its current status",
-      });
-    }
-
-    const shipmentItems = [];
-    for (const requested of items) {
-      const quantity = Number(requested.quantity);
-      const orderItem = order.items.find(
-        (entry) => String(entry.product) === String(requested.productId || requested.product),
-      );
-      if (!orderItem || !Number.isInteger(quantity) || quantity < 1) {
-        return res.status(400).json({
-          success: false,
-          message: "Each shipment item must match an order product and positive quantity",
-        });
-      }
-      shipmentItems.push({ product: orderItem.product, quantity });
-    }
-
-    order.shipments.push({
-      shipmentNumber: `SHP-${Date.now()}-${order.shipments.length + 1}`,
-      items: shipmentItems,
-      status: "planned",
-      createdBy: req.user.id,
-    });
-    await order.save();
-
-    return res.status(201).json({
-      success: true,
-      message: "Split shipment planned",
-      order,
-    });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
-
 // Mirrors CANCEL_REASONS in
 // kitab-shop-fe/src/features/order-detail/CancelOrderDialog.jsx. Anything
 // outside this list falls back to "Other" rather than being rejected — the
