@@ -2,6 +2,7 @@ import OrderModel from "./Order.model.js";
 import UserProfile from "../profiles/UserProfile.model.js";
 import ReferralSetting from "../referral/ReferralSetting.model.js";
 import CouponModel from "../coupons/coupon.model.js";
+import CouponRedemption from "../coupons/coupon-redemption.model.js";
 import CheckoutSetting from "./CheckoutSetting.model.js";
 import CodVerification from "./CodVerification.model.js";
 import { isStockEnforced } from "../../config/features.config.js";
@@ -1493,18 +1494,27 @@ const executeOrderCancellation = async ({
       });
 
       if (claimed.coupon && claimed.couponDiscount > 0) {
-        // Conditional single-statement update rather than read-modify-save:
-        // the `$gte: 1` in the filter makes the decrement atomic, and
-        // updateOne skips Mongoose validators, so this no longer depends on
-        // the subdocument's `min` at all.
-        await CouponModel.updateOne(
-          {
-            couponId: claimed.coupon,
-            usedBy: { $elemMatch: { user: claimed.user, count: { $gte: 1 } } },
-          },
-          { $inc: { "usedBy.$.count": -1, usage: -1 } },
+        // Two conditional updates rather than read-modify-save: the `$gte: 1` in each
+        // filter makes the decrement atomic, and updateOne skips Mongoose validators
+        // so this does not depend on the schema's `min` at all.
+        //
+        // Per-customer count first, coupon total second, and the total moves ONLY if
+        // the per-customer row actually did. Ordering it the other way, or moving the
+        // total unconditionally, would let a double-release free two global slots
+        // against one real redemption — which, with globalMaxRedemptions now gating
+        // money, is the difference between a budget of 100 and a budget of 101.
+        const released = await CouponRedemption.updateOne(
+          { coupon: claimed.coupon, user: claimed.user, count: { $gte: 1 } },
+          { $inc: { count: -1 } },
           { session },
         );
+        if (released.modifiedCount === 1) {
+          await CouponModel.updateOne(
+            { couponId: claimed.coupon, usage: { $gte: 1 } },
+            { $inc: { usage: -1 } },
+            { session },
+          );
+        }
       }
 
       // Record that a refund is OWED, not that it happened. The gateway call is

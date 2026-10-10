@@ -6,32 +6,6 @@ const generateCouponId = () =>
     .slice(2, 6)
     .toUpperCase()}`;
 
-const couponUsageSchema = new mongoose.Schema(
-  {
-    user: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "UserAuthenticationModel",
-      required: true,
-    },
-    count: {
-      type: Number,
-      default: 1,
-      // 0 is a legitimate state: the user redeemed the coupon and then
-      // cancelled the order, so the redemption was given back. `min: 1` made
-      // that decrement throw a ValidationError, which is not a
-      // TransientTransactionError — so withTransaction aborted instead of
-      // retrying and EVERY cancellation of a coupon order failed with a 500.
-      // The entry is kept (rather than pulled) so redemption history survives.
-      min: 0,
-    },
-    lastUsedAt: {
-      type: Date,
-      default: Date.now,
-    },
-  },
-  { _id: false },
-);
-
 const couponSchema = new mongoose.Schema(
   {
     couponId: {
@@ -107,7 +81,37 @@ const couponSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    /**
+     * Total redemptions across ALL customers.
+     *
+     * Authoritative, not derived. It used to be recomputed from the `usedBy` array
+     * by a pre("validate") hook on every save, while the cancellation path also
+     * `$inc`-ed it directly — two definitions of one number. Per-user counts now
+     * live in the CouponRedemption collection and this is maintained by the same
+     * conditional updates that move them, so `globalMaxRedemptions` below has
+     * something trustworthy to compare against.
+     */
     usage: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    /**
+     * The coupon's TOTAL redemption budget across all customers. 0 means unlimited,
+     * matching how `maxPurchaseAmount` and the COD amount gates already encode "no
+     * limit", and it is the default so every existing coupon keeps behaving exactly
+     * as it does today.
+     *
+     * Distinct from `maxLimit`, which is the PER-CUSTOMER allowance. Without this
+     * there was no total cap of any kind: "first 100 customers" was not expressible,
+     * and a code that leaked publicly was redeemable until an admin noticed and
+     * deactivated it by hand. It was the last uncapped money lever in checkout.
+     *
+     * Enforced in the FILTER of the redemption update (coupon.service.js), never by
+     * a read-then-check, so concurrent redemptions against the last slot cannot both
+     * win.
+     */
+    globalMaxRedemptions: {
       type: Number,
       default: 0,
       min: 0,
@@ -115,10 +119,6 @@ const couponSchema = new mongoose.Schema(
     isActive: {
       type: Boolean,
       default: true,
-    },
-    usedBy: {
-      type: [couponUsageSchema],
-      default: [],
     },
   },
   { timestamps: true },
@@ -151,17 +151,20 @@ couponSchema.pre("validate", function () {
   if (this.startDate && this.expireDate && this.expireDate < this.startDate) {
     this.invalidate("expireDate", "Expire date must be after start date");
   }
-  // Total redemptions = sum of per-user counts, NOT usedBy.length. Using the
-  // array length meant `usage` could only ever grow: a cancelled redemption
-  // decrements a user's count but leaves their entry in place, so the length
-  // never fell and the counter drifted permanently upward. The two definitions
-  // happen to agree only while every user is capped at one use.
-  this.usage = Array.isArray(this.usedBy)
-    ? this.usedBy.reduce((total, entry) => total + (Number(entry?.count) || 0), 0)
-    : this.usage || 0;
+  // `usage` is deliberately NOT recomputed here any more. It used to be summed from
+  // the `usedBy` array on every save, which meant an ordinary admin edit rewrote the
+  // redemption total as a side effect — untenable once `globalMaxRedemptions` gates
+  // real money on it. Per-user counts live in CouponRedemption now, and `usage` is
+  // moved only by the conditional updates that move them.
 });
 
 couponSchema.index({ isActive: 1, startDate: 1, expireDate: 1 });
+// Serves GetAvailableCoupons' `.sort({ expireDate: 1 })`, which the index above cannot:
+// index bounds stop at the first RANGE key, so after `startDate: { $lte: now }` the keys
+// are no longer ordered by expireDate and Mongo fell back to a blocking in-memory sort —
+// on a customer-facing cart path, with no .limit() to bound it. Here expireDate is the
+// second key, so the sort is satisfied by the scan and `startDate` becomes a residual.
+couponSchema.index({ isActive: 1, expireDate: 1 });
 couponSchema.index({ isActive: 1, assignedUser: 1, expireDate: 1 });
 couponSchema.index({ createdAt: -1 });
 

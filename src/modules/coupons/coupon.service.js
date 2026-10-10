@@ -1,8 +1,10 @@
 import mongoose from "mongoose";
 import CouponModel from "./coupon.model.js";
+import CouponRedemption from "./coupon-redemption.model.js";
 import OrderModel from "../orders/Order.model.js";
 import { EXCLUDE_AWAITING_PAYMENT } from "../orders/order-visibility.js";
 import ProductModel from "../products/Product.model.js";
+import { effectiveUnitPrice, findVariant, variantKeyFrom } from "../inventory/variant.service.js";
 
 export const normalizeCouponId = (couponId = "") =>
   String(couponId || "").trim().toUpperCase();
@@ -18,8 +20,72 @@ const getProductIdFromItem = (item = {}) =>
 
 const getQuantityFromItem = (item = {}) => Math.max(1, Number(item.quantity || item.qty || 1));
 
-const getUserUsage = (coupon, userId) =>
-  coupon.usedBy.find((usage) => String(usage.user) === String(userId));
+/**
+ * The variant a cart line names, in the same canonical form the cart and the order
+ * path use. Read here because a coupon is a percentage OF a subtotal, so the
+ * subtotal has to be the one the customer will actually be charged.
+ */
+const getVariantKeyFromItem = (item = {}) =>
+  item.variantKey || variantKeyFrom(item.selectedVariants);
+
+/**
+ * How many times this customer has already redeemed this coupon.
+ *
+ * An indexed lookup on CouponRedemption. This used to be a linear scan of the
+ * coupon's `usedBy` array in application memory, which is what made that array's
+ * unbounded growth a checkout-latency problem and not merely a storage one.
+ */
+export const redemptionCountFor = async ({ couponId, userId, session = null }) => {
+  const query = CouponRedemption.findOne({
+    coupon: normalizeCouponId(couponId),
+    user: userId,
+  }).select("count");
+  if (session) query.session(session);
+  const row = await query;
+  return Number(row?.count || 0);
+};
+
+/**
+ * THE per-user allowance rule, in one place.
+ *
+ * `maxLimit` is the PER-USER allowance (see calculateCouponDiscount below for why).
+ * This was written out twice — here and in GetAvailableCoupons, which hardcoded the
+ * limit at 1 — so a coupon configured for two uses was accepted by checkout and
+ * simultaneously hidden from the customer's coupon list after the first. Two copies
+ * of a rule is what let them disagree; one function is the fix.
+ *
+ * Both `redemptionCount` and `ordersWithCoupon` are passed in rather than queried,
+ * because the two callers count them differently for good reason: checkout counts one
+ * coupon for one customer, while the list counts every coupon for that customer in a
+ * single query apiece.
+ */
+export const perUserCouponLimit = (coupon) => Math.max(1, Number(coupon?.maxLimit) || 1);
+
+export const couponUsesRemaining = (coupon, redemptionCount = 0, ordersWithCoupon = 0) => {
+  // The redemption counter is decremented on cancellation while order history is the
+  // durable fact, so the higher of the two is the honest usage.
+  const used = Math.max(Number(redemptionCount) || 0, Number(ordersWithCoupon) || 0);
+  return Math.max(0, perUserCouponLimit(coupon) - used);
+};
+
+export const hasCouponAllowanceLeft = (coupon, redemptionCount = 0, ordersWithCoupon = 0) =>
+  couponUsesRemaining(coupon, redemptionCount, ordersWithCoupon) > 0;
+
+/**
+ * Whether the coupon's TOTAL budget across all customers is spent.
+ *
+ * Advisory only — it is what lets ApplyCoupon explain itself and what keeps an
+ * exhausted coupon out of the customer's list. The authority is the conditional
+ * update in the redeem branch below, which puts the same comparison in the filter so
+ * concurrent redemptions against the last slot cannot both succeed.
+ */
+export const globalCapReached = (coupon) => {
+  const cap = Number(coupon?.globalMaxRedemptions) || 0;
+  if (cap <= 0) return false;
+  return (Number(coupon?.usage) || 0) >= cap;
+};
+
+export const GLOBAL_CAP_MESSAGE = "This coupon has reached its redemption limit";
 
 /**
  * How many live orders this user has already placed with this coupon.
@@ -107,9 +173,12 @@ export const calculateCouponDiscount = async ({
   // keeps exactly the behaviour it has today, while the two that are configured
   // for 2 uses start working as configured. A global cap would instead have
   // retroactively killed every coupon already used once.
-  const perUserLimit = Math.max(1, Number(coupon.maxLimit) || 1);
-  const usage = getUserUsage(coupon, userId);
-  const usedCount = Number(usage?.count || 0);
+  const perUserLimit = perUserCouponLimit(coupon);
+  const redemptionCount = await redemptionCountFor({
+    couponId: normalizedCouponId,
+    userId,
+    session,
+  });
   // Cross-checked against real orders as well as the counter, because the counter
   // is decremented on cancellation while the order history is the durable fact.
   const ordersWithCoupon = await countOrdersWithCoupon({
@@ -117,13 +186,22 @@ export const calculateCouponDiscount = async ({
     userId,
     session,
   });
-  if (Math.max(usedCount, ordersWithCoupon) >= perUserLimit) {
+  if (!hasCouponAllowanceLeft(coupon, redemptionCount, ordersWithCoupon)) {
     throw couponError(
       perUserLimit === 1
         ? "You have already used this coupon"
         : `You have already used this coupon the maximum ${perUserLimit} times`,
     );
   }
+  // The TOTAL budget, checked here as well as in the redeem filter below. This check
+  // is what makes an exhausted coupon explain itself in ApplyCoupon and disappear
+  // from the customer's list; the filter is what actually decides a race.
+  if (globalCapReached(coupon)) {
+    throw couponError(GLOBAL_CAP_MESSAGE, 409);
+  }
+  // Captured BEFORE the redeem branch below consumes one, so the figure reported back
+  // to the caller does not count this redemption twice.
+  const usesRemaining = couponUsesRemaining(coupon, redemptionCount, ordersWithCoupon);
 
   const targetType = getCouponTargetType(coupon);
   const productIds = items
@@ -142,7 +220,11 @@ export const calculateCouponDiscount = async ({
     productFilter.category_id = coupon.category_id;
   }
 
-  const productsQuery = ProductModel.find(productFilter).select("name price image brand category_id");
+  // `variants` is loaded because a variant carries its own price, and the discount
+  // is computed against the line values below.
+  const productsQuery = ProductModel.find(productFilter).select(
+    "name price image brand category_id variants",
+  );
   if (session) productsQuery.session(session);
   const products = await productsQuery;
   const productMap = new Map(products.map((product) => [String(product._id), product]));
@@ -158,7 +240,12 @@ export const calculateCouponDiscount = async ({
 
     const quantity = getQuantityFromItem(item);
     eligibleQuantity += quantity;
-    eligibleSubtotal += (Number(product.price) || 0) * quantity;
+    // Priced per variant, matching prepareOrderData. Using `product.price` here made
+    // a percentage coupon on a separately-priced variant discount the wrong base —
+    // and made minPurchaseAmount/maxPurchaseAmount compare against a subtotal the
+    // customer is never charged.
+    const variant = findVariant(product, getVariantKeyFromItem(item));
+    eligibleSubtotal += effectiveUnitPrice(product, variant) * quantity;
     if (!eligibleProductNames.includes(product.name)) eligibleProductNames.push(product.name);
   }
 
@@ -190,19 +277,47 @@ export const calculateCouponDiscount = async ({
   }
 
   if (redeem) {
-    if (usage) {
-      usage.count = usedCount + 1;
-      usage.lastUsedAt = new Date();
-    } else {
-      coupon.usedBy.push({
-        user: userId,
-        count: 1,
-        lastUsedAt: new Date(),
-      });
+    const options = session ? { session } : {};
+
+    // ── 1. CLAIM A GLOBAL SLOT ────────────────────────────────────────────────
+    // The cap lives in the FILTER, so this is a compare-and-swap rather than a
+    // read-then-check: two customers racing for the last slot both match the filter
+    // only if there really are two slots. The same pattern as the wallet debit in
+    // PlaceOrder, and stronger than what this code did before — a full-document
+    // `coupon.save()` that relied on transaction write-conflict retries alone.
+    //
+    // `$expr` because the comparison is between two fields of the same document.
+    // The `$lte: 0` arm is the unlimited case, which is the default and therefore
+    // the path every existing coupon takes.
+    const claim = await CouponModel.updateOne(
+      {
+        _id: coupon._id,
+        $or: [
+          { globalMaxRedemptions: { $lte: 0 } },
+          { $expr: { $lt: ["$usage", "$globalMaxRedemptions"] } },
+        ],
+      },
+      { $inc: { usage: 1 } },
+      options,
+    );
+    if (claim.modifiedCount !== 1) {
+      throw couponError(GLOBAL_CAP_MESSAGE, 409);
     }
 
-    coupon.usage = coupon.usedBy.reduce((total, entry) => total + Number(entry.count || 0), 0);
-    await coupon.save(session ? { session } : undefined);
+    // ── 2. RECORD THE PER-CUSTOMER ROW ────────────────────────────────────────
+    // Upsert, so the first redemption creates the row and later ones increment it.
+    // Both writes are inside the caller's transaction, so a rollback anywhere later
+    // in checkout un-redeems the coupon completely rather than leaving the global
+    // counter advanced against a row that never appeared.
+    await CouponRedemption.updateOne(
+      { coupon: normalizedCouponId, user: userId },
+      { $inc: { count: 1 }, $set: { lastUsedAt: new Date() } },
+      { upsert: true, ...options },
+    );
+
+    // Keep the in-memory document consistent with what was just written, since the
+    // caller serialises this object straight back to the client.
+    coupon.usage = (Number(coupon.usage) || 0) + 1;
   }
 
   return {
@@ -222,6 +337,6 @@ export const calculateCouponDiscount = async ({
     eligibleQuantity,
     minPurchaseAmount,
     eligibleSubtotal,
-    remainingUses: Math.max(0, perUserLimit - usedCount - (redeem ? 1 : 0)),
+    remainingUses: Math.max(0, usesRemaining - (redeem ? 1 : 0)),
   };
 };

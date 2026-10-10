@@ -1,6 +1,7 @@
 import UserProfile from "./UserProfile.model.js";
 import ReferralSetting from "../referral/ReferralSetting.model.js";
 import CouponModel from "../coupons/coupon.model.js";
+import CouponRedemption from "../coupons/coupon-redemption.model.js";
 
 import { deleteImageAsset, saveImageAsset } from "../../utils/image-upload.js";
 import {
@@ -445,12 +446,21 @@ export const GetReferralStats = async (req, res) => {
           expireDate: { $gte: new Date() },
           maxLimit: 1,
         })
-          .select("couponId discountType discountValue minPurchaseAmount expireDate usedBy")
+          .select("couponId discountType discountValue minPurchaseAmount expireDate")
           .lean()
       : null;
-    const signupDiscountUsed = signupDiscountCoupon?.usedBy?.some(
-      (entry) => String(entry.user) === String(userId) && Number(entry.count || 0) > 0,
-    );
+    // An indexed lookup on the redemption row. This used to scan the coupon's
+    // `usedBy` array, which no longer exists — per-customer counts moved to
+    // CouponRedemption so the array could stop growing without bound.
+    const signupDiscountUsed = signupDiscountCoupon
+      ? Boolean(
+          await CouponRedemption.exists({
+            coupon: signupDiscountCoupon.couponId,
+            user: userId,
+            count: { $gt: 0 },
+          }),
+        )
+      : false;
 
     return res.status(200).json({
       success: true,

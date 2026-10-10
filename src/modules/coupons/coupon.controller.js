@@ -7,7 +7,11 @@ import UserModel from "../../model/User.model.js";
 import {
   calculateCouponDiscount,
   couponError,
+  globalCapReached,
+  hasCouponAllowanceLeft,
 } from "./coupon.service.js";
+import CouponRedemption from "./coupon-redemption.model.js";
+import { EXCLUDE_AWAITING_PAYMENT } from "../orders/order-visibility.js";
 
 const parseDate = (value, endOfDay = false) => {
   if (!value) return null;
@@ -85,9 +89,11 @@ const serializeCoupon = (coupon) => {
     maxLimit: source.maxLimit,
     minPurchaseAmount: Number(source.minPurchaseAmount) || 0,
     maxPurchaseAmount: Number(source.maxPurchaseAmount) || 0,
-    usage: Array.isArray(source.usedBy)
-      ? source.usedBy.reduce((total, entry) => total + Number(entry.count || 0), 0)
-      : source.usage || 0,
+    // Read straight off the coupon. This used to re-sum the `usedBy` array because
+    // `usage` could not be trusted; per-customer counts now live in
+    // CouponRedemption and `usage` is the authoritative total.
+    usage: Number(source.usage) || 0,
+    globalMaxRedemptions: Number(source.globalMaxRedemptions) || 0,
     isActive: source.isActive,
     createdAt: source.createdAt,
     updatedAt: source.updatedAt,
@@ -117,6 +123,11 @@ const buildCouponPayload = async (body = {}, existing = {}) => {
   if (body.startDate !== undefined) payload.startDate = parseDate(body.startDate);
   if (body.expireDate !== undefined) payload.expireDate = parseDate(body.expireDate, true);
   if (body.maxLimit !== undefined) payload.maxLimit = Number(body.maxLimit);
+  // The TOTAL budget across all customers; 0 means unlimited. Kept separate from
+  // maxLimit, which is the per-customer allowance.
+  if (body.globalMaxRedemptions !== undefined) {
+    payload.globalMaxRedemptions = Math.max(0, Number(body.globalMaxRedemptions) || 0);
+  }
   if (getMinPurchaseAmount(body) !== undefined) {
     payload.minPurchaseAmount = Number(getMinPurchaseAmount(body));
   }
@@ -192,6 +203,7 @@ const buildCouponPayload = async (body = {}, existing = {}) => {
     discountType: "percentage",
     targetType: "all",
     maxLimit: 1,
+    globalMaxRedemptions: 0,
     minPurchaseAmount: 0,
     maxPurchaseAmount: 0,
     isActive: true,
@@ -239,6 +251,13 @@ const buildCouponPayload = async (body = {}, existing = {}) => {
   }
   if (Number.isNaN(Number(merged.maxLimit)) || Number(merged.maxLimit) < 1) {
     throw couponError("Max limit must be at least 1");
+  }
+  // 0 is the "unlimited" sentinel, so only negatives and non-numbers are rejected.
+  if (
+    Number.isNaN(Number(merged.globalMaxRedemptions)) ||
+    Number(merged.globalMaxRedemptions) < 0
+  ) {
+    throw couponError("Total redemption limit must be 0 (unlimited) or greater");
   }
   if (
     Number.isNaN(Number(merged.minPurchaseAmount)) ||
@@ -288,8 +307,38 @@ const sendCsv = (res, filename, rows) => {
   return res.status(200).send(csv);
 };
 
+/**
+ * Switches off every coupon whose expiry has passed.
+ *
+ * Expiry was already enforced at redemption (validateCouponDates in coupon.service.js),
+ * so an expired coupon could never be used — but nothing said so in the admin panel,
+ * where the status badge read `isActive` alone. A coupon that had lapsed still showed a
+ * green "Active" pill, which is why setting an expiry date looked like it did nothing.
+ *
+ * Reconciled here rather than by a scheduler because this deployment has none, and the
+ * admin list is the one place the answer has to be right. A write on a GET is unusual;
+ * it is confined to a single conditional updateMany that only ever moves `true` -> `false`
+ * for a date that has already passed, so it is idempotent and cannot race meaningfully —
+ * two concurrent admins loading the page produce the same result as one.
+ *
+ * Note the consequence, which is deliberate: extending an expired coupon's date does NOT
+ * bring it back on its own, because `isActive` has really been written to false. The admin
+ * re-enables it with the Active toggle, and the form says so.
+ */
+const deactivateExpiredCoupons = async () => {
+  const result = await CouponModel.updateMany(
+    { isActive: true, expireDate: { $lt: new Date() } },
+    { $set: { isActive: false } },
+  );
+  return result?.modifiedCount || 0;
+};
+
 export const AdminGetCoupons = async (req, res) => {
   try {
+    // Before reading, not after: the list the admin sees must already agree with what
+    // checkout would do, or the panel goes on lying about which coupons are live.
+    await deactivateExpiredCoupons();
+
     const coupons = await CouponModel.find()
       .populate("product_id", "name image brand price")
       .populate("category_id", "name")
@@ -385,9 +434,7 @@ export const AdminCouponUsageReport = async (req, res) => {
       .lean();
 
     const data = coupons.map((coupon) => {
-      const usageCount = Array.isArray(coupon.usedBy)
-        ? coupon.usedBy.reduce((sum, item) => sum + Number(item.count || 0), 0)
-        : 0;
+      const usageCount = Number(coupon.usage) || 0;
       return {
         couponId: coupon.couponId,
         targetType: coupon.targetType,
@@ -432,6 +479,7 @@ export const ExportCouponUsageReport = async (req, res) => {
         "discountValue",
         "usageCount",
         "maxLimit",
+        "globalMaxRedemptions",
         "isActive",
         "startDate",
         "expireDate",
@@ -443,10 +491,9 @@ export const ExportCouponUsageReport = async (req, res) => {
         coupon.assignedUser?.email || coupon.customerEmail || "",
         coupon.discountType,
         coupon.discountValue,
-        Array.isArray(coupon.usedBy)
-          ? coupon.usedBy.reduce((sum, item) => sum + Number(item.count || 0), 0)
-          : 0,
+        Number(coupon.usage) || 0,
         coupon.maxLimit,
+        Number(coupon.globalMaxRedemptions) || 0,
         coupon.isActive,
         coupon.startDate?.toISOString?.() || "",
         coupon.expireDate?.toISOString?.() || "",
@@ -509,16 +556,51 @@ export const GetAvailableCoupons = async (req, res) => {
       .sort({ expireDate: 1 })
       .lean();
 
-    const usedCouponIds = await OrderModel.distinct("coupon", {
-      user: req.user.id,
-      coupon: { $ne: null },
-      paymentStatus: { $ne: "Failed" },
-    });
-    const usedCouponIdSet = new Set(usedCouponIds.map((couponId) => String(couponId).toUpperCase()));
+    // How many REAL orders this customer has placed per coupon.
+    //
+    // A grouped count, not `distinct`, because the allowance is `maxLimit` uses —
+    // "appears at all" would cap every coupon at one regardless of configuration.
+    // And EXCLUDE_AWAITING_PAYMENT, because a Razorpay order exists at Pending
+    // BEFORE payment: without it, starting a checkout with a coupon and abandoning
+    // it hid that coupon from this list forever, while calculateCouponDiscount --
+    // which has always applied the filter -- would still have accepted it. The
+    // customer could no longer see the coupon they were still entitled to use.
+    const couponOrderCounts = await OrderModel.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(String(req.user.id)),
+          coupon: { $ne: null },
+          paymentStatus: { $ne: "Failed" },
+          ...EXCLUDE_AWAITING_PAYMENT,
+        },
+      },
+      { $group: { _id: { $toUpper: "$coupon" }, count: { $sum: 1 } } },
+    ]);
+    const ordersByCoupon = new Map(
+      couponOrderCounts.map((row) => [String(row._id), Number(row.count) || 0]),
+    );
 
+    // Every redemption row this customer has, in ONE indexed read, rather than a
+    // lookup per listed coupon.
+    const redemptions = await CouponRedemption.find({ user: req.user.id })
+      .select("coupon count")
+      .lean();
+    const redemptionsByCoupon = new Map(
+      redemptions.map((row) => [String(row.coupon).toUpperCase(), Number(row.count) || 0]),
+    );
+
+    // Exactly the rules the checkout validator applies, from the same functions, so
+    // the list and checkout cannot disagree about whether a coupon is usable: the
+    // per-customer allowance, and the coupon's total budget.
     const availableCoupons = coupons.filter((coupon) => {
-      const usage = coupon.usedBy.find((entry) => String(entry.user) === String(req.user.id));
-      return Number(usage?.count || 0) < 1 && !usedCouponIdSet.has(String(coupon.couponId).toUpperCase());
+      const key = String(coupon.couponId).toUpperCase();
+      return (
+        hasCouponAllowanceLeft(
+          coupon,
+          redemptionsByCoupon.get(key) || 0,
+          ordersByCoupon.get(key) || 0,
+        ) && !globalCapReached(coupon)
+      );
     });
 
     return res.status(200).json({

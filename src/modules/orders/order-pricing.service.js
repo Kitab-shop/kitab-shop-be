@@ -169,12 +169,21 @@ export const prepareOrderData = async ({
     subtotal += price * quantity;
   }
 
+  // Pricing only. Redemption belongs to the two transactional call sites — PlaceOrder
+  // and completeCapturedIntent — which own a session and can roll the redemption back
+  // with the order. This function has no session to pass, so a redemption started here
+  // would commit on its own and survive a failed checkout, spending the customer's
+  // allowance and a slot of the coupon's global budget on an order that never existed.
+  // Every caller passes false today; this refuses rather than waits to be discovered.
+  if (redeemCoupon) {
+    throw orderError("Coupon redemption cannot be performed during pricing", 500);
+  }
   const couponResult = coupon
     ? await calculateCouponDiscount({
         couponId: coupon,
         userId,
         items,
-        redeem: redeemCoupon,
+        redeem: false,
       })
     : null;
   const couponDiscount = Math.min(subtotal, Math.max(0, Number(couponResult?.discount) || 0));
