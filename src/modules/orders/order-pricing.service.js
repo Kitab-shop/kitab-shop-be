@@ -79,6 +79,10 @@ export const prepareOrderData = async ({
   userId,
   redeemCoupon = false,
   useWallet = false,
+  // COD parcels cost the courier more to carry, so the rate depends on it. Defaults
+  // to the prepaid quote, which is what every caller effectively asked for before
+  // this existed.
+  paymentMethod = "RAZORPAY",
 }) => {
   if (!Array.isArray(items) || items.length === 0) {
     throw orderError("Order must contain at least one item");
@@ -231,9 +235,14 @@ export const prepareOrderData = async ({
   if (shippingRatesEnabled) {
     const rate = await getCheapestShippingRate({
       deliveryPostcode: shippingAddress.pincode,
+      // The REAL method. This was hardcoded false, so a COD order was quoted — and
+      // charged — the prepaid rate, silently absorbing the courier's COD handling
+      // fee on every cash order. Inert while shippingRatesEnabled is off, which is
+      // why it is worth fixing before anyone switches rates on.
+      //
       // The COD gate asks the same question a moment later; the memo inside
       // checkServiceability means both reads are one call.
-      cod: false,
+      cod: String(paymentMethod).toUpperCase() === "COD",
       declaredValue: subtotal,
     });
     if (rate.ok) shippingCharge = rate.amount;

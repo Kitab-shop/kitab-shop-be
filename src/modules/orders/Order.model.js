@@ -174,6 +174,14 @@ const OrderSchema = new mongoose.Schema(
 
     paymentMethod: {
       type: String,
+      // Only COD and RAZORPAY are reachable: PlaceOrder refuses anything but COD,
+      // and the prepaid path always writes RAZORPAY. "UPI" and "CARD" predate the
+      // gateway integration — a Razorpay payment may BE a UPI or card payment, but
+      // that is the instrument inside the gateway, not the method we record.
+      //
+      // Kept rather than removed. An enum constrains stored documents as well as new
+      // ones, so dropping a value would make any historical order carrying it fail
+      // validation on its next save — a real risk for no benefit.
       enum: ["COD", "UPI", "CARD", "RAZORPAY"],
       default: "COD",
     },

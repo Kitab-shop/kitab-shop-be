@@ -86,6 +86,7 @@ export const CreateRazorpayOrder = async (req, res) => {
           userId: req.user.id,
           redeemCoupon: false,
           useWallet: Boolean(useWallet),
+          paymentMethod: "RAZORPAY",
         });
         currentAmount = Math.round(currentOrder.totalAmount * 100);
       } catch {
@@ -127,6 +128,7 @@ export const CreateRazorpayOrder = async (req, res) => {
       userId: req.user.id,
       redeemCoupon: false,
       useWallet: Boolean(useWallet),
+      paymentMethod: "RAZORPAY",
     });
     const amount = Math.round(preparedOrder.totalAmount * 100);
     if (amount < 100) {

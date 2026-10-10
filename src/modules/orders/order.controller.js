@@ -78,6 +78,7 @@ export const PreviewOrderPricing = async (req, res) => {
       shippingAddress: rawShippingAddress,
       coupon,
       useWallet,
+      paymentMethod,
     } = req.body;
 
     const preparedOrder = await prepareOrderData({
@@ -87,6 +88,9 @@ export const PreviewOrderPricing = async (req, res) => {
       userId,
       redeemCoupon: false,
       useWallet: Boolean(useWallet),
+      // The preview must quote the method the customer is actually looking at, or
+      // the figure they are shown is not the figure they will be charged.
+      paymentMethod,
     });
 
     return res.status(200).json({
@@ -194,6 +198,9 @@ export const PlaceOrder = async (req, res) => {
       userId,
       redeemCoupon: false,
       useWallet: Boolean(useWallet),
+      // A literal, not req.body: the guard at the top of this handler has already
+      // refused every other method, so COD is a server-established fact here.
+      paymentMethod: "COD",
     });
 
     if (checkoutSettings.codMinOrderAmount > 0 && preparedOrder.totalAmount < checkoutSettings.codMinOrderAmount) {

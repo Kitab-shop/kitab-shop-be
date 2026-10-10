@@ -86,6 +86,9 @@ export const orderPricingPreviewSchema = {
     shippingAddress: shippingAddress.optional(),
     coupon: z.unknown().optional(),
     useWallet: z.coerce.boolean().optional(),
+    // Only decides which shipping rate is quoted. Not trusted for anything else —
+    // PlaceOrder establishes the real payment method itself.
+    paymentMethod: z.string().max(20).optional(),
   }),
 };
 
