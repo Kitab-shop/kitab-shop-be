@@ -782,6 +782,12 @@ OrderSchema.index(
   { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } },
 );
 OrderSchema.index({ user: 1, createdAt: -1 });
+// countOrdersWithCoupon runs INSIDE the checkout transaction and filters
+// { user, coupon, paymentStatus, ... }. `coupon` was indexed nowhere, so the query was
+// served by the `user` prefix alone and then filtered every order that customer had ever
+// placed in memory — a cost that grows with their order history, paid on every coupon
+// checkout, while holding a transaction open.
+OrderSchema.index({ user: 1, coupon: 1 });
 OrderSchema.index({ createdAt: -1 });
 // Backs the admin Orders page's status filter (GetAllOrders), which always
 // sorts by createdAt alongside any orderStatus filter it applies.

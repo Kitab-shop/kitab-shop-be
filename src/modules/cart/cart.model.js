@@ -45,4 +45,10 @@ const cartSchema = new mongoose.Schema(
   },
 );
 
+// AdminGetAbandonedCarts filters a RANGE on updatedAt and sorts on the same field. With
+// no index that is a collection scan plus a blocking in-memory sort, and only then the
+// .limit(100) — the limit bounded what came back, not what was read. Indexed, the scan
+// walks in sort order and stops at 100.
+cartSchema.index({ updatedAt: 1 });
+
 export default mongoose.model("Cart", cartSchema);

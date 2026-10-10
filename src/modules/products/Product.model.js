@@ -309,9 +309,17 @@ productSchema.index({ bestseller: 1, category_id: 1 });
 // collection scan, even when the query itself has no filter at all.
 productSchema.index({ bestseller: -1, viewCount: -1, createdAt: -1 });
 productSchema.index({ viewCount: -1, createdAt: -1 });
-// NOTE: adding a field to a text index does not alter an existing index in
-// place — on a database that predates `author` here, drop the old text index
-// once so Mongoose can recreate it (the fresh book-commerce DB builds it clean).
-productSchema.index({ name: "text", brand: "text", author: "text", producthightlight: "text", description: "text" });
+// REMOVED: a five-field text index (name/brand/author/producthightlight/description).
+// Nothing ever queried it — `grep -rn '\$text\|textScore' src/` returned nothing — because
+// SearchProducts and AutocompleteProducts both use case-insensitive regex instead. It was
+// pure cost: rebuilt on every boot under autoIndex, it kept `description` (the largest
+// field in the document) resident in the WiredTiger cache, and every product write and
+// every CSV bulk import paid full text tokenisation of it for no reader.
+//
+// If search is ever moved to `$text`, re-add it — and note that adding a field to a text
+// index does not alter an existing one in place, so the old index must be dropped first.
+//
+// An existing deployment still has the built index; drop it once by hand:
+//   db.products.dropIndex("name_text_brand_text_author_text_producthightlight_text_description_text")
 
 export default mango.model("ProductModel", productSchema, "products");

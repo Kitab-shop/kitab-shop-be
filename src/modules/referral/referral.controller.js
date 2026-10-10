@@ -92,9 +92,20 @@ export const getReferralDetails = async (req, res) => {
       .limit(100)
       .lean();
 
-    const usedCouponsList = await Promise.all(usedCoupons.map(async (coupon) => {
-      // Find the profile of this assigned user to get their name
-      const profile = await UserProfile.findOne({ userid: coupon.assignedUser?._id }).lean();
+    // One query for all of them. This was a Promise.all over up to 100 separate
+    // UserProfile.findOne calls — fired at once against a connection pool of 10, so 90 of
+    // them queued on sockets while the other 10 ran, and the endpoint's latency was
+    // whatever that backlog drained in.
+    const assignedUserIds = usedCoupons
+      .map((coupon) => coupon.assignedUser?._id)
+      .filter(Boolean);
+    const profiles = assignedUserIds.length
+      ? await UserProfile.find({ userid: { $in: assignedUserIds } }).lean()
+      : [];
+    const profileByUserId = new Map(profiles.map((profile) => [String(profile.userid), profile]));
+
+    const usedCouponsList = usedCoupons.map((coupon) => {
+      const profile = profileByUserId.get(String(coupon.assignedUser?._id)) || null;
       return {
         couponId: coupon._id,
         couponCode: coupon.couponId,
@@ -103,7 +114,7 @@ export const getReferralDetails = async (req, res) => {
         discountAmount: coupon.discountValue,
         usedAt: coupon.updatedAt
       };
-    }));
+    });
 
     return res.status(200).json({
       success: true,

@@ -320,6 +320,23 @@ const RELEVANCE_RANKING_FIELDS =
   "name brand author producthightlight description bestseller viewCount createdAt";
 const FUZZY_RANKING_FIELDS = "name brand author producthightlight viewCount category_id";
 
+/**
+ * Ceilings on the two ranking passes below.
+ *
+ * Both used to be unbounded. The relevance pass loaded EVERY regex match into Node to
+ * sort in JavaScript, and the fuzzy pass read the entire collection — the latter firing
+ * on any search returning fewer than 3 hits, which is every typo. On a 1-vCPU VPS with a
+ * self-hosted mongod that is the most expensive thing a logged-out visitor can trigger,
+ * and the only thing in front of it is a rate limiter.
+ *
+ * Both passes rank a candidate set and then show one page of it, so a ceiling costs
+ * nothing a user can perceive: no one reaches page 40 of a fuzzy match. The autocomplete
+ * fuzzy fallback already capped itself at 200 — these are the same idea, applied to the
+ * paths that were missed.
+ */
+const RELEVANCE_CANDIDATE_LIMIT = 500;
+const FUZZY_CANDIDATE_LIMIT = 400;
+
 /** Re-reads a ranked page of products in full, preserving the ranked order. */
 const hydrateRankedPage = async (rankedIds) => {
   if (rankedIds.length === 0) return [];
@@ -392,10 +409,18 @@ export const SearchProducts = async (req, res) => {
       // (exact/prefix/word-match on name beats a weaker brand-only match),
       // falling back to popularity only to break ties within the same
       // relevance tier.
-      const candidates = await productModel
-        .find(filter)
-        .select(RELEVANCE_RANKING_FIELDS)
-        .lean();
+      // countDocuments runs alongside rather than being inferred from the candidate
+      // array: with a ceiling in place `candidates.length` is no longer the true match
+      // count, and pagination reads `total`. The count still scans, but it never
+      // materialises documents into Node, which was the part that actually hurt.
+      const [candidates, matchCount] = await Promise.all([
+        productModel
+          .find(filter)
+          .select(RELEVANCE_RANKING_FIELDS)
+          .limit(RELEVANCE_CANDIDATE_LIMIT)
+          .lean(),
+        productModel.countDocuments(filter),
+      ]);
       candidates.sort((a, b) => {
         const relevanceDiff = computeRelevanceScore(q, a) - computeRelevanceScore(q, b);
         if (relevanceDiff !== 0) return relevanceDiff;
@@ -405,7 +430,7 @@ export const SearchProducts = async (req, res) => {
         if ((b.viewCount || 0) !== (a.viewCount || 0)) return (b.viewCount || 0) - (a.viewCount || 0);
         return new Date(b.createdAt) - new Date(a.createdAt);
       });
-      total = candidates.length;
+      total = matchCount;
       products = await hydrateRankedPage(
         candidates.slice((page - 1) * limit, page * limit).map((candidate) => candidate._id),
       );
@@ -429,11 +454,15 @@ export const SearchProducts = async (req, res) => {
       // a book that is not already among the most-viewed. The DB sort stays
       // because Array.sort is stable: it is what breaks ties between equal
       // score and view count.
+      // The sort is index-backed by { viewCount: -1, createdAt: -1 }, so the ceiling
+      // takes the most-viewed N — exactly the set a typo should be matched against.
+      // The populate stays: fuzzyScore reads category_id.name.
       const candidates = await productModel
         .find({})
         .select(FUZZY_RANKING_FIELDS)
         .populate("category_id", "name")
         .sort({ viewCount: -1, createdAt: -1 })
+        .limit(FUZZY_CANDIDATE_LIMIT)
         .lean();
       const fuzzyMatches = candidates
         .map((product) => ({ product, score: fuzzyScore(q, product) }))
