@@ -37,7 +37,8 @@ import festivalRoutes from "./modules/festival/festival.routes.js";
 import seasonRoutes from "./modules/season/season.routes.js";
 import newsletterRoutes from "./modules/newsletter/newsletter.routes.js";
 import { router as seoRoutes } from "./modules/seo/index.js";
-import { startStockReservationCleanup } from "./modules/inventory/stock-reservation-cleanup.service.js";
+import mongoose from "mongoose";
+import { startStockReservationCleanup, stopStockReservationCleanup } from "./modules/inventory/stock-reservation-cleanup.service.js";
 import { getHttpConfig } from "./config/features.config.js";
 import {
 	ensureUploadDirs,
@@ -213,8 +214,47 @@ app.use((err, req, res, next) => {
 
 const port = process.env.PORT || process.env.port || 3000;
 
-app.listen(port, () =>
+const server = app.listen(port, () =>
 	console.log(`Server is running on port ${port}`)
 );
+
+/**
+ * Graceful shutdown.
+ *
+ * There was no signal handler at all, while ecosystem.config.cjs sets
+ * `max_memory_restart: "1G"` — so PM2 already signal-kills this process periodically,
+ * mid-request, with checkout transactions potentially in flight. The order of operations
+ * matters: stop accepting new work, stop the background sweep so it cannot start writing
+ * during the close, then close Mongo.
+ *
+ * The forced exit is a backstop, not the path: if a request is still open after 10s it is
+ * not going to finish, and PM2's own SIGKILL would arrive shortly anyway.
+ */
+let shuttingDown = false;
+const shutdown = async (signal) => {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	console.log(`${signal} received — shutting down`);
+
+	const forceExit = setTimeout(() => {
+		console.error("Shutdown timed out after 10s — exiting");
+		process.exit(1);
+	}, 10000);
+	forceExit.unref?.();
+
+	try {
+		await new Promise((resolve) => server.close(resolve));
+		stopStockReservationCleanup();
+		await mongoose.connection.close(false);
+		console.log("Shutdown complete");
+		process.exit(0);
+	} catch (error) {
+		console.error("Shutdown error:", error?.message || error);
+		process.exit(1);
+	}
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 export default app;

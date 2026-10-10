@@ -142,3 +142,16 @@ export const startStockReservationCleanup = () => {
   runCleanup();
   return cleanupTimer;
 };
+
+/**
+ * Stops the sweep. Called from the shutdown handler in index.js so a SIGTERM does not
+ * start a fresh cleanup pass while the Mongo connection is being closed underneath it.
+ *
+ * The timer is already unref'd, so this is not what lets the process exit — it is what
+ * stops a half-run sweep from writing during the close.
+ */
+export const stopStockReservationCleanup = () => {
+  if (!cleanupTimer) return;
+  clearInterval(cleanupTimer);
+  cleanupTimer = null;
+};
