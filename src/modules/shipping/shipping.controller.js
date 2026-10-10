@@ -23,6 +23,7 @@ import {
   schedulePickup,
   trackAwb,
 } from "./shiprocket.service.js";
+import { ensureBillNumber } from "../orders/bill-number.service.js";
 import { ADMIN_PERMISSIONS } from "../../config/admin-permissions.config.js";
 import { adminHasPermission } from "../../config/admin-access.service.js";
 import {
@@ -1221,6 +1222,30 @@ export const ShippingWebhook = async (req, res) => {
       await OrderModel.updateOne(
         { _id: order._id, paymentMethod: "COD", paymentStatus: "Pending" },
         { $set: { paymentStatus: "Paid" } },
+      );
+    }
+
+    // Delivery is the point of supply, so the bill of supply is numbered here too.
+    //
+    // The `|| existing.orderStatus === "Delivered"` half is a DELIBERATE difference
+    // from the COD gate directly above, not an oversight. COD must not self-heal on
+    // a replay — re-running it would risk booking cash twice. Numbering is
+    // compare-and-swap protected inside ensureBillNumber and therefore genuinely
+    // idempotent, so letting a duplicate webhook repair a mint that failed the first
+    // time costs nothing and saves a manual migration run.
+    //
+    // The `applyStatus` half still does its job: a stale Delivered event against an
+    // order the customer already cancelled is rejected by the transition gate, no
+    // supply occurred, and no bill may be issued for it.
+    if (
+      order &&
+      mappedStatus === "Delivered" &&
+      (applyStatus || existing.orderStatus === "Delivered")
+    ) {
+      await ensureBillNumber(order._id).catch((error) =>
+        logLifecycleError("shipping", "bill_number_mint_failed", error, {
+          orderId: String(order._id),
+        }),
       );
     }
 

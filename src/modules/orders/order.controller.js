@@ -59,6 +59,8 @@ import { canTransitionOrderStatus } from "./order-status.rules.js";
 // resulting ledger state live in one place rather than being re-implemented per
 // cancellation path.
 import { adminHasPermission } from "../../config/admin-access.service.js";
+import { ensureBillNumber } from "./bill-number.service.js";
+import { logLifecycleError } from "../../utils/lifecycle-logger.service.js";
 
 const ADMIN_PURCHASE_MESSAGE =
   "Admin accounts cannot add products to cart or place orders. Please use a customer account.";
@@ -696,6 +698,34 @@ export const UpdateOrderStatus = async (req, res) => {
       order.paymentStatus = "Paid";
     }
     await order.save();
+
+    // Delivery is the point of supply, so it is where the bill of supply gets its
+    // number. Three deliberate choices here:
+    //
+    // AFTER the save, because the status change is what actually matters and is
+    // already durable at this point; AWAITED, because the response below carries
+    // the number back to the admin screen and a fire-and-forget mint would leave
+    // it blank until a refetch; and CAUGHT, because a numbering failure must never
+    // turn a successful delivery into a 500 — `npm run migrate:bill-numbers` is
+    // the repair path, which is the second reason that script has to stay
+    // re-runnable.
+    //
+    // The "Completed" arm is a BACKSTOP, not a second primary path: the transition
+    // table makes Completed unreachable except from Delivered, so an order arriving
+    // here as Completed either predates this feature or had its Delivered mint
+    // fail. Do not "optimise" it away on the grounds that Delivered already covers
+    // it. ensureBillNumber is a no-op when a number already exists.
+    if (orderStatus === "Delivered" || orderStatus === "Completed") {
+      try {
+        const issued = await ensureBillNumber(order._id);
+        if (issued?.order?.bill) order.bill = issued.order.bill;
+      } catch (error) {
+        logLifecycleError("orders", "bill_number_mint_failed", error, {
+          orderId: String(order._id),
+          orderStatus,
+        });
+      }
+    }
 
     // The success sign-off: tell the customer their order completed. Fire-and-
     // forget, after the save is durable.

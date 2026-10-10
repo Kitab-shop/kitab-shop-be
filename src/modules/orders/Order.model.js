@@ -278,6 +278,48 @@ const OrderSchema = new mongoose.Schema(
       default: null,
     },
 
+    /**
+     * The bill of supply issued for this order, minted once when it is delivered.
+     *
+     * "Bill of supply" and not "tax invoice" on purpose: printed books are nil-rated
+     * (HSN 4901) and the seller is not GST-registered, so `tax` is structurally 0 and
+     * there is no GSTIN to print. See bill-number.service.js.
+     *
+     * A plain nested path rather than a sub-schema, matching how `shiprocket.*` is
+     * declared — a sub-schema would not persist `null` defaults on an unbilled order,
+     * and the partial unique index below depends on an explicit null being stored.
+     *
+     * `financialYear` and `sequence` are kept alongside the formatted string rather
+     * than parsed back out of it: they are what an accountant filters and sorts on,
+     * and re-deriving them from "RB/2026-27/0001" is how a prefix change later breaks
+     * reporting without anyone noticing.
+     *
+     * `seller` is a SNAPSHOT of FooterSetting.contact taken at issue time, for the
+     * same reason items snapshot name/author/price above — editing the footer must
+     * never rewrite what an already-issued bill says.
+     */
+    bill: {
+      number: { type: String, default: null },
+      financialYear: { type: String, default: null },
+      sequence: { type: Number, default: null },
+      issuedAt: { type: Date, default: null },
+      // "backfill" marks the rows numbered retroactively by
+      // scripts/migrate-bill-numbers.js, whose issuedAt is the historical delivery
+      // date and whose seller block is today's footer rather than the one in force
+      // at the time. Worth being able to tell apart in an audit.
+      source: {
+        type: String,
+        enum: ["delivery", "backfill"],
+        default: "delivery",
+      },
+      seller: {
+        name: { type: String, default: "" },
+        address: { type: String, default: "" },
+        phone: { type: String, default: "" },
+        email: { type: String, default: "" },
+      },
+    },
+
     adminNotes: {
       type: [
         {
@@ -824,6 +866,29 @@ OrderSchema.index(
     name: "shiprocket_awbCode_unique",
     unique: true,
     partialFilterExpression: { "shiprocket.awbCode": { $type: "string" } },
+  },
+);
+/**
+ * A bill-of-supply number may never be reused. This is the database's own
+ * guarantee of that, independent of the compare-and-swap in ensureBillNumber() —
+ * the CAS stops a second number reaching one order, this stops one number
+ * reaching two orders.
+ *
+ * PARTIAL, not sparse, for exactly the reason spelled out above: `bill.number` is
+ * declared `default: null`, so every unbilled order stores an explicit null. A
+ * `unique + sparse` index would treat those nulls as ordinary duplicate values and
+ * the SECOND unbilled order ever created would fail with E11000 — that is checkout
+ * down, not a subtle bug. `$type: "string"` indexes only the rows carrying a real
+ * number, which is precisely the set that must be unique.
+ *
+ * Named explicitly so scripts/migrate-bill-numbers.js can assert on it by name.
+ */
+OrderSchema.index(
+  { "bill.number": 1 },
+  {
+    name: "bill_number_unique",
+    unique: true,
+    partialFilterExpression: { "bill.number": { $type: "string" } },
   },
 );
 /**
