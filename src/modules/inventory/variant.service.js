@@ -138,6 +138,67 @@ export const availableStockFor = (product, variantKey) => {
 };
 
 /**
+ * What a single unit of a line actually costs — the variant's price when it has
+ * one, the product's otherwise.
+ *
+ * The exact counterpart of `availableStockFor`, and it exists for the same reason:
+ * `variants[].price` was stored, validated and DISPLAYED, but never charged. The
+ * product page shows the variant's price —
+ *
+ *     const displayPrice = selectedSizeOpt?.price ? selectedSizeOpt.price : product.price;
+ *
+ * — and `optionPriceAboveMrp` in product-query.service.js exists solely to stop a
+ * variant being priced above the MRP it will be shown against. Yet both the cart
+ * and `prepareOrderData` read `product.price` unconditionally, so a ₹999 hardcover
+ * variant of a ₹299 paperback was quoted at ₹999 and SOLD at ₹299 — and a variant
+ * priced below the base overcharged the customer. Variant stock was honoured
+ * correctly throughout; only price was missed.
+ *
+ * The fallback is load-bearing, not defensive: `variants[].price` defaults to
+ * `null`, and every product in the catalogue that prices at product level relies on
+ * it to keep behaving exactly as before.
+ *
+ * `> 0` as well as finite, because a variant stored with price 0 is far more likely
+ * to be an unfilled form field than a deliberate giveaway — and the failure modes
+ * are not symmetric: falling back charges the known product price, while trusting
+ * it ships the book for free.
+ */
+export const effectiveUnitPrice = (product, variant) => {
+  const variantPrice = Number(variant?.price);
+  if (Number.isFinite(variantPrice) && variantPrice > 0) return variantPrice;
+  return Number(product?.price) || 0;
+};
+
+/**
+ * The "was" price to show a unit against — the variant's MRP when it has one.
+ *
+ * Moves together with `effectiveUnitPrice` and must keep doing so: the storefront
+ * derives its discount badge from the pair, so a variant-aware price against a
+ * product-level MRP shows a ₹999 hardcover as a discount off the ₹350 paperback
+ * MRP — a negative discount. `optionPriceAboveMrp` guards the same pairing on the
+ * write side, and falls back to the product's MRP in exactly this way.
+ */
+export const effectiveUnitMrp = (product, variant) => {
+  const variantMrp = Number(variant?.mrp);
+  if (Number.isFinite(variantMrp) && variantMrp > 0) return variantMrp;
+  return Number(product?.mrp) || 0;
+};
+
+/**
+ * `effectiveUnitPrice` / `effectiveUnitMrp` for callers holding a variantKey rather
+ * than the variant — the shape the cart and the order pricing path both work in.
+ * Resolves the variant once for both, so the two can never disagree about which
+ * variant they described.
+ */
+export const unitPricingFor = (product, variantKey) => {
+  const variant = findVariant(product, variantKey);
+  return {
+    price: effectiveUnitPrice(product, variant),
+    mrp: effectiveUnitMrp(product, variant),
+  };
+};
+
+/**
  * How many units a shopper can actually buy right now — stock AND sellability.
  *
  * Wraps `availableStockFor` rather than replacing it, and adds the one further

@@ -8,6 +8,7 @@ import {
   lineAvailability,
   normalizeSelectedVariants,
   resolveSoleVariant,
+  unitPricingFor,
   variantKeyFrom,
   variantKeyOf,
 } from "../inventory/variant.service.js";
@@ -66,10 +67,16 @@ const populateCart = async (cart) => {
   const items = cart.items.map((item) => {
     const product = item.product;
     const previousPrice = Number(item.price) || 0;
-    const livePrice = product ? Number(product.price) || 0 : previousPrice;
+    // Priced for THIS line's variant, not for the product: a separately-priced
+    // variant was previously reconciled down to the base product price on every
+    // cart read, so the cart contradicted the product page the customer had just
+    // come from. Resolved once for price and mrp together so the discount the UI
+    // derives from the pair describes a single variant.
+    const livePricing = product ? unitPricingFor(product, item.variantKey || "") : null;
+    const livePrice = livePricing ? livePricing.price : previousPrice;
     const priceChanged = Boolean(product) && livePrice !== previousPrice;
-    const liveMrp = product
-      ? (product.mrp !== undefined ? Number(product.mrp) || livePrice : livePrice)
+    const liveMrp = livePricing
+      ? livePricing.mrp || livePrice
       : Number(item.mrp) || previousPrice;
     // mrp can drift independently of price (e.g. an admin only edits the
     // "was" price) — reconcile it on every read too, not only when price
@@ -265,8 +272,11 @@ const addItemsToCart = async (userId, items, { collectErrors = false } = {}) => 
       throw error;
     }
 
-    const itemPrice = Number(product.price) || 0;
-    const itemMrp = Number(product.mrp ?? itemPrice) || itemPrice;
+    // Snapshotted at the chosen variant's price, the same number the product page
+    // quoted and the same one prepareOrderData will charge.
+    const { price: variantPrice, mrp: variantMrp } = unitPricingFor(product, variantKey);
+    const itemPrice = variantPrice;
+    const itemMrp = variantMrp || itemPrice;
 
     if (existingItem) {
       existingItem.quantity = nextQuantity;

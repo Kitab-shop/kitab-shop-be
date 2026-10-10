@@ -7,6 +7,7 @@ import CheckoutSetting from "./CheckoutSetting.model.js";
 import { getCheapestShippingRate } from "../shipping/shiprocket.service.js";
 import {
   availableStockFor,
+  effectiveUnitPrice,
   findVariant,
   hasVariantStock,
   normalizeSelectedVariants,
@@ -148,7 +149,11 @@ export const prepareOrderData = async ({
       throw orderError(`${product.name} (${variant.name}) is no longer available`);
     }
 
-    const price = Number(product.price) || 0;
+    // The VARIANT's price when it has one — `variant` is already resolved above for
+    // the `active` check. This read used `product.price` unconditionally, so a
+    // separately-priced variant was quoted to the customer at its own price and sold
+    // at the base product's. See effectiveUnitPrice for the full account.
+    const price = effectiveUnitPrice(product, variant);
     orderItems.push({
       product: product._id,
       name: product.name,
