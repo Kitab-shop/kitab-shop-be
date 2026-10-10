@@ -95,12 +95,12 @@ const FooterSettingSchema = new mongoose.Schema(
       },
       email: {
         type: String,
-        default: "support@kitabshop.com",
+        default: "support@rivermossbooks.com",
         trim: true,
       },
       address: {
         type: String,
-        default: "Kitab Shop Commerce Pvt. Ltd.\nIDPL, Rishikesh,\nUttarakhand 249201",
+        default: "Rivermoss Books\nIDPL, Rishikesh,\nUttarakhand 249201",
         trim: true,
       },
       mapUrl: {

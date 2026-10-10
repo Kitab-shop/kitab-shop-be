@@ -43,8 +43,8 @@ const defaultFooterSettings = {
   ],
   contact: {
     phone: "+91 98XXX XXXXX",
-    email: "support@kitabshop.com",
-    address: "Kitab Shop Commerce Pvt. Ltd.\nIDPL, Rishikesh,\nUttarakhand 249201",
+    email: "support@rivermossbooks.com",
+    address: "Rivermoss Books\nIDPL, Rishikesh,\nUttarakhand 249201",
     mapUrl: "https://www.google.com/maps/search/?api=1&query=IDPL+Rishikesh+Uttarakhand",
   },
   newsletterEnabled: true,
