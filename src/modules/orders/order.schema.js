@@ -39,6 +39,7 @@ const orderItem = looseBody({
 
 const shippingAddress = looseBody({
   name: boundedString({ label: "Name", max: 120 }).optional(),
+  fullName: boundedString({ label: "Name", max: 120 }).optional(),
   phone: z
     .string()
     .trim()
@@ -46,6 +47,10 @@ const shippingAddress = looseBody({
     .optional(),
   addressLine1: boundedString({ label: "Address", max: 250 }).optional(),
   addressLine2: z.string().trim().max(250).optional(),
+  // Legacy single-line form of addressLine1, still sent by older clients.
+  address: boundedString({ label: "Address", max: 600 }).optional(),
+  landmark: z.string().trim().max(120).optional(),
+  district: z.string().trim().max(100).optional(),
   city: boundedString({ label: "City", max: 100 }).optional(),
   state: z.enum(INDIAN_STATES, { error: "Select a valid Indian state or union territory" }).optional(),
   pincode: z

@@ -133,11 +133,20 @@ const OrderSchema = new mongoose.Schema(
         trim: true,
       },
 
+      // The full single-line address (line 1, line 2 and landmark joined) —
+      // what invoices, emails and the courier read. The structured parts
+      // below are kept alongside it; orders placed before they existed only
+      // have this field.
       address: {
         type: String,
         required: true,
         trim: true,
       },
+
+      addressLine1: { type: String, trim: true, default: "" },
+      addressLine2: { type: String, trim: true, default: "" },
+      landmark: { type: String, trim: true, default: "" },
+      district: { type: String, trim: true, default: "" },
 
       city: {
         type: String,

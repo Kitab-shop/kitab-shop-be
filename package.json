@@ -19,6 +19,7 @@
     "reconcile:variant-stock": "node scripts/reconcile-variant-stock.js",
     "migrate:return-open-index": "node scripts/migrate-return-open-index.js",
     "migrate:coupon-redemptions": "node scripts/migrate-coupon-redemptions.js",
+    "build:pincodes": "node scripts/build-pincode-data.js",
     "db:backup": "bash scripts/backup-db.sh",
     "db:restore": "bash scripts/restore-db.sh",
     "test:money": "node tests/money.regression.mjs",

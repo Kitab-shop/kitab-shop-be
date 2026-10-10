@@ -381,6 +381,21 @@ const splitName = (fullName) => {
   };
 };
 
+// Shiprocket prints address and address_2 on separate label lines. Orders
+// placed before addresses were structured only carry the joined `address`.
+export const splitAddressLines = (address = {}) => {
+  if (!String(address.addressLine1 || "").trim()) {
+    return { line1: address.address, line2: "" };
+  }
+  const landmark = String(address.landmark || "").trim();
+  return {
+    line1: address.addressLine1.trim(),
+    line2: [String(address.addressLine2 || "").trim(), landmark && `Near ${landmark}`]
+      .filter(Boolean)
+      .join(", "),
+  };
+};
+
 export const createShiprocketOrder = async (order, packageOverrides = {}) => {
   const credentials = await getShiprocketCredentials();
   const computedPackage = computeOrderPackage(order, credentials);
@@ -389,6 +404,7 @@ export const createShiprocketOrder = async (order, packageOverrides = {}) => {
   const packageDetails = await resolvePackage({ ...computedPackage, ...packageOverrides });
   const address = order.shippingAddress;
   const customer = splitName(address.fullName);
+  const addressLines = splitAddressLines(address);
   const email = order.user?.email;
 
   if (!email) {
@@ -401,7 +417,8 @@ export const createShiprocketOrder = async (order, packageOverrides = {}) => {
     pickup_location: credentials.pickupLocation,
     billing_customer_name: customer.firstName,
     billing_last_name: customer.lastName,
-    billing_address: address.address,
+    billing_address: addressLines.line1,
+    billing_address_2: addressLines.line2,
     billing_city: address.city,
     billing_pincode: address.pincode,
     billing_state: address.state,
@@ -476,6 +493,7 @@ export const resolveWarehouseAddress = async () => {
 export const createReturnPickup = async ({ returnRequest, order, warehouse, packageOverrides = {} }) => {
   const address = order.shippingAddress;
   const customer = splitName(address.fullName);
+  const addressLines = splitAddressLines(address);
   const email = order.user?.email;
   if (!email) {
     throw new ShiprocketError("Customer email is required to book a return pickup", 400);
@@ -489,7 +507,8 @@ export const createReturnPickup = async ({ returnRequest, order, warehouse, pack
     // FROM the customer.
     pickup_customer_name: customer.firstName,
     pickup_last_name: customer.lastName,
-    pickup_address: address.address,
+    pickup_address: addressLines.line1,
+    pickup_address_2: addressLines.line2,
     pickup_city: address.city,
     pickup_state: address.state,
     pickup_country: address.country || "India",
@@ -539,6 +558,7 @@ export const createReturnPickup = async ({ returnRequest, order, warehouse, pack
 export const createReplacementShipment = async ({ returnRequest, order, packageOverrides = {} }) => {
   const address = order.shippingAddress;
   const customer = splitName(address.fullName);
+  const addressLines = splitAddressLines(address);
   const email = order.user?.email;
   if (!email) {
     throw new ShiprocketError("Customer email is required to dispatch a replacement", 400);
@@ -554,7 +574,8 @@ export const createReplacementShipment = async ({ returnRequest, order, packageO
     pickup_location: credentials.pickupLocation,
     billing_customer_name: customer.firstName,
     billing_last_name: customer.lastName,
-    billing_address: address.address,
+    billing_address: addressLines.line1,
+    billing_address_2: addressLines.line2,
     billing_city: address.city,
     billing_pincode: address.pincode,
     billing_state: address.state,

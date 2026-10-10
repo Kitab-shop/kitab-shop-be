@@ -46,6 +46,7 @@ import {
 } from "./config/storage.config.js";
 
 import { router as userProfileRoutes } from "./modules/profiles/index.js";
+import { router as geoRoutes } from "./modules/geo/index.js";
 import wishlistRoutes from "./modules/wishlist/wishlist.routes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -166,6 +167,8 @@ app.get("/health", (req, res) => {
 app.use("/api/v1/auth", auth);
 
 app.use("/api/v1/user/profile", userProfileRoutes);
+
+app.use("/api/v1/geo", geoRoutes);
 
 app.use("/api/v1/category", categoryRoutes);
 

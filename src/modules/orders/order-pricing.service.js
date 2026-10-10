@@ -29,15 +29,37 @@ export const orderError = (message, statusCode = 400) => {
   return error;
 };
 
-export const normalizeShippingAddress = (address = {}) => ({
-  fullName: address.fullName || address.name || "",
-  phone: address.phone || address.mobile || "",
-  address: address.address || address.line || address.addressLine1 || "",
-  city: address.city || "",
-  state: address.state || "",
-  pincode: address.pincode || "",
-  country: address.country || "India",
-});
+const cleanPart = (value) => String(value || "").trim();
+
+/**
+ * Builds the single-line `address` couriers, invoices and emails print from
+ * the structured parts. Clients that still send one free-text `address`
+ * (or `line`) get it back unchanged as line 1.
+ */
+export const composeAddressLine = ({ addressLine1, addressLine2, landmark }) =>
+  [cleanPart(addressLine1), cleanPart(addressLine2), cleanPart(landmark) && `Near ${cleanPart(landmark)}`]
+    .filter(Boolean)
+    .join(", ");
+
+export const normalizeShippingAddress = (address = {}) => {
+  const parts = {
+    addressLine1: cleanPart(address.addressLine1 || address.line1 || address.address || address.line),
+    addressLine2: cleanPart(address.addressLine2 || address.line2),
+    landmark: cleanPart(address.landmark),
+  };
+
+  return {
+    fullName: address.fullName || address.name || "",
+    phone: address.phone || address.mobile || "",
+    address: composeAddressLine(parts),
+    ...parts,
+    district: cleanPart(address.district),
+    city: address.city || "",
+    state: address.state || "",
+    pincode: address.pincode || "",
+    country: address.country || "India",
+  };
+};
 
 const validateShippingAddress = (shippingAddress) => {
   const missingFields = [];
