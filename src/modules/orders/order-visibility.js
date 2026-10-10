@@ -15,11 +15,13 @@
  * `orderStatus: { $ne: "Cancelled" }` and nothing else, so an abandoned checkout
  * would have landed in `totalRevenue` and in the daily charts.
  *
- * Hence one exported filter, used everywhere, and a test
- * (`tests/orders.visibility.regression.mjs`) that fails if a new aggregate over
- * `orders` forgets it. A COD order at `Pending` is genuinely real — the customer
- * placed it and owes cash on delivery — so the filter is deliberately narrow: it
- * excludes only the prepaid-and-unpaid case.
+ * Hence one exported filter, used everywhere, and a sweep over `src/` in
+ * `test/regression/lifecycle.regression.mjs` (section 1b) that fails if a new aggregate,
+ * count or distinct over `orders` forgets it.
+ *
+ * A COD order at `Pending` is genuinely real — the customer placed it and owes cash
+ * on delivery — so the filter is deliberately narrow: it excludes only the
+ * prepaid-and-unpaid case.
  */
 
 /** Matches ONLY a Razorpay order whose payment has never completed. */

@@ -80,6 +80,7 @@ In production, set `FRONTEND_URL` and `CORS_ALLOWED_ORIGINS` to the deployed fro
 npm run dev                         # Start backend with nodemon
 npm start                           # Start backend with node
 npm test                            # Run full regression suite
+npm run test:unit                   # Run the pure unit tests
 npm run test:lifecycle              # Run lifecycle regression tests
 npm run test:money                  # Run money/pricing regression tests
 npm run test:security               # Run security regression tests
