@@ -20,7 +20,6 @@ export const getFeatures = () => ({
   payments: {
     enabled: readBool("PAYMENTS_ENABLED", false),
     provider: readString("PAYMENT_PROVIDER", "razorpay").toLowerCase(),
-    mode: readString("PAYMENT_MODE", "demo").toLowerCase(),
     razorpayWebhookEnabled: readBool("RAZORPAY_WEBHOOK_ENABLED", false),
   },
   shipping: {
