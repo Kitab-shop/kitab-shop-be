@@ -724,6 +724,9 @@ const OrderSchema = new mongoose.Schema(
         type: String,
         enum: [
           "not_created",
+          // A create request is in flight, or was sent and its outcome is unknown.
+          // Held by `claimToken`; see createForwardShipment in order-shipping.service.js.
+          "creating",
           "created",
           "awb_assigned",
           "pickup_scheduled",
@@ -733,6 +736,93 @@ const OrderSchema = new mongoose.Schema(
           "failed",
         ],
         default: "not_created",
+      },
+      /**
+       * The forward-create claim.
+       *
+       * Set together with syncStatus "creating" by the one atomic update that wins the
+       * right to call Shiprocket, and unset by the write-back. Two clicks, or the
+       * payment-verify path racing the payment webhook, used to create two Shiprocket
+       * orders for one parcel; only one caller can now hold this. The write-back is
+       * filtered on the token, so a stale caller can never store its result over a
+       * resolution an admin has made since.
+       *
+       * A claim that is never released means a request reached Shiprocket and its
+       * answer was lost. That is NOT retried automatically — the shipment may exist —
+       * and an admin resolves it (link the existing shipment, or confirm none exists).
+       */
+      claimToken: {
+        type: String,
+        default: null,
+      },
+      claimedAt: {
+        type: Date,
+        default: null,
+      },
+      // Create attempts, incremented by each successful claim.
+      attempts: {
+        type: Number,
+        default: 0,
+      },
+      // Earliest time an automatic retry may run (reconciliation backoff).
+      nextAttemptAt: {
+        type: Date,
+        default: null,
+      },
+      // Reconciler bookkeeping, kept apart from `attempts` (which counts creation
+      // claims) so a cancellation retry can never spend the creation budget or vice
+      // versa. `trackingCheckedAt` is stamped on every tracking poll — success or not —
+      // so an AWB Shiprocket cannot answer for is polled once per stale window rather
+      // than on every pass.
+      cancelAttempts: {
+        type: Number,
+        default: 0,
+      },
+      trackingCheckedAt: {
+        type: Date,
+        default: null,
+      },
+      // Time of the newest courier event applied, for the out-of-order guard.
+      lastEventAt: {
+        type: Date,
+        default: null,
+      },
+      // A courier exception code that has no order status of its own, persisted so it
+      // is visible on the order rather than only in a log line.
+      exception: {
+        type: new mongoose.Schema(
+          {
+            code: { type: Number, default: null },
+            meaning: { type: String, default: "" },
+            at: { type: Date, default: null },
+          },
+          { _id: false },
+        ),
+        default: null,
+      },
+      /**
+       * Did Shiprocket record the amount we meant?
+       *
+       * Read back from Shiprocket after creation and compared with what the order says
+       * should be collected. `mismatch` blocks AWB assignment on a COD order until an
+       * admin acknowledges it, because past that point a courier collects the wrong
+       * cash. `unverified` (the total could not be read) only warns.
+       */
+      amountCheck: {
+        status: {
+          type: String,
+          enum: ["ok", "mismatch", "unverified", null],
+          default: null,
+        },
+        expected: { type: Number, default: null },
+        reported: { type: Number, default: null },
+        checkedAt: { type: Date, default: null },
+        acknowledgedAt: { type: Date, default: null },
+        acknowledgedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "UserAuthenticationModel",
+          default: null,
+        },
       },
       ndrReason: {
         type: String,
@@ -792,6 +882,12 @@ OrderSchema.index({ createdAt: -1 });
 // Backs the admin Orders page's status filter (GetAllOrders), which always
 // sorts by createdAt alongside any orderStatus filter it applies.
 OrderSchema.index({ orderStatus: 1, createdAt: -1 });
+// Reconciler retry scans and the shipping-exceptions queue: filter on syncStatus, then on
+// when a retry is due. Built in production by scripts/migrate-shipping-reliability-indexes.js.
+OrderSchema.index(
+  { "shiprocket.syncStatus": 1, "shiprocket.nextAttemptAt": 1 },
+  { name: "shiprocket_sync_retry" },
+);
 OrderSchema.index({ "shiprocket.awbCode": 1, orderStatus: 1 });
 /**
  * Courier identity, enforced by the database.

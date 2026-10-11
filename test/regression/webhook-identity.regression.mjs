@@ -717,7 +717,16 @@ try {
 
   {
     // 15 — order stays active: the courier must NOT be told.
+    //
+    // Changed on purpose (S1). This used to expect 200: the line was cancelled and
+    // refunded while the Shiprocket order — whose payload is fixed at creation and
+    // whose /orders/cancel cannot drop one unit — still shipped it (and, on COD,
+    // still collected for it). A partial cancellation is now refused once a
+    // shipment exists; the remedies are a full cancellation (which also cancels the
+    // courier booking) or Returns after delivery. The courier-side assertions are
+    // unchanged and still hold: nothing reached Shiprocket.
     courier.cancelCalls = [];
+    razorpayCalls.refund = [];
     const product = await makeProduct("f5-active");
     const order = await makeOrder({
       product,
@@ -729,11 +738,16 @@ try {
     });
 
     const response = await partialCancel(order, { productId: product._id, quantity: 1 });
-    ok("the partial cancellation succeeds", response.statusCode === 200, `${response.statusCode} ${response.body?.message || ""}`);
-    ok("the order remains active", (await snapshot(order._id)).orderStatus === "Confirmed");
+    ok(
+      "a partial cancellation on an order with a Shiprocket shipment is refused (409 PARTIAL_CANCEL_SHIPMENT_EXISTS)",
+      response.statusCode === 409 && response.body?.code === "PARTIAL_CANCEL_SHIPMENT_EXISTS",
+      `${response.statusCode} ${response.body?.code || ""} ${response.body?.message || ""}`,
+    );
+    const after = await OrderModel.findById(order._id);
+    ok("the order remains active", after.orderStatus === "Confirmed");
+    ok("no unit was cancelled", (after.items[0].cancelledQuantity || 0) === 0, String(after.items[0].cancelledQuantity));
+    ok("no refund was recorded or paid", after.refunds.length === 0 && razorpayCalls.refund.length === 0);
     ok("ZERO Shiprocket cancellations", courier.cancelCalls.length === 0, `${courier.cancelCalls.length}`);
-    ok("orderFullyCancelled is false", response.body?.orderFullyCancelled === false);
-    ok("nothing is reported pending", response.body?.shipmentCancellationPending === false);
   }
 
   {

@@ -49,6 +49,17 @@ const suites = [
   "catalogue-scale.regression.mjs",
   "bulk-products.regression.mjs",
   "bill-number.regression.mjs",
+  "partial-cancel-guard.regression.mjs",
+  "late-capture-cancelled.regression.mjs",
+  "rto-refund-settlement.regression.mjs",
+  "cod-amount-guard.regression.mjs",
+  "shipment-create-idempotency.regression.mjs",
+  "return-booking-claims.regression.mjs",
+  "order-status-cas.regression.mjs",
+  "courier-event-pipeline.regression.mjs",
+  "shipping-reconciliation.regression.mjs",
+  "customer-shipping-endpoints.regression.mjs",
+  "reverse-awb.regression.mjs",
 ];
 
 const run = (file) =>

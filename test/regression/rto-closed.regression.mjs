@@ -27,6 +27,12 @@ process.env.SHIPROCKET_BASE_URL = "https://shiprocket.invalid/v1/external";
 process.env.INVENTORY_ENFORCE_STOCK = "true";
 process.env.NOTIFICATIONS_ENABLED = "false";
 process.env.PAYMENTS_ENABLED = "false";
+// Payments stay OFF for this suite; only payOwedRefund below switches them on, for
+// the duration of one stubbed Razorpay refund. The keys are needed for getRazorpay()
+// to build its (stubbed) client then.
+process.env.PAYMENT_PROVIDER = "razorpay";
+process.env.RAZORPAY_KEY_ID = "rzp_test_stub0000000";
+process.env.RAZORPAY_KEY_SECRET = "stub_secret_for_tests";
 
 import mongoose from "mongoose";
 import { readFile } from "node:fs/promises";
@@ -58,6 +64,7 @@ const { recordRefundObligation, sumOwedRefunds, sumRefunded, sumSettledRefunds }
 const shippingController = await import("../../src/modules/shipping/shipping.controller.js");
 const orderController = await import("../../src/modules/orders/order.controller.js");
 const { buildSalesReportData } = await import("../../src/modules/admin/admin-report.service.js");
+const razorpayService = await import("../../src/modules/payments/razorpay.service.js");
 
 await OrderModel.init();
 await ShiprocketSetting.getSettings();
@@ -159,6 +166,34 @@ const recordDisposition = (order, disposition) =>
     user: admin(),
   });
 
+/**
+ * Settles an owed RTO refund the way an operator now does (G2): "Refund via
+ * Razorpay", i.e. the reconcile endpoint, against a stubbed gateway. Payments are
+ * switched on only for this call — the rest of the suite keeps them off, as it
+ * always has.
+ */
+const razorpayRefundCalls = [];
+const payOwedRefund = async (order) => {
+  const current = await OrderModel.findById(order._id);
+  const owed = current.refunds.find((refund) => refund.status === "owed");
+  const previous = process.env.PAYMENTS_ENABLED;
+  process.env.PAYMENTS_ENABLED = "true";
+  try {
+    const { razorpay } = razorpayService.getRazorpay();
+    razorpay.payments.refund = async (paymentId, options) => {
+      razorpayRefundCalls.push({ paymentId, options });
+      return { id: `rfnd_${MARKER}_${razorpayRefundCalls.length}`, status: "processed" };
+    };
+    razorpay.payments.fetchMultipleRefund = async () => ({ items: [] });
+    return await callController(orderController.ReconcileOrderRefund, {
+      params: { orderId: String(order._id), refundId: String(owed?._id) },
+      user: admin(),
+    });
+  } finally {
+    process.env.PAYMENTS_ENABLED = previous;
+  }
+};
+
 const snapshot = async (id) => {
   const order = await OrderModel.findById(id).lean();
   return {
@@ -232,6 +267,22 @@ try {
 
     const disposition = await recordDisposition(order, "resellable");
     ok("the disposition is recorded", disposition.statusCode === 200, `${disposition.statusCode} ${disposition.body?.message || ""}`);
+
+    // Changed on purpose (G3). Closing used to succeed here with the prepaid refund
+    // still owed — "Closed" is defined as "any refund owed settled", but only the
+    // disposition was enforced, so the debt dropped out of every working view.
+    // Now: refused while owed, then the refund is paid, then the close succeeds.
+    const refusedWhileOwed = await setStatus(order, "Closed");
+    ok(
+      "closing is refused while the refund is still owed (409 RTO_REFUND_OUTSTANDING)",
+      refusedWhileOwed.statusCode === 409 && refusedWhileOwed.body?.code === "RTO_REFUND_OUTSTANDING",
+      `${refusedWhileOwed.statusCode} ${refusedWhileOwed.body?.code}`,
+    );
+    ok("  and the order stays at RTO Received", (await snapshot(order._id)).orderStatus === "RTO Received");
+
+    const paid = await payOwedRefund(order);
+    ok("the owed refund is paid through Razorpay", paid.statusCode === 200, `${paid.statusCode} ${paid.body?.code || ""} ${paid.body?.message || ""}`);
+    ok("  the refund row is processed", (await OrderModel.findById(order._id)).refunds[0]?.status === "processed");
 
     const closed = await setStatus(order, "Closed");
     ok("the order can then be closed", closed.statusCode === 200, `${closed.statusCode} ${closed.body?.message || ""}`);
@@ -445,12 +496,35 @@ try {
     );
     ok("within the ceiling", sumRefunded(fresh) <= fresh.totalAmount + 0.01);
 
-    // Closing must not settle, duplicate or clear the obligation.
+    // Changed on purpose (G3). This used to close with the refund still owed and
+    // assert the obligation survived the close. Closing is now refused until the
+    // refund is settled — and an attempted close still must not settle, duplicate
+    // or clear the obligation.
     await recordDisposition(order, "damaged");
+    const refused = await setStatus(order, "Closed");
+    ok(
+      "closing is refused while the refund is owed (409 RTO_REFUND_OUTSTANDING)",
+      refused.statusCode === 409 && refused.body?.code === "RTO_REFUND_OUTSTANDING",
+      `${refused.statusCode} ${refused.body?.code}`,
+    );
+    const afterRefusal = await OrderModel.findById(order._id);
+    ok("the refused close leaves the obligation intact", afterRefusal.refunds.length === 1, String(afterRefusal.refunds.length));
+    ok("still owed", afterRefusal.refunds[0].status === "owed", afterRefusal.refunds[0].status);
+    ok("and the order is still RTO Received", afterRefusal.orderStatus === "RTO Received", afterRefusal.orderStatus);
+
+    const callsBefore = razorpayRefundCalls.length;
+    const paid = await payOwedRefund(order);
+    ok("the owed refund is paid once through Razorpay", paid.statusCode === 200 && razorpayRefundCalls.length === callsBefore + 1,
+      `${paid.statusCode} ${paid.body?.code || ""} ${razorpayRefundCalls.length - callsBefore}x`);
+    ok("  for the full owed amount",
+      razorpayRefundCalls.at(-1)?.options?.amount === Math.round(fresh.refunds[0].amount * 100),
+      JSON.stringify(razorpayRefundCalls.at(-1)?.options));
+
     await setStatus(order, "Closed");
     const closed = await OrderModel.findById(order._id);
-    ok("closing leaves the obligation intact", closed.refunds.length === 1, String(closed.refunds.length));
-    ok("still owed", closed.refunds[0].status === "owed", closed.refunds[0].status);
+    ok("closing then leaves exactly the one (now settled) refund row", closed.refunds.length === 1, String(closed.refunds.length));
+    ok("settled, not owed", closed.refunds[0].status === "processed", closed.refunds[0].status);
+    ok("the order is fully Refunded", closed.paymentStatus === "Refunded", closed.paymentStatus);
     ok("and the order is Closed", closed.orderStatus === "Closed", closed.orderStatus);
   }
 
@@ -592,7 +666,9 @@ try {
   }
 
   {
-    // The gate must not be able to drift out of step with the invariant again.
+    // The gate must not be able to drift out of step with the invariant again. The
+    // obligation moved from the webhook into the refund service (shared by the courier
+    // pipeline and the manual RTO Received move), so that is where it is checked now.
     const shippingSource = await readFile(
       new URL("../../src/modules/shipping/shipping.controller.js", import.meta.url),
       "utf8",
@@ -601,10 +677,14 @@ try {
       new URL("../../src/modules/payments/return-refund.service.js", import.meta.url),
       "utf8",
     );
+    const obligationSource = serviceSource.slice(
+      serviceSource.indexOf("export const recordRtoRefundObligation"),
+    );
     ok("the RTO obligation no longer hardcodes its own money-collected list",
-      !/\["Paid",\s*"Partially Refunded"\]/.test(shippingSource));
+      !/\["Paid",\s*"Partially Refunded"\]/.test(shippingSource) &&
+        !/\["Paid",\s*"Partially Refunded"\]/.test(obligationSource));
     ok("it references the shared set instead",
-      /MONEY_COLLECTED_PAYMENT_STATUSES/.test(shippingSource));
+      /MONEY_COLLECTED_PAYMENT_STATUSES\.includes/.test(obligationSource));
     ok("which is exported from the refund service, where the invariant lives",
       /export const MONEY_COLLECTED_PAYMENT_STATUSES/.test(serviceSource));
     ok("and recordRefundObligation itself uses that same set",
@@ -930,9 +1010,16 @@ try {
       !shippingSource.includes("restockRtoOrder"),
       "the dead import is still present",
     );
+    // The webhook hands every event to the courier pipeline, which records it.
+    const pipelineSource = await readFile(
+      new URL("../../src/modules/shipping/courier-event.service.js", import.meta.url),
+      "utf8",
+    );
     ok(
       "and the webhook still records the RTO refund obligation",
-      shippingSource.includes("recordRtoRefundObligation(order)"),
+      shippingSource.includes("applyCourierEvent(") &&
+        pipelineSource.includes("recordRtoRefundObligation(order)") &&
+        !pipelineSource.includes("restockRtoOrder"),
     );
   }
 } catch (error) {

@@ -35,10 +35,29 @@ const shiprocketSettingSchema = new mongoose.Schema(
     // new and books REAL courier collections at customer addresses — auto-enabling it on
     // deploy would start dispatching couriers nobody asked for.
     reverseShipmentsEnabled: { type: Boolean, default: false },
+    // After booking a return pickup / replacement, also ask Shiprocket to assign its AWB
+    // (`/courier/assign/awb` with `is_return: 1`). OFF by default and labelled
+    // experimental: the `is_return` flag is not contractually documented to us, and a
+    // wrong assumption here would fail quietly. With it off, AWBs arrive through the
+    // reconciler's sync or are recorded by hand — both of which are verified paths.
+    reverseAutoAwbEnabled: { type: Boolean, default: false },
     defaultLengthCm: { type: Number, default: 10, min: 0 },
     defaultBreadthCm: { type: Number, default: 10, min: 0 },
     defaultHeightCm: { type: Number, default: 10, min: 0 },
     defaultWeightKg: { type: Number, default: 0.5, min: 0 },
+    // ── Reconciliation (shipping-reconciliation.service.js) ────────────────────
+    // The webhook is the primary source of courier truth; the reconciler is the
+    // safety net for what it misses — a stalled order, a courier cancellation that
+    // timed out, an auto-push that failed. On by default because it only ever reads
+    // tracking and retries operations already deemed safe to retry; it never books a
+    // courier the store did not already ask for. Bounds are enforced on save so a
+    // typo cannot turn the poller into a hammer on Shiprocket's API.
+    reconciliationEnabled: { type: Boolean, default: true },
+    reconcileIntervalMinutes: { type: Number, default: 15, min: 5, max: 1440 },
+    // An order with no courier update for this long gets its tracking polled.
+    trackingStaleMinutes: { type: Number, default: 360, min: 30, max: 10080 },
+    // Courier cancellation and auto-push retries stop here and become exceptions.
+    maxRetryAttempts: { type: Number, default: 5, min: 1, max: 20 },
     singletonId: {
       type: String,
       default: "default",

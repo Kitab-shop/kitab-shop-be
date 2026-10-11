@@ -285,7 +285,10 @@ const shippingChecks = async () => {
           : "You must mark orders Shipped/Delivered by hand. For COD that also means cash collection is never recorded automatically.",
       ),
     );
-  } else if (!has("SHIPROCKET_WEBHOOK_TOKEN")) {
+  } else if (!(await getShiprocketCredentials()).webhookToken) {
+    // The token the webhook actually checks — the admin-panel value first, .env as the
+    // fallback — not just the env var. Reading only the env var reported CRITICAL on a
+    // store whose token was saved in the panel and working fine.
     checks.push(check("ship.webhook", "Shiprocket delivery webhook", CRITICAL, "Webhook is enabled but no token is set.", "All webhook calls are rejected, so status updates silently never arrive."));
   } else {
     checks.push(check("ship.webhook", "Shiprocket delivery webhook", OK, "Enabled and token-protected."));

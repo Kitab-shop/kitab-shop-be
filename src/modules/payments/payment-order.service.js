@@ -50,8 +50,28 @@ const rewardReferrerForFirstOrder = async ({ userId, orderId, session }) => {
   await referrerProfile.save({ session });
 };
 
-export const completeCapturedIntent = async ({ intent, capturedPayment, signature = "" }) => {
+/**
+ * Promotes a captured payment's checkout to a real order, and reports whether THIS
+ * call is the one that did it.
+ *
+ * `promotedNow` exists because both Razorpay confirmation paths — the browser
+ * verify and the payment.captured webhook — funnel through here, routinely at the
+ * same moment. Exactly one of them wins the promotion; the other adopts the order
+ * that already exists (the intent is completed, or the compare-and-swap below
+ * finds the row already Paid) and returns it. Both used to run the post-commit
+ * block regardless, so one checkout pushed its shipment to Shiprocket twice, sent
+ * two "payment successful" notifications and two order-confirmation emails.
+ * Everything that must happen ONCE per order is now gated on this flag.
+ *
+ * @returns {{storeOrder, promotedNow: boolean}}
+ */
+export const completeCapturedIntentWithOutcome = async ({
+  intent,
+  capturedPayment,
+  signature = "",
+}) => {
   let storeOrder;
+  let promotedNow = false;
   logLifecycleEvent("payment", "complete_captured_intent_started", {
     intentId: intent?._id,
     paymentId: capturedPayment?.id,
@@ -59,6 +79,11 @@ export const completeCapturedIntent = async ({ intent, capturedPayment, signatur
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
+      // Reset per attempt: withTransaction re-runs this callback on a
+      // WriteConflict, and the retry is precisely the case where the other
+      // execution has already won — it must not inherit this attempt's claim.
+      promotedNow = false;
+      storeOrder = undefined;
       const currentIntent = await PaymentIntent.findById(intent._id).session(session);
       if (!currentIntent) throw orderError("Payment session expired", 404);
 
@@ -125,9 +150,20 @@ export const completeCapturedIntent = async ({ intent, capturedPayment, signatur
       // filter, so of two concurrent captures (a verify and a webhook arriving
       // together) exactly one promotes and the other finds nothing and re-reads.
       // A plain save() here would let both run the compensations below twice.
+      //
+      // `orderStatus: "Pending"` is in the filter too, and its absence was a
+      // resurrection bug. Cancelling an unpaid checkout used to leave
+      // paymentStatus at "Pending", so a capture that landed afterwards — a slow
+      // UPI collect, a netbanking redirect the customer finished after giving up —
+      // matched this filter and flipped a CANCELLED order straight to
+      // Confirmed/Paid: an order the customer had called off, whose stock had
+      // already gone back on sale, shipped anyway. An order that is no longer
+      // awaiting payment is not this function's to promote; losing here routes the
+      // capture to the orphaned-capture refund below, which is the correct outcome
+      // for money that arrived after the order was cancelled.
       if (currentIntent.pendingOrder) {
         storeOrder = await OrderModel.findOneAndUpdate(
-          { _id: currentIntent.pendingOrder, paymentStatus: "Pending" },
+          { _id: currentIntent.pendingOrder, paymentStatus: "Pending", orderStatus: "Pending" },
           {
             $set: {
               paymentStatus: "Paid",
@@ -153,12 +189,21 @@ export const completeCapturedIntent = async ({ intent, capturedPayment, signatur
         if (!storeOrder) {
           // Lost the claim. Either another execution promoted it a moment ago — in
           // which case the order is already correct and there is nothing to do — or
-          // the row is gone. Re-read to tell those apart.
+          // the row is no longer promotable (gone, or cancelled while unpaid). Re-read
+          // to tell those apart.
+          //
+          // Only "Paid" is adopted — that is the concurrent capture that won. A row
+          // cancelled while unpaid (now "Failed", or a legacy cancellation still at
+          // "Pending") throws the 409 below, which both callers treat as
+          // unrecoverable (isUnrecoverableCapture) and answer with
+          // refundOrphanedCapture. That is the whole point: the customer gets their
+          // money back instead of a revived order.
           const settled = await OrderModel.findById(currentIntent.pendingOrder).session(session);
           if (settled?.paymentStatus === "Paid") {
             storeOrder = settled;
             return;
           }
+          storeOrder = undefined;
           throw orderError("The order for this payment could no longer be confirmed", 409);
         }
       } else {
@@ -222,6 +267,9 @@ export const completeCapturedIntent = async ({ intent, capturedPayment, signatur
         }
       }
 
+      // Only the execution that reaches here created or promoted the order: every
+      // adopting path above returned early.
+      promotedNow = true;
       currentIntent.status = "completed";
       currentIntent.storeOrder = storeOrder._id;
       currentIntent.expiresAt = undefined;
@@ -261,24 +309,41 @@ export const completeCapturedIntent = async ({ intent, capturedPayment, signatur
   // clearing used to live in Checkout.jsx, where the webhook path never ran it.
   await clearOrderedItemsFromCart({ order: storeOrder });
 
-  await syncOrderToShiprocketIfEnabled(storeOrder);
-  await notifyPaymentSuccess(storeOrder);
-  await notifyOrderPlaced(storeOrder);
+  // ── ONCE PER ORDER, NOT ONCE PER CONFIRMATION ─────────────────────────────
+  // Gated on promotedNow. The cart cleanup above may run on every call — it is
+  // claimed on order.cartClearedAt, so a repeat is a no-op — but none of these
+  // are idempotent: a second courier push books a second shipment attempt, and a
+  // second notification and email tell the customer about one order twice. The
+  // execution that lost the promotion returns the same order without them.
+  if (promotedNow) {
+    await syncOrderToShiprocketIfEnabled(storeOrder);
+    await notifyPaymentSuccess(storeOrder);
+    await notifyOrderPlaced(storeOrder);
 
-  // The confirmation. Fire-and-forget, and after the order is durable: a mail
-  // failure must never fail a payment that has already been captured. This is
-  // the single funnel for both Razorpay paths, so the browser flow and the
-  // webhook both send exactly one.
-  UserAuthModel.findById(storeOrder.user)
-    .select("email")
-    .lean()
-    .then((customer) => sendOrderPlacedEmail({ order: storeOrder, email: customer?.email }))
-    .catch(() => {});
+    // The confirmation. Fire-and-forget, and after the order is durable: a mail
+    // failure must never fail a payment that has already been captured. This is
+    // the single funnel for both Razorpay paths, so the browser flow and the
+    // webhook both send exactly one.
+    UserAuthModel.findById(storeOrder.user)
+      .select("email")
+      .lean()
+      .then((customer) => sendOrderPlacedEmail({ order: storeOrder, email: customer?.email }))
+      .catch(() => {});
+  }
 
   logLifecycleEvent("payment", "complete_captured_intent_finished", {
     intentId: intent?._id,
     paymentId: capturedPayment?.id,
     orderId: storeOrder?._id,
+    promotedNow,
   });
-  return storeOrder;
+  return { storeOrder, promotedNow };
 };
+
+/**
+ * Backward-compatible entry point: both payment paths (and the suites) consume
+ * the order itself. Callers that need to know whether they were the promoting
+ * execution use completeCapturedIntentWithOutcome.
+ */
+export const completeCapturedIntent = async (args) =>
+  (await completeCapturedIntentWithOutcome(args)).storeOrder;

@@ -17,11 +17,15 @@ import {
 } from "../payments/return-refund.service.js";
 import { adminHasPermission } from "../../config/admin-access.service.js";
 import { logLifecycleEvent, logLifecycleError } from "../../utils/lifecycle-logger.service.js";
+import { syncReturnLegAwb } from "../shipping/shipping-reconciliation.service.js";
+import ShiprocketSetting from "../shipping/ShiprocketSetting.model.js";
 import {
+  assignAwb,
   createReplacementShipment,
   createReturnPickup,
   getShippingCapabilities,
   resolveWarehouseAddress,
+  ShiprocketError,
 } from "../shipping/shiprocket.service.js";
 import {
   deductReplacementStock,
@@ -376,6 +380,23 @@ export const CreateReturnRequest = async (req, res) => {
   }
 };
 
+// Booking claims and their error text are operator state: the raw Shiprocket message
+// ("Shiprocket is unreachable: …") means nothing to a customer and says more about our
+// integration than it should. Stripped from every customer-facing return response.
+const OPERATOR_ONLY_RETURN_FIELDS = [
+  "pickupBookingClaimedAt",
+  "pickupBookingError",
+  "replacementBookingClaimedAt",
+  "replacementBookingError",
+];
+
+const withoutOperatorFields = (returnRequest) => {
+  if (!returnRequest) return returnRequest;
+  const copy = { ...returnRequest };
+  for (const field of OPERATOR_ONLY_RETURN_FIELDS) delete copy[field];
+  return copy;
+};
+
 export const GetMyReturns = async (req, res) => {
   try {
     const returns = await populateReturn(
@@ -385,7 +406,7 @@ export const GetMyReturns = async (req, res) => {
     return res.status(200).json({
       success: true,
       total: returns.length,
-      data: returns,
+      data: returns.map(withoutOperatorFields),
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -413,9 +434,10 @@ export const GetReturnById = async (req, res) => {
       return res.status(403).json({ success: false, message: "Unauthorized" });
     }
 
+    const visible = redactRefundDestination(returnRequest, { isOwner });
     return res
       .status(200)
-      .json({ success: true, data: redactRefundDestination(returnRequest, { isOwner }) });
+      .json({ success: true, data: isOwner ? withoutOperatorFields(visible) : visible });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -728,32 +750,6 @@ export const AdminUpdateReturnStatus = async (req, res) => {
 };
 
 /**
- * Records that the replacement parcel has physically gone out.
- *
- * This is the step that did not exist. A replacement used to be closed out in one
- * click ("replaced"), which stamped a timestamp and restocked the returned unit
- * while the replacement parcel had not been packed — the operator believed the case
- * was finished, the customer had nothing to track, and the outbound unit was never
- * taken off the shelf.
- *
- * Order of operations, and each step is deliberate:
- *
- *   1. validate, and require a courier + AWB — without them the customer has
- *      nothing to track, which is the whole point of the state
- *   2. CLAIM the status transition (received → replacement_dispatched) with the
- *      expected status in the FILTER, so of two concurrent dispatches exactly one
- *      proceeds. Same primitive AdminUpdateReturnStatus uses.
- *   3. deduct the OUTBOUND unit, itself claim-first on replacementStockDeductedAt
- *   4. restock the INBOUND unit if its condition was resellable — unchanged
- *      behaviour, just moved to the moment the replacement actually ships
- *
- * If the deduction fails for want of stock, the status claim is RELEASED and the
- * dispatch is refused: a replacement must never read as dispatched when no unit was
- * available to send. Money is untouched throughout — no refund row, no gateway
- * call, no change to the order's paymentStatus, and no change to the original
- * order's shipment.
- */
-/**
  * Shared preamble for both booking endpoints: capability, credentials, the return, and
  * the order behind it. Returns an error shape rather than throwing, so each caller keeps
  * its own status codes.
@@ -798,28 +794,292 @@ const prepareReverseBooking = async (returnId) => {
   return { returnRequest, order };
 };
 
+// ─── BOOKING CLAIMS ──────────────────────────────────────────────────────────
+//
+// Both reverse legs used to book like this: read the return, check "nothing booked yet",
+// call Shiprocket, then write the result. Two clicks a moment apart both passed the read
+// and both booked a courier. Worse, the "nothing booked yet" check looked at the AWB, and
+// booking never sets an AWB (Shiprocket assigns it later) — so even a second click long
+// after a successful booking booked a second courier to the same customer.
+//
+// Now each leg is claimed atomically BEFORE Shiprocket is contacted, with the source
+// status and "no shipment yet" in the filter, so of N concurrent clicks exactly one
+// reaches Shiprocket. The claim is cleared in the same write that stores the shipment
+// ids. What happens to it on failure is the important part:
+//
+//   DEFINITE REFUSAL (Shiprocket answered 4xx, or we failed before sending anything) —
+//     nothing was booked, so the claim is released and the admin can simply retry.
+//   ANYTHING ELSE (timeout, transport error, 5xx, a 200 with no ids, an unexpected
+//     throw) — Shiprocket may well have created the shipment. The claim is KEPT, and a
+//     human checks Shiprocket before releasing it through the release-claim endpoint.
+//     An automatic retry here is precisely how a customer gets two couriers.
+const BOOKING_LEGS = {
+  pickup: {
+    label: "return pickup",
+    event: "return_pickup",
+    claimField: "pickupBookingClaimedAt",
+    errorField: "pickupBookingError",
+    shipmentField: "pickupShipmentId",
+    shiprocketOrderField: "pickupShiprocketOrderId",
+    awbField: "pickupAwb",
+    courierField: "pickupCourier",
+    // Shiprocket references the collection by the bare return number.
+    reference: (returnRequest) => String(returnRequest.returnNumber),
+  },
+  replacement: {
+    label: "replacement parcel",
+    event: "replacement_shipment",
+    claimField: "replacementBookingClaimedAt",
+    errorField: "replacementBookingError",
+    shipmentField: "replacementShipmentId",
+    shiprocketOrderField: "replacementShiprocketOrderId",
+    awbField: "replacementAwb",
+    courierField: "replacementCourier",
+    // Matches the order_id createReplacementShipment sends.
+    reference: (returnRequest) => `${returnRequest.returnNumber}-REP`,
+  },
+};
+
+// A claim younger than this with no recorded error is most likely a booking still in
+// flight (Shiprocket's login + create timeouts add up to ~35s). Releasing it then would
+// let a second booking start alongside the first, so the release endpoint refuses.
+const BOOKING_CLAIM_MIN_AGE_MS = 2 * 60 * 1000;
+
+const MAX_BOOKING_ERROR_LENGTH = 500;
+const bookingErrorText = (error) =>
+  String(error?.message || error || "Unknown error").slice(0, MAX_BOOKING_ERROR_LENGTH);
+
+/**
+ * True only when we can be sure Shiprocket did NOT create a shipment.
+ *
+ * Deliberately narrow and defensive about the error's shape. `ShiprocketError.statusCode`
+ * is OUR mapping, not Shiprocket's status: an upstream 4xx validation failure becomes 400,
+ * but an auth failure becomes 502 and an unreachable API 503 — and a bare upstream 4xx
+ * currently maps to 502 as well, so it is treated as unknown unless the error also carries
+ * the upstream `httpStatus`. `phase === "pre_request"` marks a failure before anything
+ * was sent. Anything we cannot classify is treated as "may have been booked".
+ */
+const isDefiniteBookingRefusal = (error) => {
+  if (!(error instanceof ShiprocketError) && error?.name !== "ShiprocketError") return false;
+  if (error.phase === "pre_request") return true;
+  if (error.statusCode === 400 || error.statusCode === 409) return true;
+  const upstream = Number(error.httpStatus);
+  // 408 and 429 say nothing about whether the create went through.
+  return Number.isFinite(upstream) && upstream >= 400 && upstream < 500 && upstream !== 408 && upstream !== 429;
+};
+
+/**
+ * Optionally asks Shiprocket to assign the AWB of a leg just booked.
+ *
+ * Behind `reverseAutoAwbEnabled` (off by default): the return flavour of assign-AWB
+ * (`is_return: 1`) is not contractually documented to us. With the switch off nothing
+ * here runs and AWBs arrive through the reconciler's sync or are entered by hand.
+ *
+ * Never throws and never fails the booking — the parcel IS booked by now. The AWB is
+ * stored only if the leg still has none, so it can never overwrite one an admin or the
+ * reconciler recorded meanwhile.
+ *
+ * @returns {Promise<object|null>} the updated return when an AWB was stored, else null
+ */
+const autoAssignLegAwb = async (leg, returnId, shipmentId) => {
+  try {
+    const settings = await ShiprocketSetting.getSettings();
+    if (settings.reverseAutoAwbEnabled !== true) return null;
+    const response = await assignAwb(shipmentId, null, { isReturn: leg === BOOKING_LEGS.pickup });
+    const data = response?.response?.data || response?.data || response || {};
+    const awb = String(data.awb_code || "").trim();
+    if (!awb) return null;
+    const courier = String(data.courier_name || "").trim();
+    return await ReturnModel.findOneAndUpdate(
+      { _id: returnId, [leg.awbField]: { $in: [null, ""] } },
+      { $set: { [leg.awbField]: awb, ...(courier ? { [leg.courierField]: courier } : {}) } },
+      { returnDocument: "after" },
+    );
+  } catch (error) {
+    logLifecycleEvent("returns", "return_auto_awb_failed", {
+      returnId: String(returnId),
+      leg: leg.event,
+      reason: error?.message || "unknown",
+    });
+    return null;
+  }
+};
+
+const alreadyBookedBody = (leg, returnRequest) => ({
+  success: true,
+  message: `A ${leg.label} is already booked for this return.`,
+  alreadyBooked: true,
+  [leg.shipmentField]: returnRequest[leg.shipmentField] ?? null,
+  [leg.awbField]: returnRequest[leg.awbField] || "",
+  [leg.courierField]: returnRequest[leg.courierField] || "",
+});
+
+const isLegBooked = (leg, returnRequest) =>
+  Boolean(returnRequest?.[leg.shipmentField]) || Boolean(returnRequest?.[leg.awbField]);
+
+/**
+ * The refusal for a leg whose claim is held by someone else.
+ *
+ * Two different situations share the claim: a booking genuinely in flight (no error yet),
+ * and one whose outcome is unknown (an error was recorded and the claim kept). The second
+ * needs a human to look in Shiprocket, so it says so.
+ */
+const claimHeldBody = (leg, returnRequest) => {
+  const error = returnRequest[leg.errorField];
+  if (error) {
+    return {
+      success: false,
+      code: "BOOKING_OUTCOME_UNKNOWN",
+      message: `An earlier ${leg.label} booking failed in a way that does not tell us whether Shiprocket created it (${error}). Check Shiprocket for an order with reference ${leg.reference(returnRequest)} before trying again. If there is none, use "allow rebooking" on this return.`,
+      claimedAt: returnRequest[leg.claimField],
+      bookingError: error,
+    };
+  }
+  return {
+    success: false,
+    code: "BOOKING_IN_PROGRESS",
+    message: `A ${leg.label} booking for this return is already in progress. Reload in a moment.`,
+    claimedAt: returnRequest[leg.claimField],
+  };
+};
+
+/**
+ * Takes the leg's booking claim, or explains why it could not.
+ *
+ * `extraFilter` carries the leg's own preconditions (status, resolution type), so the
+ * claim is only granted while they still hold — a read a moment earlier is not enough.
+ */
+const claimBooking = async (leg, returnRequest, extraFilter) => {
+  const claimedAt = new Date();
+  const claimed = await ReturnModel.findOneAndUpdate(
+    {
+      _id: returnRequest._id,
+      ...extraFilter,
+      [leg.shipmentField]: null,
+      [leg.awbField]: { $in: [null, ""] },
+      [leg.claimField]: null,
+    },
+    { $set: { [leg.claimField]: claimedAt } },
+    { returnDocument: "after" },
+  );
+  if (claimed) return { claimedAt };
+
+  // Lost the race (or the state moved). Re-read to say which, so the second click of a
+  // double click gets "already booked" rather than a confusing conflict.
+  const current = await ReturnModel.findById(returnRequest._id);
+  if (current && isLegBooked(leg, current)) {
+    return { response: { status: 200, body: alreadyBookedBody(leg, current) } };
+  }
+  if (current?.[leg.claimField]) {
+    return { response: { status: 409, body: claimHeldBody(leg, current) } };
+  }
+  return {
+    response: {
+      status: 409,
+      body: {
+        success: false,
+        message: "This return was updated by someone else a moment ago. Reload it and try again.",
+        code: "RETURN_STATUS_CONFLICT",
+      },
+    },
+  };
+};
+
+/**
+ * Settles the claim after Shiprocket threw, and builds the response.
+ *
+ * Every write is filtered on OUR claim timestamp, so a claim that was released and
+ * re-taken by someone else in the meantime is never touched.
+ */
+const settleFailedBooking = async (leg, returnRequest, claimedAt, error) => {
+  const errorText = bookingErrorText(error);
+  if (isDefiniteBookingRefusal(error)) {
+    await ReturnModel.updateOne(
+      { _id: returnRequest._id, [leg.claimField]: claimedAt },
+      { $set: { [leg.claimField]: null, [leg.errorField]: errorText } },
+    );
+    return {
+      status: error.statusCode && error.statusCode < 500 ? error.statusCode : 400,
+      body: {
+        success: false,
+        code: "BOOKING_REFUSED",
+        message: `Shiprocket refused the ${leg.label}: ${errorText}. Nothing was booked — fix the problem and try again.`,
+      },
+    };
+  }
+
+  await ReturnModel.updateOne(
+    { _id: returnRequest._id, [leg.claimField]: claimedAt },
+    { $set: { [leg.errorField]: errorText } },
+  );
+  logLifecycleError("returns", `${leg.event}_booking_outcome_unknown`, error, {
+    returnId: String(returnRequest._id),
+    reference: leg.reference(returnRequest),
+  });
+  return {
+    status: Number(error?.statusCode) >= 500 ? error.statusCode : 502,
+    body: {
+      success: false,
+      code: "BOOKING_OUTCOME_UNKNOWN",
+      message: `We could not confirm whether Shiprocket booked the ${leg.label} (${errorText}). It may exist. Check Shiprocket for an order with reference ${leg.reference(returnRequest)} before trying again. If there is none, use "allow rebooking" on this return.`,
+      bookingError: errorText,
+    },
+  };
+};
+
+/**
+ * Records a booking whose own write-back missed because the return moved (or its claim
+ * was released) while Shiprocket was working.
+ *
+ * The shipment exists either way, so its ids are recorded if the leg has none yet — an
+ * unrecorded shipment is exactly what lets the next click book a second courier. The
+ * return's status is left alone: overwriting whatever the concurrent change was would be
+ * worse, and the shipment id is in the log so an operator can cancel it in Shiprocket.
+ */
+const recordOrphanBooking = async (leg, returnRequest, booking, event) => {
+  await ReturnModel.updateOne(
+    { _id: returnRequest._id, [leg.shipmentField]: null },
+    {
+      $set: {
+        [leg.shipmentField]: booking.shipmentId,
+        [leg.shiprocketOrderField]: booking.shiprocketOrderId,
+        [leg.claimField]: null,
+        [leg.errorField]: "",
+      },
+    },
+  );
+  logLifecycleError(
+    "returns",
+    event,
+    new Error(`Shiprocket booked the ${leg.label} but the return had moved on`),
+    { returnId: String(returnRequest._id), shipmentId: booking.shipmentId },
+  );
+  return {
+    success: false,
+    message: `The ${leg.label} was booked, but this return had already moved on. Reload it — and cancel the duplicate shipment in Shiprocket if needed.`,
+    shipmentId: booking.shipmentId,
+  };
+};
+
 /**
  * Books a courier to collect the returned goods from the customer.
  *
  * Shiprocket is asked FIRST and the return only moves to `pickup_scheduled` once the
  * booking exists — the same ordering as the NDR action. Moving first would show
- * "pickup scheduled" for a collection no courier ever agreed to.
+ * "pickup scheduled" for a collection no courier ever agreed to. The booking itself is
+ * claim-first; see BOOKING CLAIMS above.
  */
 export const BookReturnPickup = async (req, res) => {
+  const leg = BOOKING_LEGS.pickup;
   try {
     const prepared = await prepareReverseBooking(req.params.id);
     if (prepared.error) return res.status(prepared.error.status).json(prepared.error.body);
     const { returnRequest, order } = prepared;
 
-    // Idempotent: a second click must not book a second courier to the same address.
-    if (returnRequest.pickupAwb) {
-      return res.status(200).json({
-        success: true,
-        message: "A pickup is already booked for this return.",
-        alreadyBooked: true,
-        pickupAwb: returnRequest.pickupAwb,
-        pickupCourier: returnRequest.pickupCourier,
-      });
+    // Idempotent on the SHIPMENT ID. This used to check only pickupAwb, which booking
+    // never writes, so a second click after a successful booking booked again.
+    if (isLegBooked(leg, returnRequest)) {
+      return res.status(200).json(alreadyBookedBody(leg, returnRequest));
     }
     if (returnRequest.status !== "approved") {
       return res.status(409).json({
@@ -828,10 +1088,15 @@ export const BookReturnPickup = async (req, res) => {
         code: "RETURN_NOT_APPROVED",
       });
     }
+    if (returnRequest[leg.claimField]) {
+      return res.status(409).json(claimHeldBody(leg, returnRequest));
+    }
 
     // The warehouse end of the journey. Resolved from Shiprocket's own pickup-location
     // list, so a name that is not registered there simply has no address and no pickup is
-    // booked — the Phase A validation doing real work rather than only warning.
+    // booked — the Phase A validation doing real work rather than only warning. A
+    // read-only lookup, so it runs BEFORE the claim: there is nothing to release if it
+    // fails, and a concurrent click repeating it costs nothing.
     const warehouse = await resolveWarehouseAddress();
     if (!warehouse.ok) {
       return res.status(409).json({
@@ -843,17 +1108,30 @@ export const BookReturnPickup = async (req, res) => {
       });
     }
 
-    const booking = await createReturnPickup({ returnRequest, order, warehouse: warehouse.address });
+    const claim = await claimBooking(leg, returnRequest, { status: "approved" });
+    if (claim.response) return res.status(claim.response.status).json(claim.response.body);
 
-    // Claim-in-filter on the source status, so two concurrent bookings cannot both move it.
+    let booking;
+    try {
+      booking = await createReturnPickup({ returnRequest, order, warehouse: warehouse.address });
+    } catch (error) {
+      const failure = await settleFailedBooking(leg, returnRequest, claim.claimedAt, error);
+      return res.status(failure.status).json(failure.body);
+    }
+
+    // ONE write: the ids, the status move and the claim release together, filtered on
+    // both the source status and OUR claim. There is no moment where the shipment exists
+    // in our records but the claim is free, or the claim is free but the ids are missing.
     const claimed = await ReturnModel.findOneAndUpdate(
-      { _id: returnRequest._id, status: "approved" },
+      { _id: returnRequest._id, status: "approved", [leg.claimField]: claim.claimedAt },
       {
         $set: {
           status: "pickup_scheduled",
           pickupScheduledAt: new Date(),
           pickupShiprocketOrderId: booking.shiprocketOrderId,
           pickupShipmentId: booking.shipmentId,
+          [leg.claimField]: null,
+          [leg.errorField]: "",
         },
         $push: {
           statusHistory: {
@@ -867,31 +1145,26 @@ export const BookReturnPickup = async (req, res) => {
     );
 
     if (!claimed) {
-      // The courier booking exists but the return moved on. Logged loudly rather than
-      // forced: overwriting whatever the concurrent change was would be worse, and the
-      // shipment id is in the log so an operator can cancel it in Shiprocket.
-      logLifecycleError(
-        "returns",
+      const body = await recordOrphanBooking(
+        leg,
+        returnRequest,
+        booking,
         "return_pickup_booked_but_status_moved",
-        new Error("Shiprocket booked the return pickup but the return was no longer approved"),
-        { returnId: String(returnRequest._id), shipmentId: booking.shipmentId },
       );
-      return res.status(409).json({
-        success: false,
-        message:
-          "The pickup was booked, but this return had already moved on. Reload it — and cancel the duplicate shipment in Shiprocket if needed.",
-        shipmentId: booking.shipmentId,
-      });
+      return res.status(409).json(body);
     }
 
     logLifecycleEvent("returns", "return_pickup_booked", {
       returnId: String(claimed._id),
       shipmentId: booking.shipmentId,
     });
+    const withAwb = await autoAssignLegAwb(leg, claimed._id, booking.shipmentId);
     return res.status(200).json({
       success: true,
-      message: "Return pickup booked. Assign an AWB in Shiprocket to give the customer tracking.",
-      returnRequest: claimed,
+      message: withAwb
+        ? `Return pickup booked with AWB ${withAwb.pickupAwb}.`
+        : "Return pickup booked. Its AWB will be fetched from Shiprocket once assigned, or you can enter it here.",
+      returnRequest: withAwb || claimed,
     });
   } catch (error) {
     return res
@@ -906,23 +1179,21 @@ export const BookReturnPickup = async (req, res) => {
  * Deliberately separate from DispatchReplacement. That handler claims the status, deducts
  * outbound stock and rolls back if stock is short; adding an external booking inside it
  * would mean a Shiprocket failure had to unwind a stock movement too. Keeping them apart
- * means each step is independently retryable: book here, then dispatch as before — the
- * dispatch handler now falls back to whatever this stored.
+ * means each step is independently retryable: book here, then dispatch with the AWB
+ * Shiprocket assigns. Claim-first like the pickup — see BOOKING CLAIMS above. This leg
+ * was the one most exposed: its "already booked" check also looked only at the AWB, and
+ * its write-back filtered on the AWB being absent, so a double click booked two parcels
+ * and BOTH writes succeeded, the second silently overwriting the first's ids.
  */
 export const BookReplacementShipment = async (req, res) => {
+  const leg = BOOKING_LEGS.replacement;
   try {
     const prepared = await prepareReverseBooking(req.params.id);
     if (prepared.error) return res.status(prepared.error.status).json(prepared.error.body);
     const { returnRequest, order } = prepared;
 
-    if (returnRequest.replacementAwb) {
-      return res.status(200).json({
-        success: true,
-        message: "A replacement parcel is already booked for this return.",
-        alreadyBooked: true,
-        replacementAwb: returnRequest.replacementAwb,
-        replacementCourier: returnRequest.replacementCourier,
-      });
+    if (isLegBooked(leg, returnRequest)) {
+      return res.status(200).json(alreadyBookedBody(leg, returnRequest));
     }
     if (returnRequest.resolutionType !== "replacement") {
       return res.status(400).json({
@@ -938,45 +1209,59 @@ export const BookReplacementShipment = async (req, res) => {
         code: "RETURN_NOT_RECEIVED",
       });
     }
+    if (returnRequest[leg.claimField]) {
+      return res.status(409).json(claimHeldBody(leg, returnRequest));
+    }
 
-    const booking = await createReplacementShipment({ returnRequest, order });
+    const claim = await claimBooking(leg, returnRequest, {
+      status: "received",
+      resolutionType: "replacement",
+    });
+    if (claim.response) return res.status(claim.response.status).json(claim.response.body);
 
-    // No status change here — booking is not dispatching. The parcel is recorded so
-    // DispatchReplacement can use it, and stock is still deducted there.
+    let booking;
+    try {
+      booking = await createReplacementShipment({ returnRequest, order });
+    } catch (error) {
+      const failure = await settleFailedBooking(leg, returnRequest, claim.claimedAt, error);
+      return res.status(failure.status).json(failure.body);
+    }
+
+    // No status change here — booking is not dispatching. The parcel is recorded so the
+    // admin can see it is booked, and stock is still deducted at dispatch.
     const updated = await ReturnModel.findOneAndUpdate(
-      { _id: returnRequest._id, status: "received", replacementAwb: { $exists: false } },
+      { _id: returnRequest._id, status: "received", [leg.claimField]: claim.claimedAt },
       {
         $set: {
           replacementShiprocketOrderId: booking.shiprocketOrderId,
           replacementShipmentId: booking.shipmentId,
+          [leg.claimField]: null,
+          [leg.errorField]: "",
         },
       },
       { returnDocument: "after" },
     );
     if (!updated) {
-      logLifecycleError(
-        "returns",
+      const body = await recordOrphanBooking(
+        leg,
+        returnRequest,
+        booking,
         "replacement_booked_but_return_moved",
-        new Error("Shiprocket booked the replacement but the return was no longer received/unbooked"),
-        { returnId: String(returnRequest._id), shipmentId: booking.shipmentId },
       );
-      return res.status(409).json({
-        success: false,
-        message:
-          "The replacement was booked, but this return had already moved on. Reload it — and cancel the duplicate shipment in Shiprocket if needed.",
-        shipmentId: booking.shipmentId,
-      });
+      return res.status(409).json(body);
     }
 
     logLifecycleEvent("returns", "replacement_shipment_booked", {
       returnId: String(updated._id),
       shipmentId: booking.shipmentId,
     });
+    const withAwb = await autoAssignLegAwb(leg, updated._id, booking.shipmentId);
     return res.status(200).json({
       success: true,
-      message:
-        "Replacement parcel booked. Assign an AWB in Shiprocket, then dispatch the replacement to deduct stock and notify the customer.",
-      returnRequest: updated,
+      message: withAwb
+        ? `Replacement parcel booked with AWB ${withAwb.replacementAwb}. Dispatch it to deduct stock and notify the customer.`
+        : "Replacement parcel booked. Its AWB will be fetched from Shiprocket once assigned (or enter it here); then dispatch the replacement to deduct stock and notify the customer.",
+      returnRequest: withAwb || updated,
     });
   } catch (error) {
     return res
@@ -985,24 +1270,345 @@ export const BookReplacementShipment = async (req, res) => {
   }
 };
 
+/**
+ * Releases a booking claim that was KEPT because its outcome was unknown.
+ *
+ * This is the human decision the claim exists to force. Only an operator who has looked
+ * in Shiprocket can say whether the timed-out booking exists; calling this asserts that it
+ * does not, and re-opens the leg for booking. Refused when a shipment id or AWB is already
+ * recorded (there is nothing to release — the leg is booked), and when a claim is young
+ * and has no recorded error (a booking is most likely still in flight).
+ *
+ * Audited, and noted in the return's own history, because getting this wrong books a
+ * second courier and the trail is how that gets traced back.
+ */
+const releaseBookingClaim = (leg) => async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid return id" });
+    }
+    const returnRequest = await ReturnModel.findById(req.params.id);
+    if (!returnRequest) {
+      return res.status(404).json({ success: false, message: "Return not found" });
+    }
+    if (isLegBooked(leg, returnRequest)) {
+      return res.status(409).json({
+        success: false,
+        message: `This ${leg.label} is already booked (a shipment is recorded), so there is no claim to release.`,
+        code: "ALREADY_BOOKED",
+      });
+    }
+    const claimedAt = returnRequest[leg.claimField];
+    if (!claimedAt) {
+      return res.status(409).json({
+        success: false,
+        message: `No ${leg.label} booking is held for this return. You can book it normally.`,
+        code: "NO_BOOKING_CLAIM",
+      });
+    }
+    const lastError = returnRequest[leg.errorField];
+    if (!lastError && Date.now() - new Date(claimedAt).getTime() < BOOKING_CLAIM_MIN_AGE_MS) {
+      return res.status(409).json({
+        success: false,
+        message: `A ${leg.label} booking started moments ago and may still be in progress. Wait a couple of minutes, check Shiprocket, then try again.`,
+        code: "BOOKING_IN_PROGRESS",
+      });
+    }
+
+    // Filtered on the exact claim we just read, and on the leg still being unbooked, so a
+    // booking that completes between the read and this write is never un-claimed.
+    const note = `Admin checked Shiprocket and released the ${leg.label} booking claim, allowing rebooking` +
+      (lastError ? ` (last error: ${lastError})` : "");
+    const released = await ReturnModel.findOneAndUpdate(
+      {
+        _id: returnRequest._id,
+        [leg.claimField]: claimedAt,
+        [leg.shipmentField]: null,
+        [leg.awbField]: { $in: [null, ""] },
+      },
+      {
+        $set: { [leg.claimField]: null, [leg.errorField]: "" },
+        $push: {
+          statusHistory: {
+            status: returnRequest.status,
+            changedBy: req.user?.id || null,
+            note,
+          },
+        },
+      },
+      { returnDocument: "after" },
+    );
+    if (!released) {
+      return res.status(409).json({
+        success: false,
+        message: "This return was updated by someone else a moment ago. Reload it and try again.",
+        code: "RETURN_STATUS_CONFLICT",
+      });
+    }
+
+    await createAuditLog({
+      admin: req.user?.id,
+      action: "RELEASE_RETURN_BOOKING_CLAIM",
+      module: "RETURN",
+      targetId: released._id,
+      targetName: released.returnNumber,
+      description: note,
+      req,
+    });
+    logLifecycleEvent("returns", "return_booking_claim_released", {
+      returnId: String(released._id),
+      leg: leg.event,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `The ${leg.label} can be booked again.`,
+      data: await populateReturnLean(ReturnModel.findById(released._id)),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const ReleaseReturnPickupClaim = releaseBookingClaim(BOOKING_LEGS.pickup);
+export const ReleaseReplacementBookingClaim = releaseBookingClaim(BOOKING_LEGS.replacement);
+
+// The return statuses during which each leg's parcel is travelling and its AWB is the
+// thing courier events will be matched by.
+const AWB_LEG_STATUSES = { pickup: ["pickup_scheduled"], replacement: ["received"] };
+const AWB_PATTERN = /^[A-Za-z0-9-]{4,64}$/;
+
+/**
+ * Records a return leg's AWB by hand.
+ *
+ * Booking a collection or replacement through Shiprocket stores only its order and
+ * shipment ids; the AWB is assigned afterwards (in Shiprocket's dashboard, or by their
+ * auto-assignment). Until it is recorded here no courier event can be matched to the
+ * return — the webhook resolves return legs by AWB alone. The reconciler fetches it
+ * automatically; this is the manual path for when an admin already has it in hand.
+ *
+ * Never overwrites a different AWB (that would re-point courier events to another
+ * parcel); re-sending the same one is a no-op. Uniqueness across returns is enforced by
+ * the existing unique partial indexes and reported as AWB_IN_USE.
+ */
+const recordReturnLegAwb = (leg, legName) => async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid return id" });
+    }
+    const awb = String(req.body?.awb ?? "").trim();
+    const courier = String(req.body?.courier ?? "").trim().slice(0, 80);
+    if (!AWB_PATTERN.test(awb)) {
+      return res.status(400).json({
+        success: false,
+        code: "AWB_REQUIRED",
+        message: "Enter the AWB exactly as the courier issued it (letters, digits and dashes, 4–64 characters).",
+      });
+    }
+
+    const current = await ReturnModel.findById(req.params.id).lean();
+    if (!current) return res.status(404).json({ success: false, message: "Return not found" });
+    if (!AWB_LEG_STATUSES[legName].includes(current.status)) {
+      return res.status(409).json({
+        success: false,
+        code: "RETURN_LEG_NOT_BOOKED",
+        message: `An AWB for the ${leg.label} can only be recorded while the return is ${AWB_LEG_STATUSES[legName].join(" or ")} (this one is ${current.status}).`,
+      });
+    }
+    if (current[leg.awbField]) {
+      if (current[leg.awbField] === awb) {
+        return res.status(200).json({
+          success: true,
+          message: "That AWB is already recorded.",
+          data: await populateReturnLean(ReturnModel.findById(current._id)),
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        code: "AWB_ALREADY_RECORDED",
+        message: `This ${leg.label} already has AWB ${current[leg.awbField]}. It is not replaced, because courier updates are matched by it.`,
+      });
+    }
+
+    let updated;
+    try {
+      updated = await ReturnModel.findOneAndUpdate(
+        { _id: current._id, status: current.status, [leg.awbField]: { $in: [null, ""] } },
+        {
+          $set: { [leg.awbField]: awb, ...(courier ? { [leg.courierField]: courier } : {}) },
+          $push: {
+            statusHistory: {
+              status: current.status,
+              changedBy: req.user?.id || null,
+              note: `${leg.label[0].toUpperCase()}${leg.label.slice(1)} AWB ${awb} recorded${courier ? ` (${courier})` : ""}`,
+            },
+          },
+        },
+        { returnDocument: "after" },
+      );
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          code: "AWB_IN_USE",
+          message: `AWB ${awb} is already recorded against another return.`,
+        });
+      }
+      throw error;
+    }
+    if (!updated) {
+      return res.status(409).json({
+        success: false,
+        code: "RETURN_STATUS_CONFLICT",
+        message: "This return changed while you were editing it. Reload and try again.",
+      });
+    }
+
+    await createAuditLog({
+      admin: req.user?.id,
+      action: "RECORD_RETURN_AWB",
+      module: "RETURN",
+      targetId: updated._id,
+      targetName: updated.returnNumber,
+      description: `Recorded ${leg.label} AWB ${awb}${courier ? ` (${courier})` : ""}`,
+      req,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `AWB recorded. Courier updates for this ${leg.label} will now be tracked.`,
+      data: await populateReturnLean(ReturnModel.findById(updated._id)),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/** Fetches a booked leg's AWB from Shiprocket now, rather than waiting for the reconciler. */
+const syncReturnLegAwbNow = (leg, legName) => async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid return id" });
+    }
+    const capabilities = await getShippingCapabilities();
+    if (!capabilities.shipments || !capabilities.configured) {
+      return res.status(409).json({
+        success: false,
+        code: "SHIPROCKET_NOT_IN_USE",
+        message: "Shiprocket shipments are off or not connected, so the AWB cannot be fetched. Enter it manually instead.",
+      });
+    }
+    const result = await syncReturnLegAwb(req.params.id, legName);
+    if (!result.ok && result.reason === "not_found") {
+      return res.status(404).json({ success: false, message: "Return not found" });
+    }
+    if (!result.ok && result.reason === "not_booked") {
+      return res.status(409).json({
+        success: false,
+        code: "RETURN_LEG_NOT_BOOKED",
+        message: `This ${leg.label} was not booked through Shiprocket, so there is no AWB to fetch.`,
+      });
+    }
+    if (!result.ok && result.reason === "awb_belongs_to_another_shipment") {
+      return res.status(409).json({
+        success: false,
+        code: "AWB_IN_USE",
+        message: "Shiprocket returned an AWB that is already recorded against another return. Check the booking in Shiprocket.",
+      });
+    }
+    const data = await populateReturnLean(ReturnModel.findById(req.params.id));
+    if (!result.ok) {
+      return res.status(200).json({
+        success: true,
+        synced: false,
+        message: "Shiprocket has not assigned an AWB to this parcel yet. Assign one in Shiprocket, or try again later.",
+        data,
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      synced: !result.alreadyRecorded,
+      message: result.alreadyRecorded ? "The AWB was already recorded." : `AWB ${result.awbCode} fetched from Shiprocket.`,
+      data,
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+export const RecordReturnPickupAwb = recordReturnLegAwb(BOOKING_LEGS.pickup, "pickup");
+export const RecordReplacementAwb = recordReturnLegAwb(BOOKING_LEGS.replacement, "replacement");
+export const SyncReturnPickupAwb = syncReturnLegAwbNow(BOOKING_LEGS.pickup, "pickup");
+export const SyncReplacementAwb = syncReturnLegAwbNow(BOOKING_LEGS.replacement, "replacement");
+
+/**
+ * Records that the replacement parcel has physically gone out.
+ *
+ * This is the step that did not exist. A replacement used to be closed out in one
+ * click ("replaced"), which stamped a timestamp and restocked the returned unit
+ * while the replacement parcel had not been packed — the operator believed the case
+ * was finished, the customer had nothing to track, and the outbound unit was never
+ * taken off the shelf.
+ *
+ * Order of operations, and each step is deliberate:
+ *
+ *   1. validate, and require a courier + AWB — without them the customer has
+ *      nothing to track, which is the whole point of the state
+ *   2. CLAIM the status transition (received → replacement_dispatched) with the
+ *      expected status in the FILTER, so of two concurrent dispatches exactly one
+ *      proceeds. Same primitive AdminUpdateReturnStatus uses.
+ *   3. deduct the OUTBOUND unit, itself claim-first on replacementStockDeductedAt
+ *   4. restock the INBOUND unit if its condition was resellable — unchanged
+ *      behaviour, just moved to the moment the replacement actually ships
+ *
+ * If the deduction fails for want of stock, the status claim is RELEASED and the
+ * dispatch is refused: a replacement must never read as dispatched when no unit was
+ * available to send. Money is untouched throughout — no refund row, no gateway
+ * call, no change to the order's paymentStatus, and no change to the original
+ * order's shipment.
+ */
 export const DispatchReplacement = async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Invalid return id" });
     }
 
-    // Falls back to whatever BookReplacementShipment stored, so an admin who booked the
-    // parcel through Shiprocket does not have to retype details the integration already
-    // knows. Typing them by hand still works and still wins — manual dispatch is
-    // unchanged.
+    // Falls back to a courier/AWB already stored on the return, so an admin does not have
+    // to retype details that are already recorded. Typing them by hand still works and
+    // still wins — manual dispatch is unchanged.
+    //
+    // Note BookReplacementShipment does NOT store an AWB: Shiprocket assigns one later,
+    // and syncing it back is Phase 4. So a parcel booked through Shiprocket arrives here
+    // with a shipment id and no AWB, and the admin must type the AWB Shiprocket assigned.
     const booked = await ReturnModel.findById(req.params.id).select(
-      "replacementCourier replacementAwb",
+      "replacementCourier replacementAwb replacementShipmentId replacementBookingClaimedAt replacementBookingError",
     );
     const courier = String(req.body?.courier || booked?.replacementCourier || "").trim();
     const awb = String(req.body?.awb || booked?.replacementAwb || "").trim();
     const disposition = String(req.body?.disposition || "").trim().toLowerCase();
     const dispositionNote = String(req.body?.dispositionNote || "").trim();
     const adminNote = String(req.body?.adminNote || "").trim();
+
+    // A booking still held by its claim may have created a Shiprocket parcel we have no
+    // record of. Dispatching by hand on top of it would send the customer two units, so
+    // the claim has to be resolved first (booked, refused, or released after a check).
+    if (booked && !booked.replacementShipmentId && booked.replacementBookingClaimedAt) {
+      return res.status(409).json({
+        success: false,
+        message: booked.replacementBookingError
+          ? `A replacement booking with Shiprocket has an unknown outcome (${booked.replacementBookingError}). Check Shiprocket, then use "allow rebooking" on this return: if the parcel exists there, dispatch with its AWB; if not, book it again or dispatch by hand.`
+          : "A replacement booking with Shiprocket is in progress for this return. Reload in a moment.",
+        code: booked.replacementBookingError ? "BOOKING_OUTCOME_UNKNOWN" : "BOOKING_IN_PROGRESS",
+      });
+    }
+    if (!awb && booked?.replacementShipmentId) {
+      return res.status(400).json({
+        success: false,
+        message: `This replacement is booked in Shiprocket (shipment ${booked.replacementShipmentId}) but no AWB has been recorded yet. Assign the AWB in Shiprocket, then enter the courier and that AWB here to dispatch.`,
+        code: "REPLACEMENT_AWB_NOT_ASSIGNED",
+        replacementShipmentId: booked.replacementShipmentId,
+      });
+    }
 
     if (!courier || !awb) {
       return res.status(400).json({

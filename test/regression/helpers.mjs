@@ -17,9 +17,28 @@ export const mongoUri = () =>
   process.env.MONGODB_URI ||
   process.env.MONGO_URL;
 
+// Hosts a suite may write to without an explicit opt-in. Every suite inserts and
+// deletes real documents, and `.env` has pointed at a live cluster before — so a
+// remote database must be a deliberate choice (ALLOW_REMOTE_TEST_DB=1), never the
+// accident of whatever the environment happens to hold.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+export const isLoopbackMongoUri = (uri) => {
+  const match = /^mongodb(?:\+srv)?:\/\/(?:[^@/]*@)?([^/?]+)/i.exec(String(uri || ""));
+  if (!match || /^mongodb\+srv:/i.test(uri)) return false;
+  return match[1]
+    .split(",")
+    .every((hostPort) => LOOPBACK_HOSTS.has(hostPort.replace(/:\d+$/, "").toLowerCase()));
+};
+
 export const connect = async () => {
   const uri = mongoUri();
   if (!uri) throw new Error("No MongoDB connection string in the environment");
+  if (!isLoopbackMongoUri(uri) && process.env.ALLOW_REMOTE_TEST_DB !== "1") {
+    throw new Error(
+      "Refusing to run regression suites against a non-loopback MongoDB. Point the test environment at a local replica set, or set ALLOW_REMOTE_TEST_DB=1 if writing to that database is intended.",
+    );
+  }
   await mongoose.connect(uri);
   return mongoose;
 };
@@ -43,6 +62,10 @@ export const createSuite = (title) => {
   const finish = () => {
     console.log(`\n${title}: ${passed} passed, ${failures.length} failed`);
     failures.forEach((f) => console.log(`  - ${f}`));
+    // Set here, not left to each suite. Four suites ignored this return value and
+    // exited 0 with failures, so run-all printed PASS over a red suite — a harness
+    // that can report green while checks fail is worse than no harness.
+    if (failures.length > 0) process.exitCode = 1;
     return { passed, failed: failures.length };
   };
 

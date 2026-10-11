@@ -1,4 +1,6 @@
+import mongoose from "mongoose";
 import OrderModel from "./Order.model.js";
+import PaymentIntent from "../payments/PaymentIntent.model.js";
 import UserProfile from "../profiles/UserProfile.model.js";
 import ReferralSetting from "../referral/ReferralSetting.model.js";
 import CouponModel from "../coupons/coupon.model.js";
@@ -38,16 +40,19 @@ import {
   resolveVariantId,
 } from "../inventory/variant.service.js";
 import { restockRtoOrder } from "../inventory/restock.service.js";
+import { releaseReservation } from "../inventory/inventory-reservation.service.js";
 import { createAuditLog } from "../audit/audit-log.js";
 import {
   AWAITING_PAYMENT_TTL_MS,
   EXCLUDE_AWAITING_PAYMENT,
+  isAwaitingPayment,
 } from "./order-visibility.js";
 import {
   canAutoRefund,
   cancellationRefundKey,
   proportionalRefundAmount,
   proportionalWalletRefund,
+  recordRtoRefundObligation,
   restoreWalletCredit,
   settleGatewayRefund,
   sumOwedRefunds,
@@ -60,7 +65,7 @@ import { canTransitionOrderStatus } from "./order-status.rules.js";
 // cancellation path.
 import { adminHasPermission } from "../../config/admin-access.service.js";
 import { ensureBillNumber } from "./bill-number.service.js";
-import { logLifecycleError } from "../../utils/lifecycle-logger.service.js";
+import { logLifecycleError, logLifecycleEvent } from "../../utils/lifecycle-logger.service.js";
 
 const ADMIN_PURCHASE_MESSAGE =
   "Admin accounts cannot add products to cart or place orders. Please use a customer account.";
@@ -562,6 +567,19 @@ const RECORDED_RTO_DISPOSITIONS = OrderModel.schema
   .path("rtoDisposition")
   .enumValues.filter(Boolean);
 
+/**
+ * True once the order has a shipment whose status the mirror describes.
+ *
+ * Read off the schema, like RECORDED_RTO_DISPOSITIONS, so a provider added to the
+ * enum is covered without a second list here. `shipment.provider` defaults to null,
+ * which is the "no shipment recorded" answer.
+ */
+const SHIPMENT_PROVIDERS_FOR_MIRROR = OrderModel.schema
+  .path("shipment.provider")
+  .enumValues.filter(Boolean);
+const hasRecordedShipmentProvider = (order) =>
+  SHIPMENT_PROVIDERS_FOR_MIRROR.includes(order?.shipment?.provider);
+
 // The customer's email for lifecycle mails. Best-effort: a missing account or
 // a lookup failure returns "", and the mail senders no-op on an empty address.
 const emailForOrder = async (order) => {
@@ -574,12 +592,30 @@ const emailForOrder = async (order) => {
   }
 };
 
+/**
+ * An admin moving an order's status by hand is a manual override of what the courier
+ * feed and the checkout flow would otherwise decide, so it is audited like the other
+ * order overrides (cancel, RTO disposition, shipment cancellation) rather than left
+ * only in `statusHistory`, which records the move but not the request it came from.
+ * Never throws: the status write is already durable.
+ */
+const auditStatusChange = (req, order, from, to) =>
+  createAuditLog({
+    admin: req.user?.id,
+    action: "UPDATE_ORDER_STATUS",
+    module: "ORDER",
+    targetId: order._id,
+    targetName: String(order._id),
+    description: `Order status changed from ${from} to ${to}`,
+    req,
+  }).catch(() => null);
+
 export const UpdateOrderStatus = async (req, res) => {
   try {
     const { orderId } = req.params;
     const { orderStatus } = req.body;
 
-    const order = await OrderModel.findById(orderId);
+    let order = await OrderModel.findById(orderId);
     if (!order) {
       return res.status(404).json({
         success: false,
@@ -616,6 +652,30 @@ export const UpdateOrderStatus = async (req, res) => {
       });
     }
 
+    // ── AN UNPAID PREPAID CHECKOUT IS NOT AN ORDER YET ───────────────────────
+    // Pending → Confirmed and Pending → Packed are legal moves in the table, and for
+    // a COD order (or a legacy row) they are what an operator means. For a Razorpay
+    // order still awaiting capture they are not: the transition would put a
+    // checkout nobody paid for into the fulfilment queue — reserved stock never
+    // committed, wallet never debited, coupon never redeemed — and a later capture
+    // could no longer promote it (the promotion is a compare-and-swap on
+    // orderStatus "Pending"), so the customer's money would be refunded as an
+    // orphan while the goods shipped. The payment confirms the order; an operator
+    // cannot.
+    if (
+      order.orderStatus === "Pending" &&
+      ["Confirmed", "Packed"].includes(orderStatus) &&
+      isAwaitingPayment(order)
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This prepaid order has not been paid for yet. It confirms itself when Razorpay captures the payment — it cannot be confirmed or packed by hand.",
+        code: "PAYMENT_NOT_CAPTURED",
+        currentStatus: order.orderStatus,
+      });
+    }
+
     // Same status re-submitted: nothing to do, and recording it would spam the
     // history. Return the order unchanged rather than erroring.
     if (order.orderStatus === orderStatus) {
@@ -645,15 +705,31 @@ export const UpdateOrderStatus = async (req, res) => {
     // permits "Closed" only from there, so this is the CAS on the status that was
     // just validated. Closing restocks nothing — that already happened, or
     // deliberately did not, when the disposition was recorded.
+    //
+    // ── AND ITS REFUND SETTLED (G3) ──────────────────────────────────────────
+    // The third clause of the definition — "any refund owed settled" — was not
+    // enforced at all. A prepaid RTO records an `owed` refund on arrival, and an
+    // operator could close the order the moment the parcel was inspected: "Closed"
+    // is terminal and drops out of every working view, so the customer's money was
+    // owed by an order nobody would ever open again. `owed` (nothing attempted) and
+    // `created` (attempted, outcome unknown) both block; `processed` and `failed`
+    // are settled facts. In the FILTER, with the other two preconditions, so a
+    // refund recorded by a webhook a moment before the close is not raced past.
     if (orderStatus === "Closed") {
       const claimed = await OrderModel.findOneAndUpdate(
         {
           _id: order._id,
           orderStatus: "RTO Received",
           rtoDisposition: { $in: RECORDED_RTO_DISPOSITIONS },
+          refunds: { $not: { $elemMatch: { status: { $in: ["owed", "created"] } } } },
         },
         {
-          $set: { orderStatus: "Closed" },
+          $set: {
+            orderStatus: "Closed",
+            // Same mirror rule as the generic move below: only an order that has a
+            // shipment record gets its shipment status kept in step.
+            ...(hasRecordedShipmentProvider(order) ? { "shipment.status": "Closed" } : {}),
+          },
           $push: {
             statusHistory: {
               from: order.orderStatus,
@@ -671,7 +747,7 @@ export const UpdateOrderStatus = async (req, res) => {
         // "something went wrong" on the one action that has a specific remedy:
         // record the disposition first.
         const current = await OrderModel.findById(order._id).select(
-          "orderStatus rtoDisposition",
+          "orderStatus rtoDisposition refunds",
         );
         if (current && !current.rtoDisposition) {
           return res.status(409).json({
@@ -680,6 +756,23 @@ export const UpdateOrderStatus = async (req, res) => {
               'Record the condition of the returned parcel before closing it — "resellable" puts the items back into stock, "damaged" writes them off. Closing first would strand them.',
             code: "RTO_DISPOSITION_REQUIRED",
             currentStatus: current.orderStatus,
+          });
+        }
+        const outstandingRefunds = (current?.refunds || []).filter((refund) =>
+          ["owed", "created"].includes(refund.status),
+        );
+        if (current?.orderStatus === "RTO Received" && outstandingRefunds.length > 0) {
+          return res.status(409).json({
+            success: false,
+            message:
+              "This order still owes the customer a refund. Pay it (Refund via Razorpay, or record the manual payout) before closing — a closed order drops out of every working view, and the debt with it.",
+            code: "RTO_REFUND_OUTSTANDING",
+            currentStatus: current.orderStatus,
+            outstandingRefundAmount:
+              Math.round(
+                outstandingRefunds.reduce((sum, refund) => sum + Number(refund.amount || 0), 0) *
+                  100,
+              ) / 100,
           });
         }
         return res.status(409).json({
@@ -697,6 +790,8 @@ export const UpdateOrderStatus = async (req, res) => {
         .then((email) => sendOrderClosedEmail({ order: claimed, email }))
         .catch(() => {});
 
+      await auditStatusChange(req, claimed, order.orderStatus, "Closed");
+
       return res.status(200).json({
         success: true,
         message: "Order closed",
@@ -704,39 +799,144 @@ export const UpdateOrderStatus = async (req, res) => {
       });
     }
 
+    // ── THE GENERIC MOVE IS A COMPARE-AND-SWAP ON THE STATUS IT WAS READ FROM (S4) ──
+    //
+    // This used to be read → mutate → `order.save()`. Mongoose's save() writes the
+    // fields it saw change, and `orderStatus` is a plain path with no version guard,
+    // so the save carried no claim about what the status was by the time it landed.
+    // An admin who picked "Shipped" from a dropdown opened a minute ago overwrote the
+    // courier's "Delivered" that arrived in between — moving a delivered order
+    // backwards, re-opening it to an RTO the courier would never send, and pushing a
+    // `Delivered → Shipped` history entry for a move nobody made. Two admins
+    // submitting the same move at once each pushed a history entry too, since
+    // `statusHistory` is a subdocument array Mongoose does not version-guard on $push
+    // (the reason the Closed path above was made atomic first).
+    //
+    // `orderStatus: previousStatus` in the FILTER is the status the transition and the
+    // payment gate above were validated against. Everything they concluded is true
+    // only of that status, so the write lands only while it still holds — the same
+    // claim-in-filter shape as the Closed path, the manual-shipment advance and the
+    // courier webhook.
+    //
+    // The `$set` is exactly what the old save changed, plus the shipment mirror.
+    // Nothing else on the document is written, so a concurrent write to any OTHER
+    // field (a refund row, a tracking number, an admin note) can no longer be lost
+    // to a stale snapshot either.
     const previousStatus = order.orderStatus;
-    order.orderStatus = orderStatus;
-    // Money-affecting mutations were previously untraceable — no history field
-    // and no audit log anywhere in this controller.
-    order.statusHistory.push({
-      from: previousStatus,
-      to: orderStatus,
-      changedBy: req.user?.id || null,
-      changedAt: new Date(),
-    });
+    const changedAt = new Date();
+    const set = { orderStatus };
     // Only the first "Delivered" sets this — a later re-confirmation of the
-    // same status shouldn't push the customer's return window forward.
+    // same status shouldn't push the customer's return window forward. Read off the
+    // snapshot, which the status CAS keeps honest: deliveredAt is only ever stamped
+    // together with a move to Delivered, so if it had been stamped since the read,
+    // the status would have moved too and this write would miss.
     if (orderStatus === "Delivered" && !order.deliveredAt) {
-      order.deliveredAt = new Date();
+      set.deliveredAt = changedAt;
     }
+    // `shipment.status` mirrors the order's own status and is written only in the
+    // same operation that sets it (see the schema). An order with no provider has no
+    // shipment to describe, so its mirror stays null rather than inventing one.
+    if (hasRecordedShipmentProvider(order)) {
+      set["shipment.status"] = orderStatus;
+    }
+
+    const updated = await OrderModel.findOneAndUpdate(
+      { _id: order._id, orderStatus: previousStatus },
+      {
+        $set: set,
+        // Money-affecting mutations were previously untraceable — no history field
+        // and no audit log anywhere in this controller.
+        $push: {
+          statusHistory: {
+            from: previousStatus,
+            to: orderStatus,
+            changedBy: req.user?.id || null,
+            changedAt,
+          },
+        },
+      },
+      { returnDocument: "after" },
+    );
+
+    if (!updated) {
+      // Re-read ONCE to say what happened. Not retried: the operator chose this move
+      // while looking at the old status, and whether it still makes sense from the
+      // new one (Delivered, say) is their call, not this endpoint's.
+      const current = await OrderModel.findById(order._id);
+      if (!current) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found",
+        });
+      }
+      // Someone else already made this exact move — a double-click, or two admins
+      // acting on the same order. The order is where this caller wanted it, so it is
+      // answered exactly like the same-status re-submit above, and no side effect
+      // runs twice: whoever won the CAS ran them.
+      if (current.orderStatus === orderStatus) {
+        return res.status(200).json({
+          success: true,
+          message: "Order status unchanged",
+          order: current,
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        message: `This order changed while you were editing it (it is now ${current.orderStatus}). Reload and try again.`,
+        code: "ORDER_CHANGED",
+        currentStatus: current.orderStatus,
+      });
+    }
+    order = updated;
+
     // COD money is collected at the door, so delivery IS the payment event.
     // Without this a delivered COD order stayed "Pending" forever, leaving COD
     // revenue invisible to reporting and making a COD return's "customer already
     // paid" premise untrue. Guarded so a later status edit can't overwrite a
     // refund that has since been issued.
-    if (
-      orderStatus === "Delivered" &&
-      order.paymentMethod === "COD" &&
-      order.paymentStatus === "Pending"
-    ) {
-      order.paymentStatus = "Paid";
+    //
+    // Its own conditional write, the same one the courier webhook uses, and run only
+    // because THIS request won the status CAS: a losing duplicate never reaches it,
+    // and the payment precondition sits in the filter, so it cannot flip a payment
+    // that changed after the order was read.
+    if (orderStatus === "Delivered") {
+      const promoted = await OrderModel.updateOne(
+        { _id: order._id, paymentMethod: "COD", paymentStatus: "Pending" },
+        { $set: { paymentStatus: "Paid" } },
+      );
+      if (promoted.modifiedCount === 1) order.paymentStatus = "Paid";
     }
-    await order.save();
+
+    // ── A MANUAL "RTO RECEIVED" OWES THE SAME AS A COURIER ONE (G3) ──────────
+    // The courier webhook records the prepaid refund obligation when it moves an
+    // order to "RTO Received". An operator making the same move by hand — the
+    // courier feed missed the arrival, or the parcel came back outside Shiprocket —
+    // recorded nothing, so the ledger said the customer was owed nothing for goods
+    // they paid for and never received. Same helper, same `RTO <id>` dedupe key, so
+    // a webhook arriving later (or racing this) cannot owe it twice.
+    //
+    // After the status write and never thrown: the parcel IS back, and failing the
+    // status change over a ledger write would leave the order claiming it is still
+    // in transit. A failure is logged; the obligation can be recorded by replaying
+    // the courier event or re-reading the order, both idempotent.
+    if (orderStatus === "RTO Received") {
+      try {
+        const obligation = await recordRtoRefundObligation(order);
+        // The obligation was written through the collection, so the in-memory
+        // document is stale; the response should show the liability it created.
+        if (obligation?.owed > 0) order = (await OrderModel.findById(order._id)) || order;
+      } catch (error) {
+        logLifecycleError("orders", "rto_refund_obligation_failed", error, {
+          orderId: String(order._id),
+          source: "manual_status_update",
+        });
+      }
+    }
 
     // Delivery is the point of supply, so it is where the bill of supply gets its
     // number. Three deliberate choices here:
     //
-    // AFTER the save, because the status change is what actually matters and is
+    // AFTER the status write, because the status change is what actually matters and is
     // already durable at this point; AWAITED, because the response below carries
     // the number back to the admin screen and a fire-and-forget mint would leave
     // it blank until a refetch; and CAUGHT, because a numbering failure must never
@@ -762,13 +962,15 @@ export const UpdateOrderStatus = async (req, res) => {
     }
 
     // The success sign-off: tell the customer their order completed. Fire-and-
-    // forget, after the save is durable.
+    // forget, after the status write is durable.
     if (orderStatus === "Completed") {
       notifyOrderCompleted({ orderId: order._id, userId: order.user || null }).catch(() => {});
       emailForOrder(order)
         .then((email) => sendOrderCompletedEmail({ order, email }))
         .catch(() => {});
     }
+
+    await auditStatusChange(req, order, previousStatus, orderStatus);
 
     return res.status(200).json({
       success: true,
@@ -815,16 +1017,55 @@ export const AddOrderNote = async (req, res) => {
   }
 };
 
+/**
+ * The statuses a single line may be cancelled from.
+ *
+ * Confirmed and Packed only: the order is paid for (or is COD, which is created
+ * Confirmed) and nothing has left the building. Pending is absent because the only
+ * order that sits there is a prepaid checkout awaiting capture — there is nothing
+ * to cancel a line of yet. Everything from Shipped onward is moving, and the paths
+ * for that are a full cancellation of the courier booking (pre-pickup) or Returns
+ * after delivery.
+ */
+const PARTIAL_CANCELLABLE_STATUSES = ["Confirmed", "Packed"];
+
+/**
+ * True once a parcel for this order exists outside the database — or is being
+ * created.
+ *
+ * Three facts, any one of which is enough:
+ *
+ *   - a Shiprocket order that has not been cancelled. Shiprocket's /orders/cancel
+ *     cancels a WHOLE order and its payload is fixed at creation, so a line
+ *     cancelled here would still be picked, packed and — on COD — collected for.
+ *   - a creation claim in flight (`syncStatus: "creating"`): the payload is being
+ *     built from the document the claim returned, so a line cancelled now would
+ *     ship anyway with no Shiprocket id yet to show for it.
+ *   - a manually recorded tracking number: a human has already handed the parcel to
+ *     a courier this system cannot talk to.
+ *
+ * Read from the session's snapshot inside PartialCancelOrder's transaction, so a
+ * shipment created a moment before the cancel either shows here or makes the save
+ * conflict and retry.
+ */
+const hasActiveShipment = (order) =>
+  (Boolean(order?.shiprocket?.orderId) && order.shiprocket.syncStatus !== "cancelled") ||
+  order?.shiprocket?.syncStatus === "creating" ||
+  Boolean(String(order?.shipment?.trackingNumber || "").trim());
+
+const partialCancelError = (message, statusCode, code) =>
+  Object.assign(new Error(message), { statusCode, code });
+
 export const PartialCancelOrder = async (req, res) => {
   let session;
   let refundOwed = false;
   let refundAmountOwed = 0;
   let walletCredited = 0;
   let refundKey = null;
-  // Set only when cancelling this line empties the order, which is the one case
-  // where a partial cancellation has to reach the courier — see the end of this
-  // function.
-  let becameCancelled = false;
+  // Set when this request would cancel every remaining unit. That is not a
+  // partial cancellation at all, and it is handed to executeOrderCancellation —
+  // see below.
+  let delegation = null;
   try {
     const { productId, quantity, reason = "" } = req.body || {};
     const cancelQuantity = Number(quantity);
@@ -843,31 +1084,88 @@ export const PartialCancelOrder = async (req, res) => {
       refundAmountOwed = 0;
       walletCredited = 0;
       refundKey = null;
-      becameCancelled = false;
+      delegation = null;
       order = await OrderModel.findById(req.params.orderId).session(session);
       if (!order) {
-        const error = new Error("Order not found");
-        error.statusCode = 404;
-        throw error;
-      }
-      if (["Delivered", "Cancelled"].includes(order.orderStatus)) {
-        const error = new Error("This order cannot be partially cancelled");
-        error.statusCode = 409;
-        throw error;
+        throw partialCancelError("Order not found", 404);
       }
 
-      const item = order.items.find((entry) => String(entry.product) === String(productId));
+      // A checkout nobody has paid for has no line to cancel: nothing was taken,
+      // so there is nothing to give back, and "Refund Pending" on it would claim a
+      // liability that does not exist. The customer (or an admin) cancels the
+      // whole checkout instead, which also releases its stock hold.
+      if (isAwaitingPayment(order)) {
+        throw partialCancelError(
+          "This prepaid order has not been paid for yet, so there is nothing to cancel part of. Cancel the whole order instead.",
+          409,
+          "PAYMENT_NOT_CAPTURED",
+        );
+      }
+      // Was a deny-list of Delivered/Cancelled, which let a line be cancelled on an
+      // order already Shipped, Out For Delivery or in RTO — the parcel kept moving
+      // with the unit in it while the customer was refunded for it (S1).
+      if (!PARTIAL_CANCELLABLE_STATUSES.includes(order.orderStatus)) {
+        throw partialCancelError(
+          `An order that is "${order.orderStatus}" cannot be partially cancelled. Only Confirmed or Packed orders can — once dispatched, use Returns after delivery.`,
+          409,
+          "PARTIAL_CANCEL_NOT_ALLOWED",
+        );
+      }
+
+      const itemIndex = order.items.findIndex(
+        (entry) => String(entry.product) === String(productId),
+      );
+      const item = order.items[itemIndex];
       if (!item) {
-        const error = new Error("Product was not found in this order");
-        error.statusCode = 404;
-        throw error;
+        throw partialCancelError("Product was not found in this order", 404);
       }
 
       const remainingQuantity = item.quantity - (item.cancelledQuantity || 0);
       if (cancelQuantity > remainingQuantity) {
-        const error = new Error(`Only ${remainingQuantity} item(s) can be cancelled`);
-        error.statusCode = 400;
-        throw error;
+        throw partialCancelError(`Only ${remainingQuantity} item(s) can be cancelled`, 400);
+      }
+
+      // ── EMPTYING THE ORDER IS A FULL CANCELLATION (G4) ──────────────────────
+      // Cancelling the last remaining unit used to flip orderStatus to "Cancelled"
+      // right here, by assignment — outside the transition table. No statusHistory
+      // entry, no `cancellation` record, the coupon redemption never released, the
+      // customer never told, and the courier cancellation bolted on separately.
+      // Every one of those is what executeOrderCancellation already does, under
+      // its atomic status claim.
+      //
+      // So this transaction writes NOTHING in that case: it records what was
+      // decided and hands over. The shared core re-claims the order with this
+      // read's `cancellations` count in its filter, so a concurrent partial
+      // cancellation that commits in between makes the claim miss (409) rather
+      // than letting this request act on units it no longer describes.
+      //
+      // The active-shipment guard below deliberately does not apply here: a full
+      // cancellation also cancels the courier booking, which is exactly the
+      // remedy the guard's message points to.
+      const totalRemainingAfter =
+        order.items.reduce(
+          (sum, entry) => sum + (entry.quantity - (entry.cancelledQuantity || 0)),
+          0,
+        ) - cancelQuantity;
+      if (totalRemainingAfter === 0) {
+        delegation = {
+          fromOrder: order,
+          productId: item.product,
+          itemIndex,
+          expectedCancellationCount: (order.cancellations || []).length,
+        };
+        return;
+      }
+
+      // ── NO PARTIAL CANCELLATION ONCE A PARCEL EXISTS (S1) ───────────────────
+      // Checked on the session's read, inside the transaction — see
+      // hasActiveShipment for what counts and why each one does.
+      if (hasActiveShipment(order)) {
+        throw partialCancelError(
+          "A shipment already exists for this order, and a courier booking cannot be reduced by one item. Cancel the whole order instead (which also cancels the courier booking), or use Returns once it is delivered.",
+          409,
+          "PARTIAL_CANCEL_SHIPMENT_EXISTS",
+        );
       }
 
       item.cancelledQuantity = (item.cancelledQuantity || 0) + cancelQuantity;
@@ -876,8 +1174,8 @@ export const PartialCancelOrder = async (req, res) => {
       // at order level, so `price × qty` over-refunded every discounted order.
       // Shipping is excluded here for the same reason as a return, but for a
       // different fact: the remaining units still ship, so the parcel — and its
-      // freight — is still incurred. The one exception is handled below, where
-      // cancelling the LAST unit means nothing ships at all.
+      // freight — is still incurred. Cancelling the LAST unit, where nothing ships
+      // at all, is the full cancellation delegated above.
       let refundAmount = proportionalRefundAmount({
         unitPrice: item.price,
         quantity: cancelQuantity,
@@ -935,30 +1233,6 @@ export const PartialCancelOrder = async (req, res) => {
         });
       }
 
-      const totalRemaining = order.items.reduce(
-        (sum, entry) => sum + (entry.quantity - (entry.cancelledQuantity || 0)),
-        0,
-      );
-      if (totalRemaining === 0) {
-        order.orderStatus = "Cancelled";
-        // Recorded so the courier can be told AFTER this commits. Cancelling the
-        // last remaining unit leaves nothing to ship, but a partial cancellation
-        // used not to notify Shiprocket at all — so the order read Cancelled while
-        // its parcel was still live, and only an operator running the retry
-        // endpoint could close it.
-        becameCancelled = true;
-
-        // Nothing ships now, so the freight is not incurred and the shipping
-        // charge comes back — exactly as a full cancellation would refund it.
-        // `headroom` is the outstanding balance (totalAmount − already refunded),
-        // which is the same figure CancelOrder pays out.
-        //
-        // Without this, cancelling an order unit-by-unit refunded strictly less
-        // than cancelling it in one go: the two paths disagreed by the shipping
-        // charge even though the customer ends up in the identical position.
-        if (headroom > refundAmount) refundAmount = headroom;
-      }
-
       // Records that a refund is OWED. This used to assert
       // "Refunded"/"Partially Refunded" and push a record while never calling
       // the gateway at all — so the order claimed a refund that did not exist,
@@ -1000,6 +1274,48 @@ export const PartialCancelOrder = async (req, res) => {
       await order.save({ session });
     });
 
+    // ── DELEGATED: THIS REQUEST CANCELS THE WHOLE ORDER ─────────────────────
+    // Same core, same guarantees as CancelOrder/AdminCancelOrder: the status claim
+    // (now also carrying the cancellations[] record and the line's cancelled
+    // quantity), restock of exactly the units still outstanding, wallet and coupon
+    // release, the outstanding balance — shipping included, since nothing ships —
+    // recorded and refunded under a `partial-cancel:<id>` key, then the courier,
+    // then the customer is told. The response keeps this endpoint's own shape.
+    if (delegation) {
+      const reasonText = String(reason || "").trim();
+      const { order: cancelledOrder, shipmentCancellation, walletCredited: credited } =
+        await executeOrderCancellation({
+          order: delegation.fromOrder,
+          orderId: req.params.orderId,
+          cancelReason: reasonText.slice(0, 200) || "Partial cancellation",
+          cancelDetails: "Every remaining item was cancelled individually.",
+          actorId: req.user.id,
+          source: "admin",
+          allowedStatuses: PARTIAL_CANCELLABLE_STATUSES,
+          partialCancellation: {
+            productId: delegation.productId,
+            itemIndex: delegation.itemIndex,
+            quantity: cancelQuantity,
+            reason: reasonText,
+            cancelledBy: req.user.id,
+            expectedCancellationCount: delegation.expectedCancellationCount,
+          },
+        });
+
+      return res.status(200).json({
+        success: true,
+        message: credited > 0
+          ? `Order item cancelled. ${credited} of wallet credit was returned to the customer's balance.`
+          : "Order item cancelled",
+        order: cancelledOrder,
+        walletCredited: credited,
+        orderFullyCancelled: true,
+        shipmentCancelled: shipmentCancellation.cancelled,
+        shipmentCancellationPending:
+          Boolean(cancelledOrder.shiprocket?.orderId) && !shipmentCancellation.cancelled,
+      });
+    }
+
     // Money moves only after the cancellation is durably committed — an external
     // payment call inside the transaction could succeed while the transaction
     // rolled back.
@@ -1021,19 +1337,9 @@ export const PartialCancelOrder = async (req, res) => {
       }
     }
 
-    // ── TELL THE COURIER, ONLY IF THE ORDER IS NOW FULLY CANCELLED ───────────
-    // Same helper and same ordering as CancelOrder: local claim → commit → refund
-    // → courier. A partial cancellation that leaves the order active must NOT
-    // reach here — Shiprocket's /orders/cancel cancels a whole order and cannot
-    // express "one unit of two", so calling it would cancel a parcel the customer
-    // is still expecting.
-    let shipmentCancellation = { attempted: false, cancelled: false };
-    if (becameCancelled) {
-      shipmentCancellation = await cancelShipmentForCancelledOrder(order);
-      if (shipmentCancellation.cancelled) {
-        order = await OrderModel.findById(req.params.orderId);
-      }
-    }
+    // No courier call on this path, by construction: it is reached only when the
+    // order stays active AND has no shipment (the guard above), and Shiprocket's
+    // /orders/cancel cancels a whole order and cannot express "one unit of two".
 
     // Only claim a refund to the customer once one has demonstrably happened.
     // This previously fired unconditionally — even on a COD order still at
@@ -1052,18 +1358,16 @@ export const PartialCancelOrder = async (req, res) => {
         : "Order item cancelled",
       order,
       walletCredited,
-      // Only meaningful when this cancellation emptied the order.
-      orderFullyCancelled: becameCancelled,
-      shipmentCancelled: shipmentCancellation.cancelled,
-      shipmentCancellationPending:
-        becameCancelled &&
-        Boolean(order.shiprocket?.orderId) &&
-        !shipmentCancellation.cancelled,
+      // The order is still active on this path; an emptying request returns above.
+      orderFullyCancelled: false,
+      shipmentCancelled: false,
+      shipmentCancellationPending: false,
     });
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
+      ...(error.code ? { code: error.code } : {}),
     });
   } finally {
     if (session) await session.endSession();
@@ -1172,18 +1476,78 @@ export const RetryShipmentCancellation = async (req, res) => {
  * It never decides an amount and never creates a liability — the row already
  * exists and carries both. It asks Razorpay what happened, adopts the answer if
  * there is one, and only calls the gateway when the refund is confirmed absent.
+ *
+ * It is also how an OWED gateway refund gets paid (G2). A prepaid RTO records its
+ * refund as `owed` — deliberately not pushed to the gateway from an unattended
+ * courier feed — and until now nothing could ever pay it: this endpoint required a
+ * reconciliation key the owed row never had, and the manual-settle endpoint
+ * (correctly) refuses rows Razorpay can pay. The liability was visible and
+ * permanently stuck. See the owed branch below.
  */
 export const ReconcileOrderRefund = async (req, res) => {
   try {
     const { orderId, refundId } = req.params;
-    const order = await OrderModel.findById(orderId);
+    let order = await OrderModel.findById(orderId);
     if (!order) {
       return res.status(404).json({ success: false, message: "Order not found" });
     }
 
-    const record = order.refunds.id(refundId);
+    let record = order.refunds.id(refundId);
     if (!record) {
       return res.status(404).json({ success: false, message: "Refund record not found on this order" });
+    }
+
+    // ── AN OWED GATEWAY ROW: GIVE IT A KEY, THEN PAY IT LIKE ANY OTHER ───────
+    // An `owed` row has never been sent anywhere, so there is nothing at Razorpay
+    // to reconcile against — what it lacks is only the key that every gateway
+    // attempt must carry in notes.refundKey (which is what makes a later lost
+    // response recoverable). It is assigned here, ONCE, by a compare-and-swap on
+    // the row still being owed and keyless: two operators pressing "Refund via
+    // Razorpay" together both end up holding the same `owed:<refundId>` key, and
+    // the gateway-attempt claim inside settleGatewayRefund then lets exactly one
+    // of them call Razorpay. That claim is also where the row flips owed →
+    // created, in the same write (claimGatewayAttempt).
+    //
+    // Deliberately NOT claimRefundSlot: the row is already in the ledger and
+    // already counts toward the ceiling, so pushing a second row for the same
+    // money would double it.
+    //
+    // A manual-confirmation row (a COD payout) is not the gateway's to pay at all,
+    // and an order Razorpay cannot refund has no gateway path either; both are
+    // refused before any key is written.
+    if (record.status === "owed") {
+      if (record.confirmationMethod === "manual" || !canAutoRefund(order)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "This refund cannot be paid through Razorpay. Pay the customer directly and record the payout and its reference from the owed refunds list.",
+          code: "MANUAL_REFUND_ONLY",
+        });
+      }
+      if (!record.idempotencyKey && !record.gatewayAttemptedAt) {
+        await OrderModel.updateOne(
+          {
+            _id: order._id,
+            refunds: {
+              $elemMatch: {
+                _id: record._id,
+                status: "owed",
+                // `null` matches a missing field as well as an explicit null — the
+                // schema setter stores neither, but legacy rows may carry one.
+                idempotencyKey: null,
+              },
+            },
+          },
+          { $set: { "refunds.$.idempotencyKey": `owed:${record._id}` } },
+        );
+        // Re-read whether this request set the key or a concurrent one did: either
+        // way the row now carries it, and the gateway claim decides who proceeds.
+        order = await OrderModel.findById(orderId);
+        record = order?.refunds.id(refundId);
+        if (!record) {
+          return res.status(404).json({ success: false, message: "Refund record not found on this order" });
+        }
+      }
     }
 
     if (record.status === "processed") {
@@ -1259,7 +1623,9 @@ export const ReconcileOrderRefund = async (req, res) => {
       description:
         result.outcome === "reconciled"
           ? `Adopted existing Razorpay refund ${result.providerRefundId} for ₹${record.amount} — no second refund issued`
-          : `Issued Razorpay refund ${result.providerRefundId} for ₹${record.amount} after confirming none existed`,
+          : record.status === "owed"
+            ? `Paid owed refund of ₹${record.amount} through Razorpay (${result.providerRefundId})`
+            : `Issued Razorpay refund ${result.providerRefundId} for ₹${record.amount} after confirming none existed`,
       req,
     });
 
@@ -1268,7 +1634,9 @@ export const ReconcileOrderRefund = async (req, res) => {
       message:
         result.outcome === "reconciled"
           ? "Refund reconciled against Razorpay — no second refund was issued"
-          : "Refund issued (Razorpay confirmed no earlier refund existed)",
+          : record.status === "owed"
+            ? "Owed refund paid through Razorpay"
+            : "Refund issued (Razorpay confirmed no earlier refund existed)",
       reconciled: result.outcome === "reconciled",
       order: fresh,
     });
@@ -1399,6 +1767,15 @@ const CANCEL_REASONS = [
  * the transaction re-claims against the collection, so a stale read here
  * cannot double-run any compensation. Throws on conflict (statusCode 409) —
  * callers translate errors into their own response shape.
+ *
+ * `partialCancellation` is set only by PartialCancelOrder, when a "cancel this
+ * line" request would cancel every remaining unit. It makes the claim also push
+ * the `cancellations[]` record and mark the line's units cancelled — in the same
+ * atomic write, so the record exists exactly when the status flip does — and keys
+ * the refund `partial-cancel:<cancellationId>`, the key that path has always used.
+ * `expectedCancellationCount` is the caller's read of `cancellations.length`; it
+ * goes in the claim filter so a concurrent partial cancellation committing in
+ * between makes this claim miss instead of acting on a stale picture of the lines.
  */
 const executeOrderCancellation = async ({
   order,
@@ -1411,10 +1788,15 @@ const executeOrderCancellation = async ({
   // original pair; the admin path also covers Packed (parcel booked but not
   // dispatched — the post-commit courier cancellation handles the shipment).
   allowedStatuses = ["Pending", "Confirmed"],
+  partialCancellation = null,
 }) => {
   let session;
   let refundOwed = false;
   let refundKey = null;
+  let walletCredited = 0;
+  // Set when the claimed order turned out to be a checkout nobody paid for. Its
+  // clean-up (the payment intent and the stock hold) happens after commit.
+  let unpaidCheckout = null;
   try {
     // The courier is told AFTER the local cancellation is committed — see the end
     // of this function. It used to be cancelled here, before the claim below, so
@@ -1431,6 +1813,37 @@ const executeOrderCancellation = async ({
       refundOwed = false;
       refundAmountOwed = 0;
       refundKey = null;
+      walletCredited = 0;
+      unpaidCheckout = null;
+
+      // The delegated partial cancellation's record and preconditions. The id is
+      // minted here, per attempt, so the refund key can be derived from it before
+      // anything is written.
+      const cancellationId = partialCancellation ? new mongoose.Types.ObjectId() : null;
+      const claimPrecondition = partialCancellation
+        ? { cancellations: { $size: partialCancellation.expectedCancellationCount } }
+        : {};
+      const claimRecord = partialCancellation
+        ? {
+            $push: {
+              cancellations: {
+                _id: cancellationId,
+                product: partialCancellation.productId,
+                quantity: partialCancellation.quantity,
+                reason: partialCancellation.reason || "",
+                // Filled in below from the claimed snapshot, once the outstanding
+                // balance is known — see `outstanding`.
+                refundAmount: 0,
+                cancelledBy: partialCancellation.cancelledBy,
+                cancelledAt: new Date(),
+              },
+            },
+            $inc: {
+              [`items.${partialCancellation.itemIndex}.cancelledQuantity`]:
+                partialCancellation.quantity,
+            },
+          }
+        : { $push: {} };
 
       // ─── ATOMIC CLAIM ───────────────────────────────────────────────────
       // The status gate above ran against a read taken OUTSIDE this session,
@@ -1440,8 +1853,9 @@ const executeOrderCancellation = async ({
       // once. Without this, a retried callback re-credited the wallet,
       // re-restored stock and pushed a second refund for the same order.
       const claimed = await OrderModel.findOneAndUpdate(
-        { _id: orderId, orderStatus: { $in: allowedStatuses } },
+        { _id: orderId, orderStatus: { $in: allowedStatuses }, ...claimPrecondition },
         {
+          ...claimRecord,
           $set: {
             orderStatus: "Cancelled",
             cancellation: {
@@ -1458,6 +1872,7 @@ const executeOrderCancellation = async ({
             // is derivable (SHIPMENT_CANCELLATION_PENDING).
           },
           $push: {
+            ...claimRecord.$push,
             statusHistory: {
               from: order.orderStatus,
               to: "Cancelled",
@@ -1476,6 +1891,40 @@ const executeOrderCancellation = async ({
         );
         conflict.statusCode = 409;
         throw conflict;
+      }
+
+      // ── AN UNPAID CHECKOUT HAD NOTHING TAKEN, SO NOTHING IS GIVEN BACK (G1) ──
+      // A prepaid order awaiting capture has not committed anything yet: its stock
+      // is HELD by a reservation (decremented once, at reservation time), and the
+      // wallet debit and coupon redemption both happen only at capture, inside
+      // completeCapturedIntent. Running the compensations below on it was three
+      // separate bugs at once — the units were restored here AND again when the
+      // reservation was released or expired (double restock, phantom stock), the
+      // order's walletDiscount was credited to a customer who was never debited
+      // it, and a coupon redemption that was never made was "released", freeing a
+      // slot someone else had genuinely used.
+      //
+      // And it left paymentStatus at "Pending", which is what let a late capture
+      // resurrect the cancelled order to Confirmed/Paid. "Failed" is the honest
+      // state — no money was ever collected for this order — and it takes the row
+      // out of the abandoned-checkout sweeper's reach too. Filtered on the same
+      // awaiting-payment shape, inside this transaction, so it cannot overwrite a
+      // capture that won the race (that capture would have changed the status and
+      // made the claim above see a paid order instead).
+      //
+      // The stock hold and the payment intent live outside this transaction and
+      // are closed after commit — see closeUnpaidCheckout.
+      if (isAwaitingPayment(claimed)) {
+        await OrderModel.updateOne(
+          { _id: claimed._id, paymentMethod: "RAZORPAY", paymentStatus: "Pending" },
+          { $set: { paymentStatus: "Failed", paymentExpiresAt: null } },
+          { session },
+        );
+        unpaidCheckout = {
+          orderId: claimed._id,
+          razorpayOrderId: claimed.razorpayOrderId || null,
+        };
+        return;
       }
 
       // Everything below is driven from `claimed`, the pre-cancellation
@@ -1506,7 +1955,7 @@ const executeOrderCancellation = async ({
       // directly, because a partial cancellation or a return may already have
       // given part of it back. The old unconditional $inc handed the whole
       // walletDiscount over a second time in that case.
-      await restoreWalletCredit({
+      walletCredited = await restoreWalletCredit({
         order: claimed,
         amount: claimed.walletDiscount,
         session,
@@ -1558,12 +2007,31 @@ const executeOrderCancellation = async ({
       const outstanding =
         Math.round((Number(claimed.totalAmount) - sumRefunded(claimed)) * 100) / 100;
 
+      // The delegated partial cancellation's record carries the value it
+      // cancelled, exactly as PartialCancelOrder's own records do: the outstanding
+      // balance, shipping included, because emptying the order means nothing ships.
+      // Recorded whether or not money was collected — on COD it is the amount no
+      // longer to be collected, which is what the field has always meant there.
+      if (cancellationId && outstanding > 0) {
+        await OrderModel.updateOne(
+          { _id: claimed._id, "cancellations._id": cancellationId },
+          { $set: { "cancellations.$.refundAmount": outstanding } },
+          { session },
+        );
+      }
+
       if (moneyCollected && outstanding > 0) {
         // One full cancellation per order — the status claim above guarantees a
         // single execution — so the order id is a stable key. Carried into
         // notes.refundKey at the gateway, which is what lets a lost response be
         // reconciled instead of being retried blindly.
-        refundKey = cancellationRefundKey({ orderId: claimed._id });
+        //
+        // A delegated partial cancellation keeps the key that path has always
+        // used, `partial-cancel:<cancellationId>`, so a refund is reconciled the
+        // same way whichever line of reasoning recorded it.
+        refundKey = cancellationId
+          ? cancellationRefundKey({ orderId: claimed._id, cancellationId })
+          : cancellationRefundKey({ orderId: claimed._id });
         await OrderModel.updateOne(
           { _id: claimed._id },
           {
@@ -1590,6 +2058,8 @@ const executeOrderCancellation = async ({
     // The in-memory `order` is now stale (the transaction wrote via the
     // collection, not this document), so re-read before using or returning it.
     order = await OrderModel.findById(orderId);
+
+    if (unpaidCheckout) await closeUnpaidCheckout(unpaidCheckout);
 
     // Now that the cancellation is durably committed, actually move the money.
     // A failure here leaves the order cancelled and the refund visibly pending
@@ -1673,9 +2143,73 @@ const executeOrderCancellation = async ({
       )
       .catch(() => {});
 
-    return { order, shipmentCancellation };
+    return { order, shipmentCancellation, walletCredited };
   } finally {
     if (session) await session.endSession();
+  }
+};
+
+/**
+ * Closes the payment side of a cancelled, never-paid checkout: expires its payment
+ * intent and gives its stock hold back. Runs after the cancellation has committed.
+ *
+ * The intent is EXPIRED, not deleted and not failed. Deleting it would destroy the
+ * only link from a late capture back to this customer and cart; "failed" is
+ * retryable (RetryRazorpayOrder accepts it), and a retry would mint a new Razorpay
+ * order for a checkout the customer has called off. An expired intent is refused by
+ * both payment paths — completeCapturedIntent throws 409 "Payment session is
+ * expired" — so a capture that lands anyway is recorded and refunded through
+ * refundOrphanedCapture rather than promoted.
+ *
+ * Compare-and-swap from "created"/"failed" only. A "processing" intent has a
+ * capture in flight; it is left alone, because that capture cannot win anyway — the
+ * order is no longer at Pending, so its promotion compare-and-swap misses and it
+ * takes the same 409 → refund path on its own.
+ *
+ * The reservation is released through releaseReservation, whose own active-only
+ * claim means the expiry sweeper (cleanupExpiredStockReservations) and this call
+ * can never both restock it. Reservation-less checkouts (reserveDuringPayment off)
+ * took no stock, and releaseReservation simply finds nothing.
+ *
+ * Never throws: the cancellation is already durable. Anything left undone here is
+ * still safe — the sweeper returns the stock when the hold expires, and the order's
+ * own status refuses a late promotion.
+ */
+const closeUnpaidCheckout = async ({ orderId, razorpayOrderId }) => {
+  try {
+    const links = [{ pendingOrder: orderId }];
+    if (razorpayOrderId) {
+      links.push({ razorpayOrderId }, { previousRazorpayOrderIds: razorpayOrderId });
+    }
+    const intents = await PaymentIntent.find({ $or: links }).select("_id status storeOrder");
+
+    for (const intent of intents) {
+      // An intent that produced a paid order is never this checkout's to close.
+      if (intent.storeOrder) continue;
+      const expired = await PaymentIntent.updateOne(
+        { _id: intent._id, status: { $in: ["created", "failed"] }, storeOrder: null },
+        {
+          $set: {
+            status: "expired",
+            failureReason: "Order was cancelled before the payment was captured",
+          },
+        },
+      );
+      const released = await releaseReservation({
+        paymentIntentId: intent._id,
+        reason: "order_cancelled_unpaid",
+      });
+      logLifecycleEvent("orders", "unpaid_checkout_closed", {
+        orderId: String(orderId),
+        paymentIntentId: String(intent._id),
+        intentExpired: expired.modifiedCount === 1,
+        reservationReleased: Boolean(released),
+      });
+    }
+  } catch (error) {
+    logLifecycleError("orders", "unpaid_checkout_close_failed", error, {
+      orderId: String(orderId),
+    });
   }
 };
 
@@ -1771,8 +2305,9 @@ export const CancelOrder = async (req, res) => {
  *     endpoint.
  *
  * The Pending/Confirmed gate stays: once the order is Packed the parcel is
- * moving, and the paths for that are Returns (after delivery) or per-item
- * partial cancellation — same rule the status machine enforces everywhere.
+ * moving, and the path for that is Returns (after delivery) — same rule the
+ * status machine enforces everywhere. Per-item partial cancellation is no longer
+ * a route out once a parcel exists: PartialCancelOrder refuses it then (S1).
  */
 export const AdminCancelOrder = async (req, res) => {
   try {
@@ -1798,7 +2333,7 @@ export const AdminCancelOrder = async (req, res) => {
         success: false,
         code: "ORDER_NOT_CANCELLABLE",
         message:
-          "Only Pending, Confirmed or Packed orders can be fully cancelled. Once shipped, use partial cancellation or the Returns flow after delivery.",
+          "Only Pending, Confirmed or Packed orders can be fully cancelled. Once shipped, use the Returns flow after delivery.",
       });
     }
 

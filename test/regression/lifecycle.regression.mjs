@@ -361,14 +361,17 @@ try {
       canTransitionOrderStatus("NDR", "Delivered").ok === true,
   );
 
-  const shippingSrc = await readFile("src/modules/shipping/shipping.controller.js", "utf8");
+  // The status map and the courier pipeline moved out of the controller (shared by the
+  // webhook and the reconciler); the properties are checked where the code now lives.
+  const statusMapSrc = await readFile("src/modules/shipping/shipment-status-map.js", "utf8");
+  const pipelineSrc = await readFile("src/modules/shipping/courier-event.service.js", "utf8");
+  const arrivalCheck = statusMapSrc.indexOf('isRtoReceived(statusCode, text)) return "RTO Received"');
   ok(
     'the webhook maps RTO-arrival to "RTO Received" before the generic RTO test',
-    shippingSrc.indexOf("isRtoReceived(statusCode, currentStatus)) return \"RTO Received\"") <
-      shippingSrc.indexOf('return to origin/i.test'),
+    arrivalCheck !== -1 && arrivalCheck < statusMapSrc.indexOf("return to origin/i.test"),
   );
-  ok("the webhook no longer restocks blind on arrival", !/isRtoReceived\([\s\S]{0,400}restockRtoOrder/.test(shippingSrc));
-  ok("it records a refund obligation instead", shippingSrc.includes("recordRtoRefundObligation"));
+  ok("the webhook no longer restocks blind on arrival", !pipelineSrc.includes("restockRtoOrder"));
+  ok("it records a refund obligation instead", pipelineSrc.includes("recordRtoRefundObligation(order)"));
 
   // Prepaid RTO: a refund is owed.
   const prepaidRto = await makeOrder({ paymentStatus: "Paid", orderStatus: "RTO" });
@@ -611,10 +614,13 @@ try {
     /findOneAndUpdate\([\s\S]{0,80}_id: orderId,\s*orderStatus: \{ \$in: allowedStatuses \}/.test(orderSrc) &&
       /allowedStatuses = \["Pending", "Confirmed"\]/.test(orderSrc),
   );
+  // The filter also carries orderStatus "Pending" (G1): an unpaid checkout that was
+  // cancelled must not be promotable by a capture that lands afterwards, which the
+  // paymentStatus condition alone allowed — the cancellation left it at "Pending".
   ok(
-    "the order promotion is a CAS on paymentStatus",
+    "the order promotion is a CAS on paymentStatus AND orderStatus",
     (await readFile("src/modules/payments/payment-order.service.js", "utf8")).includes(
-      '{ _id: currentIntent.pendingOrder, paymentStatus: "Pending" }',
+      '{ _id: currentIntent.pendingOrder, paymentStatus: "Pending", orderStatus: "Pending" }',
     ),
   );
   ok(

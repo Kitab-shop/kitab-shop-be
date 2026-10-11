@@ -4,7 +4,12 @@ import ProductModel from "../products/Product.model.js";
 import UserProfile from "../profiles/UserProfile.model.js";
 import { calculateCouponDiscount } from "../coupons/coupon.service.js";
 import CheckoutSetting from "./CheckoutSetting.model.js";
-import { getCheapestShippingRate } from "../shipping/shiprocket.service.js";
+import {
+  computeOrderPackage,
+  getCheapestShippingRate,
+  getShiprocketCredentials,
+  resolvePackage,
+} from "../shipping/shiprocket.service.js";
 import {
   availableStockFor,
   effectiveUnitPrice,
@@ -104,6 +109,8 @@ export const prepareOrderData = async ({
   }
 
   const orderItems = [];
+  // The measurements of what is actually in the basket, for the shipping quote below.
+  const parcelItems = [];
   let subtotal = 0;
 
   for (const item of items) {
@@ -126,7 +133,7 @@ export const prepareOrderData = async ({
     }
 
     const product = await ProductModel.findById(productId).select(
-      "name image price stock variants author",
+      "name image price stock variants author weight length breadth height",
     );
     if (!product) throw orderError("Product not found", 404);
 
@@ -193,6 +200,7 @@ export const prepareOrderData = async ({
       variantKey,
     });
     subtotal += price * quantity;
+    parcelItems.push({ product, quantity });
   }
 
   // Pricing only. Redemption belongs to the two transactional call sites — PlaceOrder
@@ -233,15 +241,29 @@ export const prepareOrderData = async ({
   const { shippingRatesEnabled } = await CheckoutSetting.getSettings();
   let shippingCharge = 0;
   if (shippingRatesEnabled) {
+    // Quoted for THIS basket's parcel — the same computeOrderPackage the shipment itself
+    // is booked with — not the store's default box. Quoting a five-book order as one
+    // default parcel under-charged the customer by every weight slab above it. If the
+    // measurements cannot be resolved, the default parcel is used, as before.
+    let packageDetails;
+    try {
+      packageDetails = await resolvePackage(
+        computeOrderPackage({ items: parcelItems }, await getShiprocketCredentials()),
+      );
+    } catch {
+      packageDetails = undefined;
+    }
     const rate = await getCheapestShippingRate({
+      packageDetails,
       deliveryPostcode: shippingAddress.pincode,
       // The REAL method. This was hardcoded false, so a COD order was quoted — and
       // charged — the prepaid rate, silently absorbing the courier's COD handling
       // fee on every cash order. Inert while shippingRatesEnabled is off, which is
       // why it is worth fixing before anyone switches rates on.
       //
-      // The COD gate asks the same question a moment later; the memo inside
-      // checkServiceability means both reads are one call.
+      // The COD gate asks serviceability again a moment later. That second call is
+      // deliberate (checkServiceability is not cached): the gate must not answer from a
+      // stale snapshot of courier availability.
       cod: String(paymentMethod).toUpperCase() === "COD",
       declaredValue: subtotal,
     });

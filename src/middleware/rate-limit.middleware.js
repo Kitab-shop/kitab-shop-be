@@ -178,3 +178,23 @@ export const adminOrderActionRateLimit = createRateLimit({
   max: 100,
   message: "Too many order actions in a short time. Please pause briefly and try again.",
 });
+
+// "Run reconciliation now" makes a bounded batch of live Shiprocket calls per click.
+// The scheduled pass already runs every few minutes, so a human needs this rarely; the
+// limit stops a stuck mouse or a script turning it into a hammer on the courier API.
+export const shippingReconcileRateLimit = createRateLimit({
+  name: "shipping-reconcile",
+  windowMs: 10 * MINUTE,
+  max: 6,
+  message: "Reconciliation was run several times just now. Wait a few minutes before running it again.",
+});
+
+// Checkout's COD pre-check: one live Shiprocket call per request. Generous enough for a
+// customer editing their address a few times, low enough that the endpoint cannot be
+// used to sweep PIN codes on the store's courier account.
+export const serviceabilityRateLimit = createRateLimit({
+  name: "serviceability",
+  windowMs: 10 * MINUTE,
+  max: 40,
+  message: "Too many delivery checks in a short time. Please wait a moment and try again.",
+});

@@ -15,6 +15,7 @@ import {
   canTransitionOrderStatus,
   isFulfillableStatus,
 } from "../orders/order-status.rules.js";
+import { EXCLUDE_AWAITING_PAYMENT, isAwaitingPayment } from "../orders/order-visibility.js";
 import { logLifecycleEvent } from "../../utils/lifecycle-logger.service.js";
 
 /**
@@ -68,6 +69,23 @@ export const RecordManualShipment = async (req, res) => {
       });
     }
 
+    // A prepaid checkout whose payment was never captured is not an order yet, and
+    // writing a carrier and tracking number onto one records goods as handed to a
+    // courier for an order nobody paid for. The transition gate below would not
+    // stop it — Pending cannot advance to Shipped, so the call would silently land
+    // as a "correction" and stamp the shipment record anyway. Refused outright,
+    // and asserted again in the write filter so a status read a moment ago cannot
+    // be relied on.
+    if (isAwaitingPayment(order)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This prepaid order has not been paid for yet, so it cannot be recorded as shipped.",
+        code: "PAYMENT_NOT_CAPTURED",
+        currentStatus: order.orderStatus,
+      });
+    }
+
     // A live Shiprocket shipment is not something this endpoint may relabel. The
     // courier identifiers behind it — orderId, shipmentId, and whatever the webhook
     // resolves against — remain real, so calling the parcel MANUAL would describe
@@ -115,8 +133,8 @@ export const RecordManualShipment = async (req, res) => {
     // entry for the same move. Nothing here moves money or stock, so a lost race
     // just asks the caller to look again.
     const filter = advance
-      ? { _id: order._id, orderStatus: order.orderStatus }
-      : { _id: order._id };
+      ? { _id: order._id, orderStatus: order.orderStatus, ...EXCLUDE_AWAITING_PAYMENT }
+      : { _id: order._id, ...EXCLUDE_AWAITING_PAYMENT };
 
     const updated = await OrderModel.findOneAndUpdate(
       filter,

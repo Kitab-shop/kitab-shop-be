@@ -580,6 +580,12 @@ try {
   section("9 — partial cancellation does not touch Shiprocket");
 
   {
+    // Changed on purpose (S1). This used to expect the line to be cancelled, refunded
+    // and restocked while the Shiprocket order went on to ship it — its payload is
+    // fixed at creation and a courier booking cannot be reduced by one unit. Once a
+    // shipment exists a partial cancellation is now refused outright; the remedy is
+    // a full cancellation, which also cancels the courier booking. What the section
+    // title promises still holds: Shiprocket is not called.
     resetStubs("success");
     const product = await makeProduct("partial", 20);
     const order = await makeOrder({ product, quantity: 3 });
@@ -590,7 +596,11 @@ try {
       user: { id: String(new mongoose.Types.ObjectId()), roles: ["admin"] },
     });
 
-    ok("the partial cancellation succeeds", response.statusCode === 200, `${response.statusCode} ${response.body?.message || ""}`);
+    ok(
+      "the partial cancellation is refused once a shipment exists (409 PARTIAL_CANCEL_SHIPMENT_EXISTS)",
+      response.statusCode === 409 && response.body?.code === "PARTIAL_CANCEL_SHIPMENT_EXISTS",
+      `${response.statusCode} ${response.body?.code || ""} ${response.body?.message || ""}`,
+    );
     ok(
       "Shiprocket is NOT called — a part-cancel cannot be expressed to the courier",
       shiprocket.cancelCalls.length === 0,
@@ -599,18 +609,15 @@ try {
 
     const fresh = await OrderModel.findById(order._id);
     ok("the order stays live", fresh.orderStatus === "Confirmed", fresh.orderStatus);
-    ok("one unit was cancelled", fresh.items[0].cancelledQuantity === 1, String(fresh.items[0].cancelledQuantity));
+    ok("no unit was cancelled", (fresh.items[0].cancelledQuantity || 0) === 0, String(fresh.items[0].cancelledQuantity));
     ok(
       "the shipment is untouched and NOT flagged pending",
       fresh.shiprocket.syncStatus === "created" && (await isPending(order._id)) === false,
       fresh.shiprocket.syncStatus,
     );
-    ok(
-      "a partial refund liability was recorded",
-      fresh.refunds.length === 1,
-      `${fresh.refunds.length} rows`,
-    );
-    ok("stock for the cancelled unit was restored", (await ProductModel.findById(product._id)).stock === 21, String((await ProductModel.findById(product._id)).stock));
+    ok("no refund liability was recorded", fresh.refunds.length === 0, `${fresh.refunds.length} rows`);
+    ok("no gateway refund was issued", razorpayCalls.refund.length === 0, `${razorpayCalls.refund.length}x`);
+    ok("stock is untouched", (await ProductModel.findById(product._id)).stock === 20, String((await ProductModel.findById(product._id)).stock));
   }
 
   {

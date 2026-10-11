@@ -45,6 +45,13 @@ const RTO_REASON_PATTERN = /^RTO [0-9a-f]{24}$/i;
  *
  * One row per owed refund, not per order: an order can owe more than one (a partial
  * cancellation and then an RTO), and they are separate pieces of work.
+ *
+ * `gatewayPayable` says whether Razorpay can pay the row — the screen offers
+ * "Refund via Razorpay" (POST /api/v1/order/:orderId/refunds/:refundId/reconcile)
+ * when it is true and the manual payout form when it is false. Derived on the
+ * SERVER from canAutoRefund, the same predicate the reconcile and manual-settle
+ * endpoints enforce, so the button the operator sees cannot disagree with what
+ * the endpoint behind it will accept.
  */
 export const AdminGetOwedRefunds = async (req, res) => {
   try {
@@ -105,6 +112,9 @@ export const AdminGetOwedRefunds = async (req, res) => {
             rtoDisposition: 1,
             customerName: "$customer.name",
             customerEmail: "$customer.email",
+            // Read only so canAutoRefund can be asked below, then dropped before
+            // the response: a payment identifier stays off this screen.
+            gatewayPaymentRef: "$razorpayPaymentId",
           },
         },
       ]),
@@ -121,11 +131,18 @@ export const AdminGetOwedRefunds = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: rows.map((row) => ({
+      data: rows.map(({ gatewayPaymentRef, ...row }) => ({
         ...row,
         // Derived on read from the existing dedupe key. No record was modified to
         // make it displayable.
         isRto: RTO_REASON_PATTERN.test(String(row.reason || "")),
+        // Owed, awaiting the gateway (not a human payout), and on an order Razorpay
+        // can actually refund. The row's reconciliation key is assigned only when
+        // the operator acts, and is never exposed here.
+        gatewayPayable:
+          row.refundStatus === "owed" &&
+          (row.confirmationMethod || "gateway") === "gateway" &&
+          canAutoRefund({ paymentMethod: row.paymentMethod, razorpayPaymentId: gatewayPaymentRef }),
       })),
       summary: {
         totalOwedAmount: Math.round((summaryResult[0]?.totalAmount || 0) * 100) / 100,
@@ -190,7 +207,7 @@ export const AdminSettleOwedRefundManually = async (req, res) => {
         success: false,
         code: "USE_GATEWAY_REFUND",
         message:
-          "This refund can be paid through Razorpay automatically. Use the Refund action on the order page instead of recording a manual payout.",
+          "This refund can be paid through Razorpay automatically. Use \"Refund via Razorpay\" instead of recording a manual payout.",
       });
     }
 

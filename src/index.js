@@ -39,6 +39,7 @@ import newsletterRoutes from "./modules/newsletter/newsletter.routes.js";
 import { router as seoRoutes } from "./modules/seo/index.js";
 import mongoose from "mongoose";
 import { startStockReservationCleanup, stopStockReservationCleanup } from "./modules/inventory/stock-reservation-cleanup.service.js";
+import { startShippingReconciliation, stopShippingReconciliation } from "./modules/shipping/shipping-reconciliation.service.js";
 import { getHttpConfig } from "./config/features.config.js";
 import {
 	ensureUploadDirs,
@@ -56,6 +57,10 @@ dotenv.config({ path: resolve(__dirname, "../.env") });
 await db();
 await ensureUploadDirs();
 startStockReservationCleanup();
+// Courier safety net: re-reads tracking the webhook went quiet on and retries courier
+// cancellations / failed auto-pushes. Self-gating — it does nothing unless Shiprocket
+// is in use and reconciliation is enabled (SHIPPING_RECONCILE_ENABLED, admin panel).
+startShippingReconciliation();
 
 const app = express();
 const httpConfig = getHttpConfig();
@@ -245,6 +250,7 @@ const shutdown = async (signal) => {
 	try {
 		await new Promise((resolve) => server.close(resolve));
 		stopStockReservationCleanup();
+		stopShippingReconciliation();
 		await mongoose.connection.close(false);
 		console.log("Shutdown complete");
 		process.exit(0);

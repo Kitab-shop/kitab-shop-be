@@ -115,3 +115,65 @@ export const canTransitionOrderStatus = (from, to) => {
   }
   return { ok: true };
 };
+
+/**
+ * Statuses a COURIER event may move an order out of.
+ *
+ * Pending is absent on purpose: a COD order is created Confirmed, so Pending only
+ * ever means a prepaid checkout whose payment has not been captured. A courier
+ * event against one is an integrity problem to surface, not a move to make — it
+ * would ship goods nobody has paid for. Delivered and every terminal status are
+ * absent because nothing a courier reports can legitimately take an order back
+ * out of them.
+ */
+export const COURIER_SOURCE_STATUSES = [
+  "Confirmed",
+  "Packed",
+  "Shipped",
+  "Out For Delivery",
+  "NDR",
+  "RTO",
+];
+
+// The only intermediate steps a courier can make us miss. Both are the single gate
+// into their branch: every in-transit status is entered through "Shipped", and
+// "RTO Received" only through "RTO". Spelled out rather than searched for, so the
+// set of moves the catch-up can make is reviewable by reading two lines.
+const VIA_SHIPPED = ["Out For Delivery", "Delivered", "NDR", "RTO", "RTO Received"];
+const PRE_DISPATCH = ["Confirmed", "Packed"];
+
+/**
+ * The sequence of moves that carries an order from `from` to the status a courier
+ * just reported, or null if no legal sequence exists.
+ *
+ * Courier events are not guaranteed to arrive, and the transition table only
+ * permits one step at a time. Without this, a single missed "Shipped" event left
+ * an order at Packed forever: the later "Delivered" was refused as an illegal
+ * jump, COD cash was never recorded, and the return window never opened. Each hop
+ * returned here is individually legal under ORDER_STATUS_TRANSITIONS, so the
+ * catch-up can never reach a status the table could not have reached by itself —
+ * it only stops a lost event from freezing the order.
+ *
+ * @returns {Array<{from: string, to: string}> | null} [] when already there.
+ */
+export const resolveCourierPath = (from, to) => {
+  if (!ORDER_STATUSES.includes(to)) return null;
+  if (from === to) return [];
+  if (!COURIER_SOURCE_STATUSES.includes(from)) return null;
+
+  if (canTransitionOrderStatus(from, to).ok) return [{ from, to }];
+
+  const hops = [];
+  let current = from;
+  if (PRE_DISPATCH.includes(current) && VIA_SHIPPED.includes(to)) {
+    hops.push({ from: current, to: "Shipped" });
+    current = "Shipped";
+  }
+  if (to === "RTO Received" && ["Shipped", "Out For Delivery", "NDR"].includes(current)) {
+    hops.push({ from: current, to: "RTO" });
+    current = "RTO";
+  }
+  if (!canTransitionOrderStatus(current, to).ok) return null;
+  hops.push({ from: current, to });
+  return hops;
+};

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import mongoose from "mongoose";
 import { isPaymentEnabled } from "../../config/features.config.js";
 import OrderModel from "../orders/Order.model.js";
 import UserProfile from "../profiles/UserProfile.model.js";
@@ -350,6 +351,40 @@ export const claimGatewayAttempt = async ({
   session = null,
 }) => {
   const cutoff = new Date(Date.now() - staleAfterMs);
+  const options = { ...(session ? { session } : {}), returnDocument: "after" };
+  const notInFlight = [
+    { gatewayAttemptedAt: null },
+    { gatewayAttemptedAt: { $exists: false } },
+    { gatewayAttemptedAt: { $lte: cutoff } },
+  ];
+
+  // ── AN OWED ROW BECOMES `created` IN THE SAME WRITE THAT CLAIMS THE ATTEMPT ──
+  // `owed` means "liability recorded, nothing attempted"; `created` means "the
+  // gateway was called and the outcome is unknown". The moment this claim is won
+  // the first is no longer true, so the flip belongs in the claim itself. Done as
+  // a separate write afterwards, a crash between the two would leave a row that
+  // reads "nothing attempted" while a Razorpay call may in fact have gone out —
+  // and the owed-refunds queue would offer it for payment again.
+  //
+  // Tried FIRST and on its own because it is a strict subset of the general
+  // claim below: a row that is still `owed` can only be claimed here, and once
+  // flipped it can never become `owed` again, so falling through to the general
+  // claim cannot double-claim it.
+  const claimedOwed = await OrderModel.findOneAndUpdate(
+    {
+      _id: orderId,
+      refunds: { $elemMatch: { _id: refundId, status: "owed", $or: notInFlight } },
+    },
+    {
+      $set: {
+        "refunds.$.gatewayAttemptedAt": new Date(),
+        "refunds.$.status": "created",
+      },
+    },
+    options,
+  );
+  if (claimedOwed) return true;
+
   const claimed = await OrderModel.findOneAndUpdate(
     {
       _id: orderId,
@@ -357,16 +392,12 @@ export const claimGatewayAttempt = async ({
         $elemMatch: {
           _id: refundId,
           status: { $ne: "processed" },
-          $or: [
-            { gatewayAttemptedAt: null },
-            { gatewayAttemptedAt: { $exists: false } },
-            { gatewayAttemptedAt: { $lte: cutoff } },
-          ],
+          $or: notInFlight,
         },
       },
     },
     { $set: { "refunds.$.gatewayAttemptedAt": new Date() } },
-    { ...(session ? { session } : {}), returnDocument: "after" },
+    options,
   );
   return Boolean(claimed);
 };
@@ -552,7 +583,36 @@ export const settleGatewayRefund = async ({
  *
  * Idempotent: keyed on `dedupeKey`, so a replayed webhook or a double-clicked
  * button records one liability, not two. Respects the cumulative ceiling.
+ *
+ * ── ATOMIC, LIKE claimRefundSlot ─────────────────────────────────────────────
+ * This used to be read-then-save: look for a row with this reason, compute the
+ * headroom from the in-memory document, push, save. Mongoose does not
+ * version-guard a subdocument-array `$push`, so two deliveries of the same
+ * courier event arriving together (Shiprocket retries, and a manual move to
+ * "RTO Received" can now race the webhook) both passed the read and both saved —
+ * two liabilities for one parcel, and a ceiling that only held for whichever
+ * write landed last.
+ *
+ * Every precondition now lives in the FILTER of one conditional `$push`:
+ *
+ *   1. MONEY COLLECTED — the order is still in a captured payment state.
+ *   2. DEDUPE          — no non-failed row already carries this reason. The
+ *                        legacy reason-as-key is kept rather than moved to
+ *                        `idempotencyKey`: owed rows deliberately have NO key
+ *                        until a gateway attempt is about to be made (see
+ *                        ReconcileOrderRefund), and existing rows are found by
+ *                        their reason.
+ *   3. CEILING         — committed + this amount stays within `totalAmount`.
+ *
+ * The amount is computed from a read and then asserted by the filter, so a lost
+ * race re-reads and re-decides rather than writing a stale figure. Bounded,
+ * because a loop that cannot make progress must not spin.
+ *
+ * The caller's `order` document is read but no longer mutated or saved: writing
+ * back a whole stale document is exactly what made the old version racy.
  */
+const OBLIGATION_CLAIM_ATTEMPTS = 3;
+
 export const recordRefundObligation = async ({
   order,
   amount,
@@ -572,36 +632,144 @@ export const recordRefundObligation = async ({
   // RTO is precisely the case where that is easy to get wrong, because the parcel
   // coming back *looks* like a return. Keeping the rule at the level of the
   // invariant means a future caller cannot reintroduce the mistake by forgetting
-  // to check.
+  // to check. Repeated in the write filter below, so a concurrent change of
+  // payment state cannot slip past it either.
   const moneyCollected = MONEY_COLLECTED_PAYMENT_STATUSES.includes(order?.paymentStatus);
   if (!moneyCollected) {
     return { refund: null, created: false, noMoneyCollected: true };
   }
 
-  const existing = (order.refunds || []).find(
+  const options = session ? { session } : {};
+  let current = order;
+
+  for (let attempt = 0; attempt < OBLIGATION_CLAIM_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) {
+      current = await OrderModel.findById(order._id).session(session || null);
+      if (!current) return { refund: null, created: false };
+      if (!MONEY_COLLECTED_PAYMENT_STATUSES.includes(current.paymentStatus)) {
+        return { refund: null, created: false, noMoneyCollected: true };
+      }
+    }
+
+    const existing = (current.refunds || []).find(
+      (refund) => refund.reason === dedupeKey && refund.status !== "failed",
+    );
+    if (existing) return { refund: existing, created: false };
+
+    const alreadyCommitted = sumRefunded(current);
+    const headroom = Math.round((Number(current.totalAmount) - alreadyCommitted) * 100) / 100;
+    if (headroom <= 0) return { refund: null, created: false, noHeadroom: true };
+
+    const value = Math.min(owedAmount, headroom);
+    // Generated here so the row can be found in the returned document by id
+    // rather than by position — a concurrent push may land after it.
+    const refundId = new mongoose.Types.ObjectId();
+
+    const claimed = await OrderModel.findOneAndUpdate(
+      {
+        _id: current._id,
+        paymentStatus: { $in: MONEY_COLLECTED_PAYMENT_STATUSES },
+        refunds: { $not: { $elemMatch: { reason: dedupeKey, status: { $ne: "failed" } } } },
+        $expr: {
+          $lte: [
+            { $add: [COMMITTED_REFUND_SUM, value] },
+            { $add: [{ $ifNull: ["$totalAmount", 0] }, 0.01] },
+          ],
+        },
+      },
+      {
+        $push: {
+          refunds: {
+            _id: refundId,
+            paymentProvider: confirmationMethod === "manual" ? "manual" : "razorpay",
+            providerPaymentId: current.razorpayPaymentId || "",
+            returnRequest,
+            amount: value,
+            // The dedupe key IS the reason string, so the idempotency guard is visible
+            // in the ledger rather than hidden in a side field.
+            reason: dedupeKey,
+            status: "owed",
+            confirmationMethod,
+            createdBy,
+          },
+        },
+      },
+      { ...options, returnDocument: "after" },
+    );
+
+    if (claimed) {
+      // paymentStatus follows the ledger. Recomputed on the document the write
+      // returned, which already contains every row — including any a concurrent
+      // writer added — so the derived status cannot lag the ledger.
+      await recomputeRefundState(claimed, { session });
+      return { refund: claimed.refunds.id(refundId), created: true, note: reason };
+    }
+    // Lost: a duplicate landed, the headroom shrank, or the payment state moved.
+    // Re-read and decide again.
+  }
+
+  // Still contended after every attempt. Say so rather than guess: the caller
+  // records nothing, and a retried event will find the settled state.
+  const settled = await OrderModel.findById(order._id).session(session || null);
+  const existing = (settled?.refunds || []).find(
     (refund) => refund.reason === dedupeKey && refund.status !== "failed",
   );
   if (existing) return { refund: existing, created: false };
+  return { refund: null, created: false, contended: true };
+};
 
-  const alreadyCommitted = sumRefunded(order);
-  const headroom = Math.round((Number(order.totalAmount) - alreadyCommitted) * 100) / 100;
-  if (headroom <= 0) return { refund: null, created: false, noHeadroom: true };
+/**
+ * Records what a returned-to-origin parcel means for the customer's money.
+ *
+ * The whole point of branching here explicitly: an RTO is NOT a customer return.
+ * The customer did not ask for anything and, on COD, never paid — so issuing them
+ * a refund would be handing money to someone who owes it. On a prepaid order the
+ * opposite is true: they paid for goods they never received, so a refund is owed
+ * the moment the parcel is confirmed back with us.
+ *
+ * Recorded as `owed`, not pushed to the gateway, because this runs unattended from
+ * a courier feed. What it guarantees is that the liability is never invisible.
+ *
+ * Lives here, beside recordRefundObligation, rather than in the shipping
+ * controller: there are now two ways an order reaches "RTO Received" — the courier
+ * webhook and an admin's manual status move — and the second used to record no
+ * obligation at all, so a prepaid customer whose parcel an operator marked as back
+ * was owed money the ledger never mentioned. One definition, every caller.
+ *
+ * The `RTO <orderId>` dedupe key is unchanged and load-bearing: it is what makes a
+ * replayed courier event (or a webhook racing a manual move) idempotent, and the
+ * owed-refunds list recognises an RTO obligation by it.
+ */
+export const recordRtoRefundObligation = async (order) => {
+  // COD: nothing was collected, so nothing is owed. Explicit and final.
+  //
+  // Reads the shared set rather than restating it. The hand-written version kept
+  // {Paid, Partially Refunded}, two states short of the invariant
+  // recordRefundObligation enforces — so a prepaid order whose earlier partial
+  // refund had not settled yet, which leaves it at "Refund Pending", was told "no
+  // payment was ever collected" and its RTO liability was never recorded. The
+  // customer had paid in full, received nothing, and only the earlier partial
+  // amount was owed back.
+  const moneyCollected = MONEY_COLLECTED_PAYMENT_STATUSES.includes(order.paymentStatus);
+  if (!moneyCollected) return { owed: 0, reason: "no payment was ever collected" };
 
-  order.refunds.push({
-    paymentProvider: confirmationMethod === "manual" ? "manual" : "razorpay",
-    providerPaymentId: order.razorpayPaymentId || "",
-    returnRequest,
-    amount: Math.min(owedAmount, headroom),
-    // The dedupe key IS the reason string, so the idempotency guard is visible in
-    // the ledger rather than hidden in a side field.
-    reason: dedupeKey,
-    status: "owed",
-    confirmationMethod,
-    createdBy,
+  const outstanding =
+    Math.round((Number(order.totalAmount) - sumRefunded(order)) * 100) / 100;
+  if (outstanding <= 0) return { owed: 0, reason: "already fully refunded" };
+
+  const fresh = await OrderModel.findById(order._id);
+  if (!fresh) return { owed: 0, reason: "order no longer exists" };
+
+  const { refund, created } = await recordRefundObligation({
+    order: fresh,
+    amount: outstanding,
+    reason: "Parcel returned to origin undelivered",
+    // Stable key = idempotency. A retried courier event finds this row and stops.
+    dedupeKey: `RTO ${fresh._id}`,
+    confirmationMethod: "gateway",
   });
-  await recomputeRefundState(order, { session });
 
-  return { refund: order.refunds.at(-1), created: true, note: reason };
+  return { owed: created ? refund?.amount || 0 : 0, alreadyRecorded: !created };
 };
 
 /**

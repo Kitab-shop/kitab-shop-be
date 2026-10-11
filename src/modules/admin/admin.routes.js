@@ -34,8 +34,20 @@ import {
   BookReplacementShipment,
   BookReturnPickup,
   DispatchReplacement,
+  ReleaseReplacementBookingClaim,
+  RecordReturnPickupAwb,
+  RecordReplacementAwb,
+  SyncReturnPickupAwb,
+  SyncReplacementAwb,
+  ReleaseReturnPickupClaim,
 } from "../returns/return.controller.js";
 import { AdminGetOwedRefunds, AdminSettleOwedRefundManually } from "../payments/owed-refund.controller.js";
+import {
+  GetShippingReconciliationStatus,
+  RunShippingReconciliation,
+} from "../shipping/shipping-ops.controller.js";
+import { shippingReconcileRateLimit } from "../../middleware/rate-limit.middleware.js";
+import { GetShippingExceptions } from "../shipping/shipping-exceptions.controller.js";
 import { GetHomepageReviewOptions, UpdateHomepageSettings } from "../homepage/homepage.controller.js";
 import {
   AdminCreateCmsBlock,
@@ -69,6 +81,14 @@ router.patch("/returns/:id/status", isAdmin, requirePermission(ADMIN_PERMISSIONS
 // stock movement, so each is independently retryable.
 router.post("/returns/:id/pickup/book", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), BookReturnPickup);
 router.post("/returns/:id/replacement/book", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), BookReplacementShipment);
+// Clears a booking claim kept after a timeout/5xx, once an operator has checked Shiprocket.
+router.post("/returns/:id/pickup/release-claim", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), ReleaseReturnPickupClaim);
+router.post("/returns/:id/replacement/release-claim", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), ReleaseReplacementBookingClaim);
+// Return-leg AWBs: record by hand, or fetch from Shiprocket now.
+router.patch("/returns/:id/pickup/awb", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), RecordReturnPickupAwb);
+router.patch("/returns/:id/replacement/awb", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), RecordReplacementAwb);
+router.post("/returns/:id/pickup/sync-awb", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), SyncReturnPickupAwb);
+router.post("/returns/:id/replacement/sync-awb", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), SyncReplacementAwb);
 router.post("/returns/:id/replacement/dispatch", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), DispatchReplacement);
 router.post("/returns/:id/replacement/delivered", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), ConfirmReplacementDelivery);
 router.get("/all-users", isAdmin, requirePermission(ADMIN_PERMISSIONS.USERS_MANAGE), GetAllUsers);
@@ -87,6 +107,17 @@ router.get("/products/export", isAdmin, requirePermission(ADMIN_PERMISSIONS.PROD
 router.get("/reports/sales", isAdmin, requirePermission(ADMIN_PERMISSIONS.REPORTS_READ), GetSalesReport);
 // Read-only. Same permission as other financial reporting; nothing here mutates an order.
 router.get("/reports/cod-reconciliation", isAdmin, requirePermission(ADMIN_PERMISSIONS.REPORTS_READ), GetCodReconciliation);
+// Everything in fulfilment waiting on a person, derived from the workflows' own state.
+router.get("/shipping/exceptions", isAdmin, requirePermission(ADMIN_PERMISSIONS.ORDERS_MANAGE), GetShippingExceptions);
+// Courier reconciliation: status of the last pass, and a rate-limited "run now".
+router.get("/shipping/reconciliation", isAdmin, requirePermission(ADMIN_PERMISSIONS.ORDERS_MANAGE), GetShippingReconciliationStatus);
+router.post(
+  "/shipping/reconciliation/run",
+  shippingReconcileRateLimit,
+  isAdmin,
+  requirePermission(ADMIN_PERMISSIONS.ORDERS_MANAGE),
+  RunShippingReconciliation,
+);
 router.put("/homepage/settings", isAdmin, requirePermission(ADMIN_PERMISSIONS.CMS_MANAGE), UpdateHomepageSettings);
 router.get("/homepage/reviews", isAdmin, requirePermission(ADMIN_PERMISSIONS.CMS_MANAGE), GetHomepageReviewOptions);
 router.get("/cms/blocks", isAdmin, requirePermission(ADMIN_PERMISSIONS.CMS_MANAGE), AdminGetCmsBlocks);

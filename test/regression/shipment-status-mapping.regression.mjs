@@ -91,8 +91,15 @@ section("4 — the forward journey is unchanged");
 
 ok("7 is Delivered", mapOrderStatus(7, "") === "Delivered");
 ok("17 is Out For Delivery", mapOrderStatus(17, "") === "Out For Delivery");
-for (const code of [6, 18, 19, 27, 38, 42]) {
+for (const code of [6, 18, 38, 42]) {
   ok(`${code} is Shipped`, mapOrderStatus(code, "") === "Shipped", String(mapOrderStatus(code, "")));
+}
+// 19 (Out For Pickup) and 27 (Pickup Booked) describe a parcel still at the seller's
+// door. Mapping them to Shipped locked admin cancellation before any pickup happened,
+// so they deliberately change no status — even when their text looks like movement.
+for (const code of [19, 27]) {
+  ok(`${code} is a pickup-stage code and changes no status`, mapOrderStatus(code, "") === null);
+  ok(`${code} stays statusless whatever its text says`, mapOrderStatus(code, "Shipped - RTO hub") === null);
 }
 ok('"Ready To Ship" text is Packed', mapOrderStatus(null, "Ready To Ship") === "Packed");
 

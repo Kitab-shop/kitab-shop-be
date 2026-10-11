@@ -208,6 +208,24 @@ const returnSchema = new mongoose.Schema(
     replacementCourierStatus: { type: String, trim: true, default: "" },
     replacementCourierUpdatedAt: { type: Date, default: null },
 
+    // ── BOOKING CLAIMS (one per leg) ─────────────────────────────────────────
+    // Taken atomically BEFORE Shiprocket is asked to book a leg, and cleared in the same
+    // write that stores the shipment ids. Without it a double click, or two admins on the
+    // same return, both passed the "nothing booked yet" read and both booked a courier —
+    // and the booking's own idempotency check keyed on the AWB, which booking never sets,
+    // so even a second click AFTER success booked again.
+    //
+    // A claim is released automatically only when Shiprocket definitely refused (a 4xx, or
+    // a failure before any request left). A timeout or 5xx keeps it: the booking may well
+    // exist on Shiprocket's side, and retrying blind is how a customer gets two couriers.
+    // An operator checks Shiprocket and releases it by hand (release-claim endpoints).
+    pickupBookingClaimedAt: { type: Date, default: null },
+    replacementBookingClaimedAt: { type: Date, default: null },
+    // The last booking failure on each leg, so the admin page can say WHY a claim is held
+    // rather than showing a button that silently refuses.
+    pickupBookingError: { type: String, trim: true, default: "" },
+    replacementBookingError: { type: String, trim: true, default: "" },
+
     pickupScheduledAt: {
       type: Date,
       default: null,
@@ -321,6 +339,10 @@ const returnSchema = new mongoose.Schema(
  * QUANTITY_CONSUMING_RETURN_STATUSES; that check is safe as a read-then-sum
  * precisely because this index serialises creations.
  */
+// The return-AWB sync scans for legs booked through Shiprocket that have no AWB yet.
+// Built in production by scripts/migrate-shipping-reliability-indexes.js.
+returnSchema.index({ pickupShipmentId: 1 }, { name: "return_pickupShipmentId" });
+
 returnSchema.index(
   { order: 1, product: 1, user: 1 },
   {

@@ -15,9 +15,12 @@ import {
   UpdateOrderStatus,
 } from "./order.controller.js";
 import {
+  AcknowledgeAmountMismatch,
   AssignAwb,
   CheckServiceability,
+  ConfirmShipmentNotCreated,
   CreateShipment,
+  LinkShipment,
   GenerateInvoice,
   GenerateLabel,
   GenerateManifest,
@@ -29,9 +32,15 @@ import {
   TrackShipment,
 } from "../shipping/shipping.controller.js";
 import { RecordManualShipment } from "../shipping/manual-shipment.controller.js";
+import { linkShipmentSchema, shipmentOrderParamSchema } from "../shipping/shipping.schema.js";
 import { SendCodOtp, VerifyCodOtp } from "./cod-verification.controller.js";
 import { TokenVerify } from "../../middleware/auth.middleware.js";
-import { adminOrderActionRateLimit, orderActionRateLimit, refundRateLimit } from "../../middleware/rate-limit.middleware.js";
+import {
+  adminOrderActionRateLimit,
+  orderActionRateLimit,
+  refundRateLimit,
+  serviceabilityRateLimit,
+} from "../../middleware/rate-limit.middleware.js";
 import { requirePermission } from "../../middleware/require-permission.middleware.js";
 import { validate } from "../../middleware/validate.middleware.js";
 import {
@@ -59,7 +68,7 @@ routes.post("/pricing-preview", TokenVerify, validate(orderPricingPreviewSchema)
 routes.post("/create", TokenVerify, validate(placeOrderSchema), PlaceOrder);
 routes.post("/place-order", TokenVerify, validate(placeOrderSchema), PlaceOrder);
 routes.post("/shipping/webhook", ShippingWebhook);
-routes.get("/shipping/serviceability", TokenVerify, CheckServiceability);
+routes.get("/shipping/serviceability", serviceabilityRateLimit, TokenVerify, CheckServiceability);
 routes.post("/cod/send-otp", TokenVerify, SendCodOtp);
 routes.post("/cod/verify-otp", TokenVerify, VerifyCodOtp);
 routes.get("/my-orders", TokenVerify, GetMyOrders);
@@ -67,6 +76,31 @@ routes.get("/all", TokenVerify, canManageOrders, GetAllOrders);
 routes.post("/:orderId/shipment", TokenVerify, canManageOrders, CreateShipment);
 routes.get("/:orderId/shipment/couriers", TokenVerify, canManageOrders, GetCourierOptions);
 routes.post("/:orderId/shipment/awb", TokenVerify, canManageOrders, AssignAwb);
+// Resolving a shipment creation whose outcome is unknown (the request reached Shiprocket
+// and the answer was lost). Never retried automatically — a person decides, on the
+// record, whether the shipment exists (link it) or not (confirm, which allows a retry).
+routes.post(
+  "/:orderId/shipment/link",
+  TokenVerify,
+  canManageOrders,
+  validate(linkShipmentSchema),
+  LinkShipment,
+);
+routes.post(
+  "/:orderId/shipment/confirm-not-created",
+  TokenVerify,
+  canManageOrders,
+  validate(shipmentOrderParamSchema),
+  ConfirmShipmentNotCreated,
+);
+// Releases the COD amount-mismatch hold on AWB assignment. Audited.
+routes.post(
+  "/:orderId/shipment/amount-ack",
+  TokenVerify,
+  canManageOrders,
+  validate(shipmentOrderParamSchema),
+  AcknowledgeAmountMismatch,
+);
 // PUT, not POST: recording a hand-shipped parcel is create-or-correct, and sending
 // the same carrier and number twice must be a no-op rather than a second shipment.
 // Same permission as every other shipment action — orders:manage.

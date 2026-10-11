@@ -7,6 +7,9 @@ const TOKEN_LIFETIME_MS = 9 * 24 * 60 * 60 * 1000;
 let cachedToken = null;
 let tokenExpiresAt = 0;
 let pendingLogin = null;
+// Bumped by resetShiprocketToken(). A login that started under the previous credentials
+// may still finish afterwards; it must not repopulate the cache with that account's token.
+let tokenGeneration = 0;
 
 // Pickup locations are account configuration that changes rarely, but System Health reads
 // them on every load to verify the configured name — so without this, opening the admin
@@ -20,14 +23,73 @@ let cachedPickupLocations = null;
 let pickupCachedAt = 0;
 
 
+/**
+ * `statusCode` is the HTTP status WE answer with, and its meaning is unchanged.
+ *
+ * `phase` and `httpStatus` were added for a different question, one only a caller that
+ * CREATES something at Shiprocket has to ask: "might this request have taken effect?"
+ * A forward shipment that failed before the request left this process can be retried
+ * freely; one whose request reached Shiprocket and then went quiet might exist there,
+ * and retrying it books a second courier for the same parcel. `statusCode` cannot answer
+ * that — a 503 means both "our credentials are missing" and "Shiprocket timed out".
+ *
+ *   - "pre_request": nothing was sent for THIS call (validation, credentials, login).
+ *   - "transport":   sent, or possibly sent, and no response came back (timeout, reset).
+ *   - "response":    Shiprocket answered; `httpStatus` is what it answered with.
+ *   - null:          not classified. Treated as "might have taken effect" by every
+ *                    caller that cares, because guessing "safe to retry" is the
+ *                    direction that duplicates parcels.
+ */
 export class ShiprocketError extends Error {
-  constructor(message, statusCode = 502, details = null) {
+  constructor(message, statusCode = 502, details = null, { phase = null, httpStatus = null, providerStatus = null } = {}) {
     super(message);
     this.name = "ShiprocketError";
     this.statusCode = statusCode;
     this.details = details;
+    this.phase = phase;
+    this.httpStatus = httpStatus;
+    // The status Shiprocket embedded in a 200 body ({ status: 400, message }), when that
+    // is how it chose to reject the request.
+    this.providerStatus = providerStatus;
   }
 }
+
+/**
+ * Tags an error raised before a request was sent. Only fills a phase that is still
+ * unknown, so an error that already knows it came from a response keeps saying so.
+ * A non-Shiprocket error (a TypeError while building a payload, say) is wrapped rather
+ * than passed through untagged, so the "nothing was sent" fact is not lost on the way up.
+ */
+const asPreRequest = (error) => {
+  if (error instanceof ShiprocketError) {
+    if (!error.phase) error.phase = "pre_request";
+    return error;
+  }
+  return new ShiprocketError(error?.message || "Shiprocket request could not be prepared", 500, null, {
+    phase: "pre_request",
+  });
+};
+
+/**
+ * Did Shiprocket DEFINITELY not create anything?
+ *
+ * True only when the request never left (pre_request), or Shiprocket answered with a
+ * clear refusal: an HTTP 4xx, or a 200 whose body carries a 4xx status. 408 and 429 are
+ * excluded — a request timeout and a rate limit say nothing about whether an earlier
+ * attempt landed, and a 5xx is the textbook "maybe". A transport failure is the hardest
+ * maybe of all: the request may have been processed and only the answer lost.
+ *
+ * Everything else is ambiguous, and ambiguous must be treated as "might exist".
+ */
+export const isDefiniteShiprocketRejection = (error) => {
+  if (!(error instanceof ShiprocketError)) return false;
+  if (error.phase === "pre_request") return true;
+  if (error.phase !== "response") return false;
+  const http = Number(error.httpStatus);
+  if (http >= 400 && http < 500) return http !== 408 && http !== 429;
+  const provider = Number(error.providerStatus);
+  return http >= 200 && http < 300 && provider >= 400 && provider < 500 && provider !== 408 && provider !== 429;
+};
 
 // Admin-panel settings win when set; falling back to .env lets an existing
 // deployment keep working before anyone touches the new admin panel.
@@ -136,6 +198,7 @@ const getErrorMessage = (data, fallback) => {
 };
 
 const login = async () => {
+  const generation = tokenGeneration;
   const { email, password, baseUrl } = await getConfig();
   const response = await fetch(`${baseUrl}/auth/login`, {
     method: "POST",
@@ -153,9 +216,11 @@ const login = async () => {
     );
   }
 
-  cachedToken = data.token;
-  tokenExpiresAt = Date.now() + TOKEN_LIFETIME_MS;
-  return cachedToken;
+  if (generation === tokenGeneration) {
+    cachedToken = data.token;
+    tokenExpiresAt = Date.now() + TOKEN_LIFETIME_MS;
+  }
+  return data.token;
 };
 
 const getToken = async (forceRefresh = false) => {
@@ -164,23 +229,36 @@ const getToken = async (forceRefresh = false) => {
   }
 
   if (!pendingLogin) {
-    pendingLogin = login().finally(() => {
-      pendingLogin = null;
+    // Cleared only if it is still THIS attempt: after resetShiprocketToken() a newer
+    // login may own the slot, and an older one finishing must not clear it.
+    const attempt = login().finally(() => {
+      if (pendingLogin === attempt) pendingLogin = null;
     });
+    pendingLogin = attempt;
   }
   return pendingLogin;
 };
 
 const request = async (path, { method = "GET", body, query } = {}, retry = true) => {
-  const { baseUrl } = await getConfig();
-  const url = new URL(`${baseUrl}${path}`);
-  for (const [key, value] of Object.entries(query || {})) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
+  // Configuration and login both happen before THIS request is sent, so a failure in
+  // either — missing credentials, a rejected password, even an unreachable auth
+  // endpoint — means the call itself never reached Shiprocket. Tagged so a create
+  // caller can tell that apart from a request that may have landed.
+  let url;
+  let token;
+  try {
+    const { baseUrl } = await getConfig();
+    url = new URL(`${baseUrl}${path}`);
+    for (const [key, value] of Object.entries(query || {})) {
+      if (value !== undefined && value !== null && value !== "") {
+        url.searchParams.set(key, String(value));
+      }
     }
+    token = await getToken();
+  } catch (error) {
+    throw asPreRequest(error);
   }
 
-  const token = await getToken();
   let response;
   try {
     response = await fetch(url, {
@@ -193,22 +271,39 @@ const request = async (path, { method = "GET", body, query } = {}, retry = true)
       signal: AbortSignal.timeout(20000),
     });
   } catch (error) {
-    throw new ShiprocketError(`Shiprocket is unreachable: ${error.message}`, 503);
+    throw new ShiprocketError(`Shiprocket is unreachable: ${error.message}`, 503, null, {
+      phase: "transport",
+    });
   }
 
   if (response.status === 401 && retry) {
     cachedToken = null;
     tokenExpiresAt = 0;
-    await getToken(true);
+    // A 401 means the first attempt was refused outright, so a failed re-login still
+    // leaves nothing created.
+    await getToken(true).catch((error) => {
+      throw asPreRequest(error);
+    });
     return request(path, { method, body, query }, false);
   }
 
-  const data = await readResponse(response);
+  let data;
+  try {
+    data = await readResponse(response);
+  } catch (error) {
+    // The body stream failed mid-read: Shiprocket answered, so whatever was asked may
+    // well have happened.
+    throw new ShiprocketError(`Shiprocket response could not be read: ${error.message}`, 502, null, {
+      phase: "response",
+      httpStatus: response.status,
+    });
+  }
   if (!response.ok) {
     throw new ShiprocketError(
       getErrorMessage(data, `Shiprocket request failed with status ${response.status}`),
       response.status === 429 ? 503 : 502,
       data,
+      { phase: "response", httpStatus: response.status },
     );
   }
 
@@ -227,6 +322,7 @@ const request = async (path, { method = "GET", body, query } = {}, retry = true)
       getErrorMessage(data, "Shiprocket rejected the request"),
       logicalErrorCode >= 400 && logicalErrorCode < 500 ? 400 : 502,
       data,
+      { phase: "response", httpStatus: response.status, providerStatus: logicalErrorCode },
     );
   }
 
@@ -281,6 +377,187 @@ export const volumetricWeightKg = ({ length, breadth, height } = {}, divisor = V
 export const appliedWeightKg = (packageDetails = {}, divisor = VOLUMETRIC_DIVISOR) =>
   Math.max(Number(packageDetails.weight) || 0, volumetricWeightKg(packageDetails, divisor));
 
+/** Units of a line still to ship: ordered minus cancelled, never negative. */
+const remainingUnits = (item) =>
+  Math.max(0, (Number(item?.quantity) || 0) - (Number(item?.cancelledQuantity) || 0));
+
+/** Money in integer paise, so every split below is exact rather than float-approximate. */
+const toPaise = (value) => Math.round((Number(value) || 0) * 100);
+const fromPaise = (paise) => paise / 100;
+
+/**
+ * What the forward shipment actually carries, and what it is worth.
+ *
+ * One function for the three places that must agree on it: the Shiprocket payload, the
+ * parcel measurement (computeOrderPackage uses the same remaining-units rule) and the
+ * COD amount check after creation. The payload used to be assembled inline, and it
+ * disagreed with the order in two ways that cost money:
+ *
+ *   1. It shipped `quantity`, ignoring `cancelledQuantity` — so a COD order created
+ *      after a partial cancellation asked the courier to collect for goods that were
+ *      no longer in the box.
+ *   2. It sent `total_discount: order.discount` alongside a `sub_total` that was ALREADY
+ *      net of that discount. Whether Shiprocket subtracts total_discount from sub_total
+ *      again is not documented, and the two readings differ by exactly the discount on
+ *      every discounted COD order.
+ *
+ * The fix removes the ambiguity rather than guessing: the order-level discount (coupon +
+ * wallet, both already inside `order.discount`) is spread onto the item lines, and
+ * `total_discount` is always 0. Then the lines, `sub_total` and the amount we expect
+ * collected all say the same number however Shiprocket combines them.
+ *
+ * ── The money ────────────────────────────────────────────────────────────────
+ *   netTotal  = totalAmount − Σ cancellations[].refundAmount
+ *   subTotal  = netTotal − shippingCharge            (goods still shipping, net of discount)
+ *   COD collectable = netTotal                        (what the courier must collect)
+ *
+ * `cancellations[].refundAmount` is what each partial cancellation valued the removed
+ * units at (proportionalRefundAmount — net of discount, shipping excluded), and
+ * totalAmount is never lowered by a partial cancel, so subtracting it is what leaves
+ * exactly the remaining goods. It is subtracted for COD even though no refund is paid
+ * on an unpaid COD order: the cancellation still removed those goods from the bill.
+ *
+ * ── `discount` is a PER-UNIT figure ─────────────────────────────────────────
+ * Shiprocket's `selling_price` is per unit and `units` multiplies it; reading `discount`
+ * on the same basis is the consistent interpretation, and it is the one that agrees
+ * with Shiprocket's own order form. It is NOT verified against their API, which is
+ * precisely why the COD amount check reads the order back after creation — a wrong
+ * reading here shows up as a `mismatch` and blocks the AWB, rather than as a courier
+ * collecting the wrong cash. Each line's total is therefore
+ *
+ *   units × (selling_price − discount)
+ *
+ * and those totals sum to `sub_total` EXACTLY, to the paise. Per-unit is the harder
+ * contract to keep exact: a line's discount must divide by its units. Leftover paise are
+ * moved onto lines that can absorb them (units = 1 absorbs anything), and if none can,
+ * one unit of the largest line is split onto its own line (same name and SKU) to carry
+ * them. Splitting is rare — it needs every line to have 2+ units and an odd-paise
+ * discount — and it is the only way to be exact without misstating a price.
+ *
+ * Pure. Throws a 409 ShiprocketError when the order cannot be represented honestly
+ * (nothing left to ship, or a total that exceeds the goods) — sending a wrong amount
+ * to a courier who will collect it is worse than refusing.
+ *
+ * @returns {{orderItems: object[], subTotal: number, totalDiscount: 0, shippingCharges: number, codCollectable: number, declaredTotal: number, grossTotal: number}}
+ */
+export const computeShipmentLines = (order = {}) => {
+  const lines = (order.items || [])
+    .map((item) => ({
+      item,
+      units: remainingUnits(item),
+      unitPrice: toPaise(item?.price),
+    }))
+    .filter((line) => line.units > 0);
+
+  if (lines.length === 0) {
+    throw new ShiprocketError("Nothing is left to ship on this order — every unit has been cancelled", 409);
+  }
+  if (lines.some((line) => line.unitPrice < 0)) {
+    throw new ShiprocketError("An item on this order has a negative price, so it cannot be shipped", 409);
+  }
+
+  const shipping = toPaise(order.shippingCharge);
+  const cancelledValue = (order.cancellations || []).reduce(
+    (sum, entry) => sum + Math.max(0, toPaise(entry?.refundAmount)),
+    0,
+  );
+  const netTotal = toPaise(order.totalAmount) - cancelledValue;
+  const subTotal = netTotal - shipping;
+  const gross = lines.reduce((sum, line) => sum + line.unitPrice * line.units, 0);
+  const discount = gross - subTotal;
+
+  if (subTotal < 0) {
+    throw new ShiprocketError(
+      `This order's remaining value (₹${fromPaise(netTotal)}) is less than its shipping charge (₹${fromPaise(shipping)}), so the shipment amount cannot be stated. Check the order's cancellations before shipping.`,
+      409,
+    );
+  }
+  if (discount < 0) {
+    // The goods would have to be declared ABOVE their listed prices to reach the total.
+    // Only possible with a charge this function does not know about (tax, today always
+    // 0); refusing is safer than inventing a line for it.
+    throw new ShiprocketError(
+      `This order's remaining value (₹${fromPaise(subTotal)} of goods) exceeds the listed price of the items still shipping (₹${fromPaise(gross)}), so it cannot be expressed as item lines.`,
+      409,
+    );
+  }
+
+  // 1. Spread the discount across lines by value, flooring each share; the rounding
+  //    remainder goes to the largest line, which can carry it with the least distortion.
+  let allocated = 0;
+  let largest = 0;
+  lines.forEach((line, index) => {
+    const value = line.unitPrice * line.units;
+    line.lineDiscount = gross > 0 ? Math.floor((discount * value) / gross) : 0;
+    allocated += line.lineDiscount;
+    if (value > lines[largest].unitPrice * lines[largest].units) largest = index;
+  });
+  lines[largest].lineDiscount += discount - allocated;
+
+  // 2. Convert to per-unit discounts. What does not divide evenly is gathered…
+  let leftover = 0;
+  for (const line of lines) {
+    line.unitDiscount = Math.floor(line.lineDiscount / line.units);
+    leftover += line.lineDiscount - line.unitDiscount * line.units;
+  }
+  // …and handed to lines that can take it whole, fewest units first (a single-unit line
+  // takes any amount), never pushing a unit's discount past its price.
+  for (const line of [...lines].sort((a, b) => a.units - b.units)) {
+    if (leftover <= 0) break;
+    const steps = Math.min(Math.floor(leftover / line.units), line.unitPrice - line.unitDiscount);
+    if (steps > 0) {
+      line.unitDiscount += steps;
+      leftover -= steps * line.units;
+    }
+  }
+  // 3. Still some paise over: split one unit of the largest multi-unit line onto its own
+  //    line, which can then carry them.
+  if (leftover > 0) {
+    const donor = lines
+      .filter((line) => line.units > 1 && line.unitPrice - line.unitDiscount >= leftover)
+      .sort((a, b) => b.unitPrice * b.units - a.unitPrice * a.units)[0];
+    if (!donor) {
+      throw new ShiprocketError(
+        "The order discount cannot be spread across its items exactly, so the shipment amount cannot be stated.",
+        409,
+      );
+    }
+    donor.units -= 1;
+    lines.splice(lines.indexOf(donor) + 1, 0, {
+      item: donor.item,
+      units: 1,
+      unitPrice: donor.unitPrice,
+      unitDiscount: donor.unitDiscount + leftover,
+    });
+    leftover = 0;
+  }
+
+  const orderItems = lines.map((line) => ({
+    name: line.item.name,
+    sku: String(line.item.product?._id || line.item.product),
+    units: line.units,
+    selling_price: fromPaise(line.unitPrice),
+    discount: fromPaise(line.unitDiscount),
+    tax: 0,
+    hsn: "",
+  }));
+
+  const cod = order.paymentMethod === "COD";
+  return {
+    orderItems,
+    subTotal: fromPaise(subTotal),
+    totalDiscount: 0,
+    shippingCharges: fromPaise(shipping),
+    // Nothing is collected at the door on a prepaid order.
+    codCollectable: cod ? fromPaise(netTotal) : 0,
+    // What Shiprocket should hold as the order's value, COD or not: the goods plus
+    // freight. Equal to codCollectable for COD; recorded for prepaid too, so a payload
+    // misreading is visible on every order rather than only the cash ones.
+    declaredTotal: fromPaise(netTotal),
+    grossTotal: fromPaise(gross),
+  };
+};
+
 // Auto-computed from the products actually in the order (weight/length/
 // breadth/height set on Product.model.js).
 //
@@ -318,7 +595,11 @@ export const computeOrderPackage = (order, defaults = {}) => {
 
   for (const item of order.items || []) {
     const product = item.product;
-    const quantity = Number(item.quantity) || 0;
+    // REMAINING units, not ordered units: a partially cancelled line no longer ships
+    // its cancelled units, and declaring them would over-state the parcel. The same
+    // arithmetic as computeShipmentLines(), so the box and the invoice describe the
+    // same goods.
+    const quantity = remainingUnits(item);
     if (quantity <= 0) continue;
     units += quantity;
     if (!(Number(product?.weight) > 0)) unmeasuredUnits += quantity;
@@ -360,7 +641,12 @@ const readShipmentIds = (data, fallbackMessage) => {
     !Number.isFinite(shipmentId) ||
     shipmentId <= 0
   ) {
-    throw new ShiprocketError(getErrorMessage(data, fallbackMessage), 502, data);
+    // Phase "response": Shiprocket answered 200, and a 200 without ids is exactly the
+    // reply that may still have created an order we cannot see.
+    throw new ShiprocketError(getErrorMessage(data, fallbackMessage), 502, data, {
+      phase: "response",
+      httpStatus: 200,
+    });
   }
   return { data, shiprocketOrderId, shipmentId };
 };
@@ -397,6 +683,33 @@ export const splitAddressLines = (address = {}) => {
 };
 
 export const createShiprocketOrder = async (order, packageOverrides = {}) => {
+  // Everything up to the request is preparation: a failure here means nothing was sent,
+  // and the caller may safely mark the attempt failed and let it be retried. Tagged as
+  // such so it is never confused with a request that may have reached Shiprocket.
+  let payload;
+  let packageDetails;
+  let lines;
+  try {
+    ({ payload, packageDetails, lines } = await buildForwardPayload(order, packageOverrides));
+  } catch (error) {
+    throw asPreRequest(error);
+  }
+
+  const data = await request("/orders/create/adhoc", {
+    method: "POST",
+    body: payload,
+  });
+
+  return {
+    ...readShipmentIds(data, "Shiprocket did not return an order ID and shipment ID"),
+    packageDetails,
+    // Returned so the caller's amount check compares against the SAME figures that
+    // were sent, not a second computation that could drift from them.
+    lines,
+  };
+};
+
+const buildForwardPayload = async (order, packageOverrides = {}) => {
   const credentials = await getShiprocketCredentials();
   const computedPackage = computeOrderPackage(order, credentials);
   // Precedence: an explicit per-request override wins, then the per-order
@@ -410,6 +723,8 @@ export const createShiprocketOrder = async (order, packageOverrides = {}) => {
   if (!email) {
     throw new ShiprocketError("Customer email is required to create a Shiprocket order", 400);
   }
+
+  const lines = computeShipmentLines(order);
 
   const payload = {
     order_id: String(order._id),
@@ -426,30 +741,19 @@ export const createShiprocketOrder = async (order, packageOverrides = {}) => {
     billing_email: email,
     billing_phone: address.phone,
     shipping_is_billing: true,
-    order_items: order.items.map((item) => ({
-      name: item.name,
-      sku: String(item.product?._id || item.product),
-      units: item.quantity,
-      selling_price: item.price,
-      discount: 0,
-      tax: 0,
-      hsn: "",
-    })),
+    // Remaining units only, with the order discount already inside each line — see
+    // computeShipmentLines for why total_discount is always 0.
+    order_items: lines.orderItems,
     payment_method: order.paymentMethod === "COD" ? "COD" : "Prepaid",
-    shipping_charges: order.shippingCharge || 0,
+    shipping_charges: lines.shippingCharges,
     giftwrap_charges: 0,
     transaction_charges: 0,
-    total_discount: order.discount || 0,
-    sub_total: Math.max(0, order.totalAmount - (order.shippingCharge || 0)),
+    total_discount: lines.totalDiscount,
+    sub_total: lines.subTotal,
     ...packageDetails,
   };
 
-  const data = await request("/orders/create/adhoc", {
-    method: "POST",
-    body: payload,
-  });
-
-  return { ...readShipmentIds(data, "Shiprocket did not return an order ID and shipment ID"), packageDetails };
+  return { payload, packageDetails, lines };
 };
 
 /**
@@ -793,6 +1097,26 @@ export const clearPickupLocationCache = () => {
   pickupCachedAt = 0;
 };
 
+/**
+ * Forgets the cached auth token (and any login in flight).
+ *
+ * Same staleness bug as the pickup cache, with a longer tail: the token is cached for
+ * nine days, so after an admin changed the Shiprocket email/password every call kept
+ * running as the PREVIOUS account until the token happened to expire — shipments booked
+ * on an account the store had just moved away from. Called wherever the credentials
+ * change, so the next request logs in with what is saved now.
+ *
+ * Clearing `pendingLogin` only stops NEW callers joining a login started with the old
+ * credentials; one already awaiting it still resolves for that caller, but the
+ * generation bump stops it writing the old account's token back into the cache.
+ */
+export const resetShiprocketToken = () => {
+  tokenGeneration += 1;
+  cachedToken = null;
+  tokenExpiresAt = 0;
+  pendingLogin = null;
+};
+
 export const listPickupLocations = async ({ forceRefresh = false } = {}) => {
   if (!(await isShiprocketConfigured())) {
     return { ok: false, locations: [], reason: "not_configured" };
@@ -842,12 +1166,15 @@ export const generateManifest = (shipmentId) =>
     body: { shipment_id: [Number(shipmentId)] },
   });
 
-export const assignAwb = (shipmentId, courierId) =>
+// `isReturn` marks a reverse (return) shipment. The flag name is not contractually
+// documented to us, which is why its only caller sits behind reverseAutoAwbEnabled.
+export const assignAwb = (shipmentId, courierId, { isReturn = false } = {}) =>
   request("/courier/assign/awb", {
     method: "POST",
     body: {
       shipment_id: shipmentId,
       ...(courierId ? { courier_id: Number(courierId) } : {}),
+      ...(isReturn ? { is_return: 1 } : {}),
     },
   });
 
@@ -893,8 +1220,75 @@ export const actOnNdr = (awbCode, { action, comment = "" } = {}) =>
     body: { action, comments: comment },
   });
 
+/**
+ * Shiprocket's own record of an order we created — documented as GET /orders/show/{id}.
+ * Used to read back what Shiprocket will collect, rather than trusting that it
+ * interpreted our payload the way we meant it.
+ */
+export const getShiprocketOrder = (shiprocketOrderId) =>
+  request(`/orders/show/${encodeURIComponent(Number(shiprocketOrderId))}`);
+
+const REPORTED_TOTAL_FIELDS = ["net_total", "total", "order_total", "cod_amount"];
+
+/**
+ * The order total Shiprocket reports, or null when it cannot be found.
+ *
+ * ⚠ UNVERIFIED FIELD NAME. The endpoint is documented; which field holds the
+ * collectable total is not, so this tries the plausible names in a fixed order and
+ * accepts numbers or numeric strings ("1,234.50" included). Anything else is null —
+ * and null makes the amount check `unverified` (a warning), never `ok`. An unexpected
+ * shape must not read as "the amounts agree".
+ *
+ * Correct this list (one line) once a sandbox response confirms the real field.
+ */
+export const readReportedOrderTotal = (data) => {
+  const record = data?.data ?? data;
+  if (!record || typeof record !== "object") return null;
+  for (const field of REPORTED_TOTAL_FIELDS) {
+    const raw = record[field];
+    // Number("") and Number(null) are 0 — a blank field must not read as "₹0 total".
+    if (typeof raw === "number") {
+      if (Number.isFinite(raw)) return raw;
+      continue;
+    }
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const value = Number(raw.replace(/,/g, "").trim());
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+};
+
 export const trackAwb = (awbCode) =>
   request(`/courier/track/awb/${encodeURIComponent(awbCode)}`);
+
+/**
+ * One shipment as Shiprocket holds it (`GET /shipments/{id}`, documented in their API
+ * helpsheet). Used to recover the AWB of a return pickup or replacement parcel: booking
+ * those returns only order and shipment ids, and the AWB is assigned later — in
+ * Shiprocket's dashboard or by their auto-assignment — so this is how it reaches us.
+ */
+export const getShipment = (shipmentId) => request(`/shipments/${Number(shipmentId)}`);
+
+/**
+ * The AWB and courier from a getShipment response, or nulls.
+ *
+ * The response's exact field names are not contractually documented to us, so this
+ * reads the plausible spellings and returns null rather than guessing — an AWB stored
+ * wrongly would resolve courier events to the wrong parcel.
+ *
+ * @returns {{awbCode: string|null, courierName: string|null}}
+ */
+export const readShipmentAwb = (data) => {
+  const root = data?.data && typeof data.data === "object" ? data.data : data || {};
+  const awb = String(root.awb ?? root.awb_code ?? root.awbCode ?? "").trim();
+  const courier = String(root.courier ?? root.courier_name ?? root.sr_courier_name ?? "").trim();
+  return {
+    // An AWB is an opaque courier identifier, but never contains whitespace and is never
+    // a bare zero (Shiprocket's "not assigned" placeholder in some responses).
+    awbCode: awb && !/\s/.test(awb) && awb !== "0" ? awb : null,
+    courierName: courier || null,
+  };
+};
 
 export const cancelShiprocketOrder = (shiprocketOrderId) =>
   request("/orders/cancel", {

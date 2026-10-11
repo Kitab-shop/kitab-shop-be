@@ -27,10 +27,21 @@ process.env.PAYMENTS_ENABLED = "false";
 
 import mongoose from "mongoose";
 import { readFile } from "node:fs/promises";
-import { connect, createSuite, marker, productFixture, addressFixture } from "./helpers.mjs";
+import {
+  connect,
+  createSuite,
+  marker,
+  productFixture,
+  addressFixture,
+  pinShiprocketCapabilities,
+} from "./helpers.mjs";
 
 const { ok, section, finish } = createSuite("manual-shipment");
 await connect();
+// The webhook cases need Shiprocket's capabilities ON. Pinned rather than read from the
+// shared settings singleton, which is whatever the local admin panel last saved — a
+// store set to manual fulfilment made this suite fail for reasons unrelated to its code.
+const restoreCapabilities = await pinShiprocketCapabilities();
 
 const OrderModel = (await import("../../src/modules/orders/Order.model.js")).default;
 const { SHIPMENT_PROVIDERS } = await import("../../src/modules/orders/Order.model.js");
@@ -605,6 +616,7 @@ try {
   await OrderModel.deleteMany({ _id: { $in: trash.orders } });
   await ProductModel.deleteMany({ _id: { $in: trash.products } });
   await UserModel.deleteMany({ _id: { $in: trash.users } });
+  restoreCapabilities();
   await mongoose.disconnect();
   finish();
 }
