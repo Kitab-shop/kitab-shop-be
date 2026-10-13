@@ -100,12 +100,35 @@ const resolved = (dbValue, envName, fallback = "") => {
   return fromEnv || fallback;
 };
 
+// The value the settings schema used to write into every new settings document.
+const LEGACY_DEFAULT_PICKUP = "Primary";
+
+/**
+ * The pickup location name: admin panel, then .env, then "Primary".
+ *
+ * The schema used to default `pickupLocation` to "Primary", so every settings document
+ * already holds that value whether or not an admin ever chose it — and because the
+ * stored value wins, SHIPROCKET_PICKUP_LOCATION in .env could never take effect. Found
+ * when configuring a live account whose pickup address is named "Home": every shipment
+ * would have been booked against a "Primary" that does not exist.
+ *
+ * New documents now default to empty. For existing ones, a stored "Primary" is
+ * indistinguishable from the untouched default, so an explicit .env value wins over it;
+ * any other stored name is an admin's deliberate choice and still wins over .env.
+ */
+const resolvePickupLocation = (stored) => {
+  const fromDb = String(stored ?? "").trim();
+  const fromEnv = String(process.env.SHIPROCKET_PICKUP_LOCATION ?? "").trim();
+  if (fromDb && !(fromDb === LEGACY_DEFAULT_PICKUP && fromEnv)) return fromDb;
+  return fromEnv || LEGACY_DEFAULT_PICKUP;
+};
+
 export const getShiprocketCredentials = async () => {
   const settings = await ShiprocketSetting.getSettings();
   return {
     email: resolved(settings.email, "SHIPROCKET_EMAIL"),
     password: resolved(settings.password, "SHIPROCKET_PASSWORD"),
-    pickupLocation: resolved(settings.pickupLocation, "SHIPROCKET_PICKUP_LOCATION", "Primary"),
+    pickupLocation: resolvePickupLocation(settings.pickupLocation),
     pickupPostcode: resolved(settings.pickupPostcode, "SHIPROCKET_PICKUP_POSTCODE"),
     webhookToken: resolved(settings.webhookToken, "SHIPROCKET_WEBHOOK_TOKEN"),
     defaultLengthCm: settings.defaultLengthCm || Number(process.env.SHIPROCKET_DEFAULT_LENGTH_CM) || 10,
@@ -1131,7 +1154,15 @@ export const listPickupLocations = async ({ forceRefresh = false } = {}) => {
     // Documented shape is data.shipping_address[]; tolerate the bare array too rather
     // than assuming, because an unexpected shape must read as "could not list", never
     // as "this account has no pickup locations".
-    const raw = data?.data?.shipping_address ?? data?.shipping_address;
+    const container = data?.data ?? data;
+    // Verified against a live account: one with NO pickup address registered answers
+    // `{data: {shipping_address: null, recent_addresses: [], …}}`. That is a real
+    // answer — "none registered" — not an unreadable response, and reporting it as the
+    // latter hid the actual fix (register an address in Shiprocket) behind a vague warning.
+    const raw =
+      container && "shipping_address" in container && container.shipping_address === null
+        ? []
+        : data?.data?.shipping_address ?? data?.shipping_address;
     if (!Array.isArray(raw)) {
       return { ok: false, locations: [], reason: "unexpected_response_shape" };
     }

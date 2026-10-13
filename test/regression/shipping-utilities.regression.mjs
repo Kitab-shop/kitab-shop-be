@@ -378,6 +378,29 @@ section("A2 — pickup locations");
   );
 }
 
+{
+  // The shape a live account with no pickup address actually returns (verified
+  // 2026-10-13): `shipping_address` is null, not an empty array.
+  pickupResponder = () => ({
+    status: 200,
+    body: {
+      data: {
+        shipping_address: null,
+        allow_more: "1",
+        is_blackbox_seller: false,
+        company_name: "Test",
+        recent_addresses: [],
+      },
+    },
+  });
+  const result = await listFresh();
+  ok(
+    "a live 'none registered' answer (shipping_address: null) is ok with an empty list",
+    result.ok === true && result.locations.length === 0,
+    JSON.stringify(result),
+  );
+}
+
 // "Could not ask" must never render as "the answer is no" — an admin told they have no
 // pickup locations, when really the call failed, goes and fixes the wrong thing.
 const unreadableCases = [

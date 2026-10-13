@@ -10,6 +10,17 @@
 import "dotenv/config";
 import mongoose from "mongoose";
 
+// A developer's .env can hold a REAL Shiprocket account. Nothing from it may reach a
+// suite: real credentials plus one suite that forgets to stub fetch would book or
+// cancel on the live account, and real values (a pickup name, a PIN) silently change
+// what a suite is testing. So every Shiprocket setting is dropped as soon as .env is
+// read, and the API base URL points nowhere. This runs during import — before a suite's
+// own `process.env.X = …` lines — so whatever a suite sets explicitly still applies.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("SHIPROCKET_")) delete process.env[key];
+}
+process.env.SHIPROCKET_BASE_URL = "https://shiprocket.invalid/v1/external";
+
 export const mongoUri = () =>
   process.env.mango_url ||
   process.env.mongo_url ||

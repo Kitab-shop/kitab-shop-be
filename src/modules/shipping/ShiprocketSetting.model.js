@@ -15,7 +15,10 @@ const shiprocketSettingSchema = new mongoose.Schema(
   {
     email: { type: String, trim: true, default: "" },
     password: { type: String, default: "" },
-    pickupLocation: { type: String, trim: true, default: "Primary" },
+    // Empty by default so SHIPROCKET_PICKUP_LOCATION applies; "Primary" is the final
+    // fallback in getShiprocketCredentials. (It used to default to "Primary" here, which
+    // stored the default as if chosen and hid the .env value.)
+    pickupLocation: { type: String, trim: true, default: "" },
     pickupPostcode: { type: String, trim: true, default: "" },
     webhookToken: { type: String, default: "" },
     // Use Shiprocket for shipments at all: create shipment, assign AWB, book pickup,
