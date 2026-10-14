@@ -424,6 +424,93 @@ section("a COD order is quoted at the COD rate, not the prepaid one");
   );
 }
 
+// ================================================================ FREE DELIVERY
+
+section("free delivery above an amount");
+
+{
+  // priceOrder buys 2 × ₹500, so the books total ₹1,000. Earlier sections leave the rate
+  // stub returning no couriers; put back the ₹47.20 cheapest courier.
+  const product = await makeProduct();
+  rateResponder = () => ({
+    status: 200,
+    body: { data: { available_courier_companies: [{ courier_company_id: 2, courier_name: "Cheap", rate: 47.2, cod: 1 }] } },
+  });
+
+  checkout = { ...checkout, shippingRatesEnabled: true, freeShippingThreshold: 1000 };
+  resetCalls();
+  const atThreshold = await priceOrder(product);
+  ok("an order exactly at the amount ships free", atThreshold.shippingCharge === 0, `shipping=${atThreshold.shippingCharge}`);
+  ok("… and the total is the books alone", atThreshold.totalAmount === 1000, `total=${atThreshold.totalAmount}`);
+  ok("… without asking Shiprocket for a rate", rateCalls().length === 0, `calls=${rateCalls().length}`);
+
+  checkout = { ...checkout, freeShippingThreshold: 1001 };
+  resetCalls();
+  const below = await priceOrder(product);
+  ok("₹1 under the amount pays the courier rate", below.shippingCharge === 48, `shipping=${below.shippingCharge}`);
+
+  checkout = { ...checkout, freeShippingThreshold: 0 };
+  const noThreshold = await priceOrder(product);
+  ok("0 means no threshold — every order pays", noThreshold.shippingCharge === 48, `shipping=${noThreshold.shippingCharge}`);
+
+  checkout = { ...checkout, shippingRatesEnabled: false, freeShippingThreshold: 5000 };
+  const ratesOff = await priceOrder(product);
+  ok("with rates off everything still ships free", ratesOff.shippingCharge === 0, `shipping=${ratesOff.shippingCharge}`);
+
+  checkout = { ...checkout, shippingRatesEnabled: false, freeShippingThreshold: 0 };
+}
+
+section("the free delivery amount is validated");
+
+{
+  const { GetCheckoutSettings, UpdateCheckoutSettings } = await import(
+    "../../src/modules/orders/checkout-settings.controller.js"
+  );
+  const saved = { ...checkout, freeShippingThreshold: 999 };
+  const stubbed = CheckoutSetting.getSettings;
+  // A document-like object whose save() lands in `saved`, so the real controller runs
+  // without touching the singleton the dev store shares.
+  CheckoutSetting.getSettings = async () => {
+    const doc = { ...saved };
+    doc.save = async () => {
+      saved.freeShippingThreshold = doc.freeShippingThreshold;
+      return doc;
+    };
+    return doc;
+  };
+  const call = async (handler, body = {}) => {
+    let statusCode = 200;
+    let payload;
+    const res = {
+      status(code) { statusCode = code; return this; },
+      json(data) { payload = data; return this; },
+    };
+    await handler({ body, params: {}, query: {} }, res);
+    return { statusCode, body: payload };
+  };
+
+  for (const junk of ["abc", -1, null, "", Number.NaN]) {
+    const result = await call(UpdateCheckoutSettings, { freeShippingThreshold: junk });
+    ok(`${JSON.stringify(junk)} is refused`, result.statusCode === 400, `status=${result.statusCode}`);
+  }
+  ok("… and the saved amount is untouched", saved.freeShippingThreshold === 999, `saved=${saved.freeShippingThreshold}`);
+
+  const accepted = await call(UpdateCheckoutSettings, { freeShippingThreshold: "1499" });
+  ok("a numeric amount is saved", accepted.statusCode === 200 && saved.freeShippingThreshold === 1499, `saved=${saved.freeShippingThreshold}`);
+
+  const untouched = await call(UpdateCheckoutSettings, { codEnabled: true });
+  ok("saving another setting leaves it alone", untouched.statusCode === 200 && saved.freeShippingThreshold === 1499);
+
+  const publicView = await call(GetCheckoutSettings);
+  ok(
+    "the storefront can read it",
+    publicView.body?.settings?.freeShippingThreshold === 1499,
+    JSON.stringify(publicView.body?.settings),
+  );
+
+  CheckoutSetting.getSettings = stubbed;
+}
+
 // ================================================================ GUARD
 
 section("pricing refuses to redeem a coupon");

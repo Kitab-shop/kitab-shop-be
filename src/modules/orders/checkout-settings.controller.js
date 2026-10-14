@@ -5,6 +5,7 @@ const presentSettings = (settings) => ({
   codEnabled: settings.codEnabled,
   codServiceabilityCheckEnabled: settings.codServiceabilityCheckEnabled,
   shippingRatesEnabled: settings.shippingRatesEnabled,
+  freeShippingThreshold: settings.freeShippingThreshold ?? 0,
   codMinOrderAmount: settings.codMinOrderAmount,
   codMaxOrderAmount: settings.codMaxOrderAmount,
   cancellationWindowHours: settings.cancellationWindowHours,
@@ -59,6 +60,24 @@ export const UpdateCheckoutSettings = async (req, res) => {
     // are charged.
     if (typeof body.shippingRatesEnabled === "boolean") {
       settings.shippingRatesEnabled = body.shippingRatesEnabled;
+    }
+
+    if (body.freeShippingThreshold !== undefined) {
+      const nextThreshold = Number(body.freeShippingThreshold);
+      // Number(null) and Number("") are 0, which here means "no free delivery" — a change to
+      // what customers pay. Only a real number (or numeric string) may make that change.
+      if (
+        body.freeShippingThreshold === null ||
+        body.freeShippingThreshold === "" ||
+        !Number.isFinite(nextThreshold) ||
+        nextThreshold < 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "The free delivery amount must be zero or a positive number.",
+        });
+      }
+      settings.freeShippingThreshold = nextThreshold;
     }
 
     const nextMin = body.codMinOrderAmount === undefined ? settings.codMinOrderAmount : Number(body.codMinOrderAmount);

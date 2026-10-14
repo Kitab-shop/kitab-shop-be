@@ -29,6 +29,15 @@ const checkoutSettingSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Free delivery once the books in the order are worth at least this much (after any
+    // coupon, before wallet credit). Only meaningful while shippingRatesEnabled is on —
+    // with it off every order already ships free. 0 means "no threshold": rates apply to
+    // every order.
+    freeShippingThreshold: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     // 0 means "no minimum". Guards against COD being used for very small
     // orders where the delivery/handling cost isn't worth the fraud risk.
     codMinOrderAmount: {

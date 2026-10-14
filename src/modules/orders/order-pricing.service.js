@@ -238,9 +238,15 @@ export const prepareOrderData = async ({
   // in the controllers means both checkout paths — COD and Razorpay — price shipping
   // identically, and the preview the customer is shown is the figure the order is created
   // with. Falls back to free on any failure, so a courier API blip cannot block checkout.
-  const { shippingRatesEnabled } = await CheckoutSetting.getSettings();
+  //
+  // Free delivery above a threshold is judged on the books' value after the coupon: a
+  // coupon really lowers what the customer spends, wallet credit is only a way of paying
+  // for it. Checked first, so a qualifying order never spends a Shiprocket call.
+  const { shippingRatesEnabled, freeShippingThreshold } = await CheckoutSetting.getSettings();
+  const threshold = Number(freeShippingThreshold) || 0;
+  const qualifiesForFreeShipping = threshold > 0 && subtotal - couponDiscount >= threshold;
   let shippingCharge = 0;
-  if (shippingRatesEnabled) {
+  if (shippingRatesEnabled && !qualifiesForFreeShipping) {
     // Quoted for THIS basket's parcel — the same computeOrderPackage the shipment itself
     // is booked with — not the store's default box. Quoting a five-book order as one
     // default parcel under-charged the customer by every weight slab above it. If the
