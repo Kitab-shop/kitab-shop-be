@@ -51,7 +51,10 @@ const presentStatus = async () => {
     status: {
       enabled: isShippingEnabled(),
       configured: capabilities.configured,
-      autoCreateOrder: Boolean(shipping.autoCreateOrder),
+      // Both pills report what the server will actually do (env AND the admin's toggle).
+      // This one used to read .env alone, so it said "pushed automatically" while the
+      // admin's auto-push switch was off and every order waited for a click.
+      autoCreateOrder: capabilities.autoPush,
       webhookEnabled: capabilities.deliveryWebhook,
     },
     // What .env permits, independent of the admin's choice. The UI disables a switch
