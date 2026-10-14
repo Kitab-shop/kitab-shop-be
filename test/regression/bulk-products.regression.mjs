@@ -16,12 +16,25 @@
  * 4. Imported products got no slug, because only CreateProduct called
  *    buildSeoFields.
  *
+ * And the export → edit → re-import round trip the admin guide describes:
+ *
+ * 5. Export wrote bestseller as the text "false" and import read it with
+ *    Boolean(), so every re-imported product became a bestseller.
+ * 6. Import ignored the id column and always created, so re-importing an export
+ *    duplicated the catalogue. A row with an id now updates that product, and a
+ *    blank cell in it means "leave as it is".
+ * 7. Export had no authorBio column, so a round trip lost every bio.
+ * 8. Pictures are uploaded as files before the import; a dry run validates the
+ *    sheet first so a bad file never leaves orphaned pictures behind.
+ *
  * Run with `npm run test:bulk-products` (or `npm test` for everything).
  */
 process.env.NOTIFICATIONS_ENABLED = "false";
 process.env.SHIPROCKET_ENABLED = "false";
 
+import { existsSync } from "node:fs";
 import mongoose from "mongoose";
+import sharp from "sharp";
 import { connect, createSuite, marker } from "./helpers.mjs";
 
 const { ok, section, finish } = createSuite("bulk-products");
@@ -29,23 +42,58 @@ await connect();
 
 const ProductModel = (await import("../../src/modules/products/Product.model.js")).default;
 const CategoryModel = (await import("../../src/modules/categories/Category.model.js")).default;
-const { BulkImportProducts, BulkUpdateProducts } = await import(
+const { BulkImportProducts, BulkUpdateProducts, ExportProducts, UploadBulkProductImages } = await import(
   "../../src/modules/admin/admin.controller.js"
 );
+const { deleteImageAsset } = await import("../../src/utils/image-upload.js");
+const { resolveStoragePath } = await import("../../src/config/storage.config.js");
 
 const MARKER = marker("bulkprod");
 const trash = [];
+const trashImages = [];
 const adminId = new mongoose.Types.ObjectId();
 
-const call = async (handler, body) => {
+const call = async (handler, body, extra = {}) => {
   let statusCode = 200;
   let payload;
+  let sent;
   const res = {
     status(code) { statusCode = code; return this; },
     json(data) { payload = data; return this; },
+    setHeader() {},
+    send(data) { sent = data; return this; },
   };
-  await handler({ body, params: {}, query: {}, headers: {}, user: { id: adminId } }, res);
-  return { statusCode, body: payload };
+  await handler({ body, params: {}, query: {}, headers: {}, user: { id: adminId }, ...extra }, res);
+  return { statusCode, body: payload, sent };
+};
+
+// Minimal CSV reader for the export (quoted fields, embedded commas/newlines) —
+// the same rules as the admin page's parseCsv.
+const parseCsv = (text) => {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (quoted) {
+      if (char === '"' && text[i + 1] === '"') { cell += '"'; i += 1; }
+      else if (char === '"') quoted = false;
+      else cell += char;
+    } else if (char === '"') quoted = true;
+    else if (char === ",") { row.push(cell); cell = ""; }
+    else if (char === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += char;
+  }
+  row.push(cell);
+  rows.push(row);
+  const [headers, ...body] = rows;
+  return body.map((cells) => Object.fromEntries(headers.map((h, i) => [h, cells[i] ?? ""])));
+};
+
+const exportedRowFor = async (name) => {
+  const out = await call(ExportProducts, {});
+  return parseCsv(out.sent).find((r) => r.name === name);
 };
 
 const row = (overrides = {}) => ({
@@ -149,7 +197,162 @@ try {
   const afterMrpDrop = await ProductModel.findById(target._id).lean();
   ok("the MRP is unchanged", afterMrpDrop.mrp === 500, afterMrpDrop.mrp);
   ok("the whole request is reported as applying nothing", out.statusCode === 400, out.statusCode);
+
+  // ═══ bestseller text ══════════════════════════════════════════════════════
+  section('A bestseller cell of "false" stays false');
+  out = await call(BulkImportProducts, {
+    products: [row({ name: `${MARKER} Not Best`, category_id: String(category._id), bestseller: "false" })],
+  });
+  const notBest = await ProductModel.findOne({ name: `${MARKER} Not Best` }).lean();
+  ok("imported", out.statusCode === 201, `${out.statusCode}: ${out.body?.message}`);
+  ok("bestseller is false", notBest?.bestseller === false, notBest?.bestseller);
+
+  // ═══ image links ══════════════════════════════════════════════════════════
+  section("Only https:// picture links (or our own /uploads paths) are accepted");
+  out = await call(BulkImportProducts, {
+    products: [row({ name: `${MARKER} Http`, category_id: String(category._id), image: "http://example.test/c.jpg" })],
+  });
+  ok("an http:// link is refused", out.statusCode === 400 && out.body?.errors?.[0]?.fields?.includes("image"), out.body?.errors);
+  out = await call(BulkImportProducts, {
+    products: [row({ name: `${MARKER} Bare Name`, category_id: String(category._id), image: "cover.jpg" })],
+  });
+  ok("a bare file name is refused outside a dry run", out.statusCode === 400, out.statusCode);
+
+  // ═══ export → re-import round trip ════════════════════════════════════════
+  section("Export → edit → re-import updates in place instead of duplicating");
+  const roundTrip = await ProductModel.create({
+    category_id: category._id,
+    name: `${MARKER} Round Trip`,
+    description: "line one\nline two, with a comma",
+    image: "https://example.test/rt.jpg",
+    brand: "Fixture Press",
+    producthightlight: "fixture",
+    authorBio: "A bio that must survive",
+    price: 300,
+    mrp: 500,
+    stock: 4,
+    bestseller: false,
+  });
+  trash.push(roundTrip._id);
+
+  const exported = await exportedRowFor(`${MARKER} Round Trip`);
+  ok("export carries an authorBio column", exported?.authorBio === "A bio that must survive", exported?.authorBio);
+  ok("export carries the id", exported?.id === String(roundTrip._id), exported?.id);
+
+  out = await call(BulkImportProducts, { products: [{ ...exported, price: "350" }] });
+  ok("re-import succeeds", out.statusCode === 200 && out.body?.success, `${out.statusCode}: ${out.body?.message}`);
+  ok("reported as one update, nothing created", out.body?.updated === 1 && out.body?.created === 0, out.body);
+  const copies = await ProductModel.find({ name: `${MARKER} Round Trip` }).lean();
+  ok("still exactly one product", copies.length === 1, copies.length);
+  ok("the edited price applied", copies[0]?.price === 350, copies[0]?.price);
+  ok("bestseller still false", copies[0]?.bestseller === false, copies[0]?.bestseller);
+  ok("bio kept", copies[0]?.authorBio === "A bio that must survive", copies[0]?.authorBio);
+  ok("multi-line description kept", copies[0]?.description === roundTrip.description);
+
+  // A fresh export, so the row matches what is stored now.
+  out = await call(BulkImportProducts, { products: [await exportedRowFor(`${MARKER} Round Trip`)] });
+  ok(
+    "re-importing an unedited row changes nothing",
+    out.body?.updated === 0 && out.body?.unchanged === 1,
+    JSON.stringify({ updated: out.body?.updated, unchanged: out.body?.unchanged }),
+  );
+
+  section("In an update row, a blank cell leaves the field as it is");
+  out = await call(BulkImportProducts, {
+    products: [{ id: String(roundTrip._id), name: "", description: "", price: "", stock: "9", authorBio: "" }],
+  });
+  const afterSparse = await ProductModel.findById(roundTrip._id).lean();
+  ok("the filled cell applied", afterSparse.stock === 9, afterSparse.stock);
+  ok("blank name kept", afterSparse.name === `${MARKER} Round Trip`, afterSparse.name);
+  ok("blank price kept", afterSparse.price === 350, afterSparse.price);
+  ok("blank bio kept", afterSparse.authorBio === "A bio that must survive", afterSparse.authorBio);
+
+  section("An update row is held to the same price/MRP rule");
+  out = await call(BulkImportProducts, { products: [{ id: String(roundTrip._id), price: "900" }] });
+  ok("price above the stored MRP is refused", out.statusCode === 400, out.statusCode);
+  ok("with a reason", /above mrp/i.test(out.body?.errors?.[0]?.message || ""), out.body?.errors);
+
+  section("Bad ids are refused and nothing is written");
+  const ghost = new mongoose.Types.ObjectId();
+  out = await call(BulkImportProducts, {
+    products: [
+      row({ name: `${MARKER} Alongside Ghost`, category_id: String(category._id) }),
+      { id: String(ghost), price: "10" },
+      { id: String(roundTrip._id), price: "320" },
+      { id: String(roundTrip._id), price: "330" },
+    ],
+  });
+  ok("the file is refused", out.statusCode === 400, out.statusCode);
+  ok("unknown id reported on its row", out.body?.errors?.some((e) => e.row === 3 && /does not match/.test(e.message)), out.body?.errors);
+  ok("duplicate id reported on its row", out.body?.errors?.some((e) => e.row === 5 && /more than once/.test(e.message)), out.body?.errors);
+  ok("the valid new row was not created", (await ProductModel.countDocuments({ name: `${MARKER} Alongside Ghost` })) === 0);
+  ok("the valid update was not applied", (await ProductModel.findById(roundTrip._id).lean()).price === 350);
+
+  // ═══ variant-stocked products ═════════════════════════════════════════════
+  section("Variant-stocked products: the exported total round-trips, a new total is refused");
+  const variantProduct = await ProductModel.create({
+    category_id: category._id,
+    name: `${MARKER} Variants`,
+    description: "bulk fixture",
+    image: "https://example.test/v.jpg",
+    brand: "Fixture Press",
+    producthightlight: "fixture",
+    price: 100,
+    mrp: 200,
+    stock: 7,
+    variants: [
+      { name: "Paperback", attributes: { format: "Paperback" }, stock: 5, active: true },
+      { name: "Hardcover", attributes: { format: "Hardcover" }, stock: 2, active: true },
+    ],
+  });
+  trash.push(variantProduct._id);
+  const variantRow = await exportedRowFor(`${MARKER} Variants`);
+  out = await call(BulkImportProducts, { products: [variantRow] });
+  ok("the same total is accepted", out.statusCode === 200, `${out.statusCode}: ${out.body?.message}`);
+  out = await call(BulkImportProducts, { products: [{ ...variantRow, stock: "50" }] });
+  ok("a different total is refused", out.statusCode === 400 && /variant/i.test(out.body?.errors?.[0]?.message || ""), out.body?.errors);
+
+  // ═══ dry run + picture upload ═════════════════════════════════════════════
+  section("A dry run validates the sheet and writes nothing");
+  const dryRows = [
+    row({ name: `${MARKER} Dry New`, category_id: String(category._id), image: "Dry-Cover.JPG" }),
+    { id: String(roundTrip._id), price: "360" },
+  ];
+  out = await call(BulkImportProducts, { products: dryRows, dryRun: true, uploadNames: ["dry-cover.jpg"] });
+  ok("passes, matching the picture name case-insensitively", out.statusCode === 200 && out.body?.dryRun, `${out.statusCode}: ${out.body?.message}`);
+  ok("reports what it would do", out.body?.toCreate === 1 && out.body?.toUpdate === 1, out.body);
+  ok("nothing created", (await ProductModel.countDocuments({ name: `${MARKER} Dry New` })) === 0);
+  ok("nothing updated", (await ProductModel.findById(roundTrip._id).lean()).price === 350);
+  out = await call(BulkImportProducts, { products: dryRows, dryRun: true, uploadNames: ["other.jpg"] });
+  ok("a picture that was not selected fails the dry run", out.statusCode === 400 && out.body?.errors?.[0]?.fields?.includes("image"), out.body?.errors);
+
+  section("Uploaded pictures are stored like a single-product upload");
+  const png = await sharp({ create: { width: 40, height: 60, channels: 3, background: "#884422" } }).png().toBuffer();
+  out = await call(UploadBulkProductImages, {}, {
+    files: [{ originalname: "Dry-Cover.JPG", mimetype: "image/png", buffer: png, size: png.length }],
+  });
+  const uploaded = out.body?.images?.[0];
+  if (uploaded?.image) trashImages.push(uploaded.image);
+  ok("upload succeeds", out.statusCode === 201, `${out.statusCode}: ${out.body?.message}`);
+  ok("returns a /uploads/products path", /^\/uploads\/products\/.+\.webp$/.test(uploaded?.image || ""), uploaded?.image);
+  ok("the file exists on disk", Boolean(uploaded?.image) && existsSync(resolveStoragePath(uploaded.image)));
+  out = await call(UploadBulkProductImages, {}, {
+    files: [{ originalname: "broken.jpg", mimetype: "image/jpeg", buffer: Buffer.from("not a picture"), size: 13 }],
+  });
+  ok("an unreadable picture gets a plain message", out.statusCode === 400 && /could not be read/.test(out.body?.message || ""), out.body?.message);
+
+  section("The real import then uses the stored paths");
+  out = await call(BulkImportProducts, {
+    products: [{ ...dryRows[0], image: uploaded?.image }, { id: String(roundTrip._id), image: uploaded?.image }],
+  });
+  ok("import succeeds", out.statusCode === 201, `${out.statusCode}: ${out.body?.message}`);
+  const dryNew = await ProductModel.findOne({ name: `${MARKER} Dry New` }).lean();
+  ok("new product has the picture", dryNew?.image === uploaded?.image, dryNew?.image);
+  const recovered = await ProductModel.findById(roundTrip._id).lean();
+  ok("updated product's cover replaced", recovered.image === uploaded?.image, recovered.image);
+  ok("and it leads the gallery", recovered.images?.[0] === uploaded?.image, recovered.images);
 } finally {
+  for (const stored of trashImages) await deleteImageAsset(stored);
   if (trash.length > 0) await ProductModel.deleteMany({ _id: { $in: trash } });
   await ProductModel.deleteMany({ name: new RegExp(MARKER) });
   if (category) await CategoryModel.deleteOne({ _id: category._id });

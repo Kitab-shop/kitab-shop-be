@@ -113,6 +113,18 @@ export const setUserActiveStatus = async ({ id, isActive, adminId }) => {
   return formatAdminUser({ user, profile, ordersCount });
 };
 
+// Every CSV cell arrives as text, so Boolean() made the "false" that Export
+// Products writes into true — re-importing an export turned every product into
+// a bestseller. Only an explicit yes counts.
+export const parseBulkBoolean = (value) =>
+  value === true || /^(true|yes|y|1)$/i.test(String(value ?? "").trim());
+
+// The storefront's CSP allows images from any https: host; a plain http: link
+// is force-upgraded by the browser and usually fails, so it is refused at
+// import time instead of becoming a broken cover. /uploads/ is our own storage.
+export const isAcceptableImageUrl = (value) =>
+  /^https:\/\/\S+$/i.test(String(value || "")) || String(value || "").startsWith("/uploads/");
+
 // Bulk-import CSVs are filled in by non-technical admins who have no way to
 // look up a category's raw Mongo ObjectId, so a plain category name (matched
 // case-insensitively against categoryIdByName) is accepted alongside an id.
@@ -137,7 +149,7 @@ export const normalizeBulkProduct = (item = {}, categoryIdByName = new Map()) =>
     producthightlight: String(item.producthightlight || item.highlight || "").trim(),
     image: String(item.image || "").trim(),
     public_id: item.public_id || "",
-    bestseller: Boolean(item.bestseller),
+    bestseller: parseBulkBoolean(item.bestseller),
     // Book columns — all optional; the Product model mirrors publisher into
     // brand when brand is blank, and normalization here keeps that possible
     // by defaulting brand from publisher for CSV rows too.

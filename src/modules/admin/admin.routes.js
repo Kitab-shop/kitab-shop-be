@@ -4,6 +4,7 @@ import {
   BulkImportProducts,
   BulkUpdateProducts,
   ExportProducts,
+  UploadBulkProductImages,
   GetAdminPermissions,
   GetSystemHealth,
   GetAllUsers,
@@ -24,6 +25,7 @@ import {
   ExportCouponUsageReport,
 } from "../coupons/coupon.controller.js";
 import { isAdmin } from "../../middleware/is-admin.middleware.js";
+import image from "../../middleware/image.middleware.js";
 import { requirePermission } from "../../middleware/require-permission.middleware.js";
 import { ADMIN_PERMISSIONS } from "../../config/admin-permissions.config.js";
 import { GetLoginActivities } from "../login-activity/login-activity.controller.js";
@@ -101,8 +103,24 @@ router.get("/coupons/report/export", isAdmin, requirePermission(ADMIN_PERMISSION
 router.post("/coupons", isAdmin, requirePermission(ADMIN_PERMISSIONS.COUPONS_MANAGE), AdminCreateCoupon);
 router.put("/coupons/:id", isAdmin, requirePermission(ADMIN_PERMISSIONS.COUPONS_MANAGE), AdminUpdateCoupon);
 router.delete("/coupons/:id", isAdmin, requirePermission(ADMIN_PERMISSIONS.COUPONS_MANAGE), AdminDeleteCoupon);
+// Multer's own refusals (too large, wrong type, too many files) would otherwise
+// reach the app-wide handler and come back as a bare 500 the admin cannot act on.
+const MAX_BULK_IMAGES_PER_REQUEST = 10;
+const bulkImageUpload = (req, res, next) =>
+  image.array("images", MAX_BULK_IMAGES_PER_REQUEST)(req, res, (error) => {
+    if (!error) return next();
+    const message =
+      error.code === "LIMIT_FILE_SIZE"
+        ? "A picture is larger than 10 MB. Make it smaller and try again."
+        : error.code === "LIMIT_UNEXPECTED_FILE" || error.code === "LIMIT_FILE_COUNT"
+          ? `Too many pictures in one upload (the limit is ${MAX_BULK_IMAGES_PER_REQUEST}).`
+          : error.message;
+    return res.status(400).json({ success: false, message });
+  });
+
 router.post("/products/bulk-import", isAdmin, requirePermission(ADMIN_PERMISSIONS.PRODUCTS_BULK), BulkImportProducts);
 router.patch("/products/bulk-update", isAdmin, requirePermission(ADMIN_PERMISSIONS.PRODUCTS_BULK), BulkUpdateProducts);
+router.post("/products/bulk-images", isAdmin, requirePermission(ADMIN_PERMISSIONS.PRODUCTS_BULK), bulkImageUpload, UploadBulkProductImages);
 router.get("/products/export", isAdmin, requirePermission(ADMIN_PERMISSIONS.PRODUCTS_BULK), ExportProducts);
 router.get("/reports/sales", isAdmin, requirePermission(ADMIN_PERMISSIONS.REPORTS_READ), GetSalesReport);
 // Read-only. Same permission as other financial reporting; nothing here mutates an order.
