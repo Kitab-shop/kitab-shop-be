@@ -198,3 +198,13 @@ export const serviceabilityRateLimit = createRateLimit({
   max: 40,
   message: "Too many delivery checks in a short time. Please wait a moment and try again.",
 });
+
+// Product page PIN check. Anonymous, and an uncached PIN costs one live Shiprocket call
+// (the COD hint), so it is capped like checkout's pre-check — higher, since browsing
+// several books and re-checking is normal.
+export const deliveryEstimateRateLimit = createRateLimit({
+  name: "delivery-estimate",
+  windowMs: 10 * MINUTE,
+  max: 60,
+  message: "Too many delivery checks in a short time. Please wait a moment and try again.",
+});

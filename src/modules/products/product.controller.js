@@ -10,13 +10,14 @@ import {
   escapeRegex,
   findUnsupportedVariantFormat,
   fuzzyScore,
-  getDeliveryRange,
   normalizeProductStyles,
   resolveVariantPayload,
   toBoolean,
   trackSearch,
 } from "./product-query.service.js";
 import { buildSeoFields } from "./product-seo.service.js";
+import { getCodAvailabilityHint } from "../orders/order-shipping.service.js";
+import { getDeliveryDaysForPincode } from "./delivery-estimate.service.js";
 import {
   VARIANT_MANAGED_STOCK_MESSAGE,
   hasVariantStock,
@@ -674,8 +675,12 @@ export const GetDeliveryEstimate = async (req, res) => {
       });
     }
 
-    const { minDays, maxDays } = getDeliveryRange(pincode);
     const now = new Date();
+    const [{ minDays, maxDays, source }, codAvailable] = await Promise.all([
+      getDeliveryDaysForPincode(pincode),
+      // A hint only — a failure here must never cost the customer their delivery estimate.
+      getCodAvailabilityHint(pincode).catch(() => null),
+    ]);
 
     return res.status(200).json({
       success: true,
@@ -686,6 +691,8 @@ export const GetDeliveryEstimate = async (req, res) => {
         maxDays,
         earliestDate: addDeliveryDays(now, minDays).toISOString(),
         latestDate: addDeliveryDays(now, maxDays).toISOString(),
+        source,
+        codAvailable,
       },
     });
   } catch (error) {

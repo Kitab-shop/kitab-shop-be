@@ -48,6 +48,7 @@
     "test:refund-confirmation": "node test/regression/refund-confirmation.regression.mjs",
     "test:inventory-reporting": "node test/regression/inventory-reporting.regression.mjs",
     "test:cod-serviceability": "node test/regression/cod-serviceability.regression.mjs",
+    "test:delivery-estimate-cod": "node test/regression/delivery-estimate-cod.regression.mjs",
     "test:shipping-capabilities": "node test/regression/shipping-capabilities.regression.mjs",
     "test:shipping-utilities": "node test/regression/shipping-utilities.regression.mjs",
     "test:courier-recovery": "node test/regression/courier-recovery.regression.mjs",

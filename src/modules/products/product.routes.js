@@ -16,7 +16,7 @@ import image from "../../middleware/image.middleware.js";
 import { isAdmin } from "../../middleware/is-admin.middleware.js";
 import { requirePermission } from "../../middleware/require-permission.middleware.js";
 import { ADMIN_PERMISSIONS } from "../../config/admin-permissions.config.js";
-import { searchRateLimit } from "../../middleware/rate-limit.middleware.js";
+import { deliveryEstimateRateLimit, searchRateLimit } from "../../middleware/rate-limit.middleware.js";
 
 const routes = express.Router();
 
@@ -38,7 +38,7 @@ routes.get("/product-id/:id", GetProductById);
 
 routes.get("/category/:categoryId", GetProductsByCategory);
 
-routes.get("/:id/delivery-estimate", GetDeliveryEstimate);
+routes.get("/:id/delivery-estimate", deliveryEstimateRateLimit, GetDeliveryEstimate);
 
 routes.delete(
   "/delete/:id",

@@ -1012,6 +1012,50 @@ export const getCheapestShippingRate = async ({ deliveryPostcode, cod = false, p
 };
 
 /**
+ * How many days couriers quote to carry a parcel to this pincode, counted from pickup.
+ *
+ * `fastestDays` is the quickest courier on offer; `expectedDays` is the one Shiprocket
+ * recommends — the courier an AWB request without a courier_id is given — falling back to
+ * the slowest quote when no recommendation matches. Fails soft like the rate lookup: any
+ * failure is `ok: false` and the caller keeps its own estimate. Days that are missing,
+ * non-numeric or absurd (over 30) are ignored rather than shown to a customer.
+ *
+ * @returns {Promise<{ok: boolean, fastestDays?: number, expectedDays?: number, reason?: string}>}
+ */
+export const getCourierDeliveryDays = async ({ deliveryPostcode } = {}) => {
+  if (!(await isShiprocketConfigured())) return { ok: false, reason: "shiprocket_not_configured" };
+  try {
+    const parcel = await resolvePackage({});
+    const data = await checkServiceability({ ...parcel, deliveryPostcode, cod: false });
+    const payload = data?.data ?? data;
+    const couriers = payload?.available_courier_companies;
+    if (!Array.isArray(couriers) || couriers.length === 0) return { ok: false, reason: "no_courier" };
+
+    const quotes = couriers
+      .map((entry) => {
+        // Same rule as the rate lookup: Number(null) and Number("") are 0, and a courier
+        // with no quote must not become "delivers today".
+        const raw = entry?.estimated_delivery_days;
+        const days = raw === null || raw === undefined || raw === "" ? Number.NaN : Number(raw);
+        return { id: Number(entry?.courier_company_id), days };
+      })
+      .filter((entry) => Number.isInteger(entry.days) && entry.days > 0 && entry.days <= 30);
+    if (quotes.length === 0) return { ok: false, reason: "no_usable_estimate" };
+
+    const days = quotes.map((entry) => entry.days);
+    const recommendedId = Number(payload?.recommended_courier_company_id);
+    const recommended = quotes.find((entry) => entry.id === recommendedId);
+    return {
+      ok: true,
+      fastestDays: Math.min(...days),
+      expectedDays: recommended ? recommended.days : Math.max(...days),
+    };
+  } catch (error) {
+    return { ok: false, reason: error?.message || "request_failed" };
+  }
+};
+
+/**
  * Can this pincode take a Cash-on-Delivery parcel?
  *
  * Deliberately TRI-STATE. "No courier will carry COD here" and "we could not ask"

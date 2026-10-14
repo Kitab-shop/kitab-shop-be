@@ -34,6 +34,7 @@ const suites = [
   "refund-confirmation.regression.mjs",
   "inventory-reporting.regression.mjs",
   "cod-serviceability.regression.mjs",
+  "delivery-estimate-cod.regression.mjs",
   "shipping-capabilities.regression.mjs",
   "shipping-utilities.regression.mjs",
   "courier-recovery.regression.mjs",

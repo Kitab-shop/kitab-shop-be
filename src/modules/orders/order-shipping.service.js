@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import OrderModel from "./Order.model.js";
+import CheckoutSetting from "./CheckoutSetting.model.js";
 import { getFeatures } from "../../config/features.config.js";
 import {
   assignAwb,
@@ -234,6 +235,51 @@ export const evaluateCodPincodeRestriction = async ({
     message:
       "Cash on Delivery is not available for this delivery address. Please choose another payment method.",
   };
+};
+
+const COD_HINT_TTL_MS = 30 * 60 * 1000;
+const COD_HINT_MAX_ENTRIES = 5000;
+const codHintCache = new Map();
+
+/** Test hook: drop every remembered answer. */
+export const clearCodAvailabilityHintCache = () => codHintCache.clear();
+
+/**
+ * "Will checkout accept COD to this PIN?" — for the product page's delivery box.
+ *
+ * Predicts evaluateCodPincodeRestriction rather than replacing it: same settings, same
+ * carrier call. Two deliberate differences, both because this is a hint and not a gate:
+ *
+ *   - FAILS OPEN to `null` (say nothing). The gate refuses when Shiprocket cannot be
+ *     asked; the product page must not tell a customer COD is unavailable on the strength
+ *     of an outage. Checkout still makes the real decision.
+ *   - CACHED per pincode for a short while. The endpoint is public and anonymous, so
+ *     every check reaching Shiprocket would let anyone spend the store's API quota.
+ *     Only definite answers are cached, never an unverified one.
+ *
+ * @returns {Promise<boolean|null>} true/false only when checkout would enforce it;
+ *   null when COD is off store-wide, the restriction is off, or the answer is unknown.
+ */
+export const getCodAvailabilityHint = async (pincode) => {
+  const normalized = String(pincode ?? "").trim();
+  if (!INDIAN_PINCODE_REGEX.test(normalized)) return null;
+
+  const settings = await CheckoutSetting.getSettings();
+  // COD off everywhere is said at checkout; a per-PIN message would add nothing. With the
+  // restriction off, checkout accepts COD to any PIN, so "unavailable" would be untrue.
+  if (!settings?.codEnabled || !settings?.codServiceabilityCheckEnabled) return null;
+
+  const cached = codHintCache.get(normalized);
+  if (cached && cached.expiresAt > Date.now()) return cached.available;
+
+  const result = await checkCodServiceability({ deliveryPostcode: normalized });
+  if (result.unverified) return null;
+
+  if (codHintCache.size >= COD_HINT_MAX_ENTRIES) {
+    codHintCache.delete(codHintCache.keys().next().value);
+  }
+  codHintCache.set(normalized, { available: result.serviceable, expiresAt: Date.now() + COD_HINT_TTL_MS });
+  return result.serviceable;
 };
 
 /**
