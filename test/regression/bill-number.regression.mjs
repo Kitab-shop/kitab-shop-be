@@ -432,7 +432,9 @@ try {
   ok("the PDF reads the bill number", /order\?\.bill\?\.number/.test(pdf));
   ok("the PDF titles a numbered document BILL OF SUPPLY", /BILL OF SUPPLY/.test(pdf));
   ok("the PDF still renders an unnumbered order", /"INVOICE"/.test(pdf));
-  ok("the PDF prints a delivery row", /label: "Delivery"/.test(pdf));
+  // The label may carry the carrier ("Delivery (Delhivery)"), so match the plain fallback
+  // anywhere in the label expression rather than only as a literal.
+  ok("the PDF prints a delivery row", /label:[\s\S]{0,160}"Delivery"/.test(pdf));
   ok("the PDF reconciles with an Adjustment row", /label: "Adjustment"/.test(pdf));
 
   const sidebar = await readFile(
@@ -441,7 +443,11 @@ try {
   );
   ok("the on-screen summary no longer hardcodes free shipping", !/>Free<\/span>\s*<\/div>\s*\{order\.coupon/.test(sidebar));
   ok("the on-screen summary reads shippingCharge", /shippingCharge/.test(sidebar));
-  ok("the on-screen summary reads subtotal, not total", /Subtotal<\/span><span>₹\{subtotal/.test(sidebar));
+  // Markup-agnostic: the Subtotal label must be followed by the subtotal value, not total.
+  ok(
+    "the on-screen summary reads subtotal, not total",
+    /Subtotal<\/(?:span|dt)>\s*<(?:span|dd)[^>]*>(?:₹\{|\{inr\()subtotal\b/.test(sidebar),
+  );
 } catch (error) {
   console.error(error);
   ok("suite ran to completion", false, error.message);

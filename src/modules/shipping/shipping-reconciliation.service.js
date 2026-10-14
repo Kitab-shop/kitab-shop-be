@@ -4,6 +4,7 @@ import ShiprocketSetting from "./ShiprocketSetting.model.js";
 import { EXCLUDE_AWAITING_PAYMENT } from "../orders/order-visibility.js";
 import {
   SHIPMENT_CANCELLATION_PENDING,
+  autoAssignForwardAwb,
   cancelShipmentForCancelledOrder,
   createForwardShipment,
 } from "../orders/order-shipping.service.js";
@@ -259,6 +260,12 @@ const reconcileAutoPush = async ({ now, settings, summary, scope }) => {
     const result = await createForwardShipment(order._id, { source: "reconciler" });
     if (result.outcome === "created" || result.outcome === "already_created") {
       summary.autoPush.created += 1;
+      // A retried push finishes the same way a first-time one does. Only on "created":
+      // "already_created" means another caller made it, and that caller assigns. Awaited
+      // here — no customer is waiting on this pass. Never throws; checks autoAwb itself.
+      if (result.outcome === "created") {
+        await autoAssignForwardAwb(order._id, { source: "reconciler" });
+      }
       continue;
     }
     if (result.outcome === "failed") {

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import OrderModel from "./Order.model.js";
 import { getFeatures } from "../../config/features.config.js";
 import {
+  assignAwb,
   cancelShiprocketOrder,
   checkCodServiceability,
   computeShipmentLines,
@@ -14,6 +15,7 @@ import {
 import { logLifecycleEvent, logLifecycleError } from "../../utils/lifecycle-logger.service.js";
 import { INDIAN_PINCODE_REGEX } from "../../config/india-geo.config.js";
 import { EXCLUDE_AWAITING_PAYMENT, isAwaitingPayment } from "./order-visibility.js";
+import { isFulfillableStatus } from "./order-status.rules.js";
 
 /**
  * A shipment that our records say should be cancelled but Shiprocket has not
@@ -759,6 +761,212 @@ export const acknowledgeAmountMismatch = async (orderId, actorId) => {
   return { outcome: "not_mismatch", order: current };
 };
 
+const readAwbData = (response) => response?.response?.data || response?.data || response || {};
+
+/**
+ * Assigns (or reassigns) the AWB for an order's forward shipment. Shared by the admin's
+ * Assign AWB button and the automatic assignment after an auto-push, so both are held
+ * to the same COD amount gate and the same reassignment and identity rules.
+ *
+ * The caller has already decided the order may ship (status, capabilities). Throws only
+ * when the Shiprocket request itself fails; otherwise returns one of:
+ *   { outcome: "assigned", order, response, awbCode, courierName, isReassignment, previousAwb }
+ *   { outcome: "no_shipment", statusCode: 409, message }
+ *   { outcome: "cod_mismatch", statusCode: 409, code: "COD_AMOUNT_MISMATCH", message, expected, reported }
+ *   { outcome: "reassign_no_change", statusCode: 409, message }
+ *   { outcome: "awb_conflict", statusCode: 409, message }
+ *   { outcome: "awb_not_issued", statusCode: 502, message }
+ */
+export const assignOrderAwb = async (order, { courierId = null, source = "admin" } = {}) => {
+  if (!order.shiprocket?.shipmentId) {
+    return { outcome: "no_shipment", statusCode: 409, message: "Create the Shiprocket order first" };
+  }
+  // An AWB is the point of no return for a COD amount: once a courier is assigned,
+  // the parcel is collected and the courier asks the customer for whatever
+  // Shiprocket holds. A definite mismatch is therefore held here until a person has
+  // looked at it. `unverified` (the total could not be read) does not block.
+  const amountCheck = order.shiprocket?.amountCheck;
+  if (order.paymentMethod === "COD" && amountCheck?.status === "mismatch" && !amountCheck.acknowledgedAt) {
+    return {
+      outcome: "cod_mismatch",
+      statusCode: 409,
+      code: "COD_AMOUNT_MISMATCH",
+      message: `Shiprocket has ₹${amountCheck.reported} recorded for this COD order, but ₹${amountCheck.expected} should be collected. Correct the amount in Shiprocket, then acknowledge the mismatch on this order before assigning an AWB.`,
+      expected: amountCheck.expected,
+      reported: amountCheck.reported,
+    };
+  }
+
+  // Reassignment is the same call, but it must be held to a stricter standard than a
+  // first assignment: the order already HAS a working AWB, so a response that does not
+  // carry a new one must not be reported as success. The `||` fallbacks below are
+  // correct for a first assignment (nothing to lose) and were quietly wrong for a
+  // reassign — they left the old AWB in place while answering "AWB assigned", so the
+  // admin believed the courier had changed and the parcel was still with the old one.
+  const previousAwb = String(order.shiprocket?.awbCode || "").trim();
+  const isReassignment = Boolean(previousAwb);
+
+  const response = await assignAwb(order.shiprocket.shipmentId, courierId);
+  const data = readAwbData(response);
+  const newAwb = String(data.awb_code || "").trim();
+
+  if (isReassignment && (!newAwb || newAwb === previousAwb)) {
+    logLifecycleEvent("shipping", "shiprocket_awb_reassign_no_change", {
+      orderId: order._id,
+      previousAwb,
+      requestedCourierId: courierId ?? null,
+    });
+    return {
+      outcome: "reassign_no_change",
+      statusCode: 409,
+      message:
+        "Shiprocket did not issue a new AWB, so the courier has not changed. The parcel is still with the original courier.",
+    };
+  }
+  // A first assignment that comes back without an AWB did not happen either. Shiprocket
+  // can answer 200 with `awb_assign_status: 0` and the reason (low wallet balance, no
+  // courier for the PIN code) in `awb_assign_error`; recording that as "awb_assigned"
+  // would leave an order that claims a courier it does not have.
+  if (!isReassignment && !newAwb) {
+    const reason = String(data.awb_assign_error || response?.message || "").trim();
+    logLifecycleEvent("shipping", "shiprocket_awb_not_issued", { orderId: order._id, source, reason });
+    return {
+      outcome: "awb_not_issued",
+      statusCode: 502,
+      message: reason
+        ? `Shiprocket did not assign an AWB: ${reason}`
+        : "Shiprocket did not assign an AWB for this shipment.",
+    };
+  }
+
+  const awbCode = newAwb || order.shiprocket.awbCode;
+  const assignedCourierId = Number(data.courier_company_id || data.courier_id) || order.shiprocket.courierId;
+  const courierName = data.courier_name || order.shiprocket.courierName;
+  // Named paths only, in one update — not a save() of the document loaded before the
+  // Shiprocket round trip, which could carry stale values for fields a webhook wrote
+  // meanwhile. A pipeline so the provider-neutral mirror's status is copied from the
+  // order's status as it is NOW. This is the point at which a Shiprocket parcel
+  // actually acquires a tracking number, so it is the point the mirror becomes
+  // meaningful.
+  const set = {
+    "shiprocket.awbCode": awbCode,
+    "shiprocket.courierId": assignedCourierId,
+    "shiprocket.courierName": courierName,
+    "shiprocket.syncStatus": "awb_assigned",
+    "shiprocket.lastError": null,
+    "shiprocket.lastSyncedAt": new Date(),
+    ...buildShipmentMirrorSet({ provider: "SHIPROCKET", carrierName: courierName, trackingNumber: awbCode }),
+  };
+  let saved;
+  try {
+    saved = await OrderModel.findOneAndUpdate(
+      { _id: order._id },
+      [
+        {
+          $set: {
+            ...Object.fromEntries(Object.entries(set).map(([path, value]) => [path, { $literal: value }])),
+            ...SHIPMENT_STATUS_FROM_ORDER,
+          },
+        },
+      ],
+      { returnDocument: "after", updatePipeline: true },
+    );
+  } catch (error) {
+    // E11000 means this AWB already belongs to a DIFFERENT order — the unique partial
+    // index from H2-01 refusing an identity collision. Without this it surfaced as a
+    // raw 500 and the admin had no idea the assignment had been rejected rather than
+    // failed. Refuse loudly; the order keeps its previous AWB untouched.
+    if (error?.code === 11000) {
+      logLifecycleError("shipping", "shiprocket_awb_identity_conflict", error, {
+        orderId: order._id,
+        previousAwb,
+        conflictingAwb: newAwb,
+      });
+      return {
+        outcome: "awb_conflict",
+        statusCode: 409,
+        message: `AWB ${newAwb} is already recorded against another order. This order still has its previous AWB.`,
+      };
+    }
+    throw error;
+  }
+
+  if (isReassignment) {
+    logLifecycleEvent("shipping", "shiprocket_awb_reassigned", {
+      orderId: order._id,
+      previousAwb,
+      newAwb: awbCode,
+      courierName,
+    });
+  } else {
+    logLifecycleEvent("shipping", "shiprocket_awb_assigned", { orderId: order._id, awbCode, courierName, source });
+  }
+
+  return {
+    outcome: "assigned",
+    order: saved || order,
+    response,
+    awbCode,
+    courierName,
+    isReassignment,
+    previousAwb: isReassignment ? previousAwb : null,
+  };
+};
+
+/**
+ * Assigns the AWB of a shipment that was just created automatically, when the admin has
+ * opted in (`autoAwb`). The courier is whichever Shiprocket picks for the account — its
+ * courier priority settings decide, exactly as when the admin clicks Assign AWB without
+ * choosing one.
+ *
+ * Never throws. A refusal or failure leaves the order exactly where an un-automated one
+ * would be — created, no AWB — with the reason in `shiprocket.lastError` on the order
+ * page, so the admin assigns it by hand. It is not retried here: the usual causes (an
+ * empty Shiprocket wallet, no courier serving the PIN code, a COD amount mismatch) need
+ * a person, and a retry loop would only repeat them.
+ */
+export const autoAssignForwardAwb = async (orderId, { source = "auto_push" } = {}) => {
+  const context = { orderId, source };
+  try {
+    const capabilities = await getShippingCapabilities();
+    if (!capabilities.autoAwb || !capabilities.configured) return { outcome: "disabled" };
+
+    const order = await OrderModel.findById(orderId);
+    // Already has one (an admin got there first), or no longer meant to ship (cancelled
+    // while the shipment was being created — that path cancels the shipment itself).
+    if (!order || order.shiprocket?.awbCode || !isFulfillableStatus(order.orderStatus)) {
+      return { outcome: "skipped" };
+    }
+
+    const result = await assignOrderAwb(order, { source });
+    if (result.outcome === "assigned") return result;
+
+    await recordAutoAwbFailure(orderId, result.message);
+    logLifecycleEvent("shipping", "shiprocket_auto_awb_skipped", {
+      ...context,
+      outcome: result.outcome,
+      code: result.code ?? null,
+    });
+    return result;
+  } catch (error) {
+    await recordAutoAwbFailure(orderId, error?.message);
+    logLifecycleError("shipping", "shiprocket_auto_awb_failed", error, context);
+    return { outcome: "failed", error };
+  }
+};
+
+/** Filtered on "still no AWB", so it never overwrites a manual assignment made since. */
+const recordAutoAwbFailure = (orderId, reason) =>
+  OrderModel.updateOne(
+    { _id: orderId, "shiprocket.awbCode": { $in: [null, ""] } },
+    {
+      $set: {
+        "shiprocket.lastError": `Automatic AWB assignment did not go through: ${reason || "unknown error"}. Assign the AWB from this order page.`,
+        "shiprocket.lastSyncedAt": new Date(),
+      },
+    },
+  ).catch(() => {});
+
 export const syncOrderToShiprocketIfEnabled = async (order) => {
   // One capability call instead of three separate reads: `autoPush` already folds in
   // the env ceiling, the admin's "use Shiprocket for shipments" choice and the
@@ -777,7 +985,13 @@ export const syncOrderToShiprocketIfEnabled = async (order) => {
         outcome: result.outcome,
         code: result.code ?? null,
       });
+      return;
     }
+    // Only the caller that actually created the shipment assigns its AWB, so the verify
+    // path and the webhook arriving together still book one courier. Not awaited: this
+    // runs inside the customer's checkout request, and courier selection can take
+    // seconds they should not spend looking at a spinner. It never throws.
+    if (capabilities.autoAwb) void autoAssignForwardAwb(order?._id, { source: "auto_push" });
   } catch (error) {
     logLifecycleError("shipping", "shiprocket_sync_failed", error, { orderId: order?._id });
   }

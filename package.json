@@ -69,7 +69,8 @@
     "test:courier-event-pipeline": "node test/regression/courier-event-pipeline.regression.mjs",
     "test:shipping-reconciliation": "node test/regression/shipping-reconciliation.regression.mjs",
     "test:customer-shipping-endpoints": "node test/regression/customer-shipping-endpoints.regression.mjs",
-    "test:reverse-awb": "node test/regression/reverse-awb.regression.mjs"
+    "test:reverse-awb": "node test/regression/reverse-awb.regression.mjs",
+    "test:auto-awb": "node test/regression/auto-awb.regression.mjs"
   },
   "keywords": [],
   "author": "",

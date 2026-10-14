@@ -27,6 +27,8 @@ const presentSettings = (settings) => ({
   // the UI can show a switch as ON-but-blocked instead of silently flipping it off.
   shipmentsEnabled: settings.shipmentsEnabled !== false,
   autoPushEnabled: settings.autoPushEnabled !== false,
+  // `=== true`, matching the resolver: absent means never opted in.
+  autoAwbEnabled: settings.autoAwbEnabled === true,
   deliveryWebhookEnabled: settings.deliveryWebhookEnabled !== false,
   // `=== true`, matching the resolver: absent means never opted in, not enabled.
   reverseShipmentsEnabled: settings.reverseShipmentsEnabled === true,
@@ -58,6 +60,8 @@ const presentStatus = async () => {
     envCeiling: {
       shipments: isShippingEnabled(),
       autoPush: isShippingEnabled() && Boolean(shipping.autoCreateOrder),
+      // No env flag of its own — it inherits the auto-push ceiling.
+      autoAwb: isShippingEnabled() && Boolean(shipping.autoCreateOrder),
       deliveryWebhook: isShippingEnabled() && Boolean(shipping.webhookEnabled),
       // No env flag of its own — it inherits the shipments ceiling, so the panel is the
       // only place it is decided.
@@ -89,6 +93,7 @@ const NUMBER_FIELDS = ["defaultLengthCm", "defaultBreadthCm", "defaultHeightCm",
 const CAPABILITY_FIELDS = [
   "shipmentsEnabled",
   "autoPushEnabled",
+  "autoAwbEnabled",
   "deliveryWebhookEnabled",
   "reverseShipmentsEnabled",
 ];

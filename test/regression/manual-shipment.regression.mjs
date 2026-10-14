@@ -598,7 +598,8 @@ try {
     ok("the panel is no longer gated on a Shiprocket AWB",
       !/\{order\.shiprocket\?\.awbCode\s*&&\s*\(/.test(timeline));
     ok("Shiprocket's own sync fields are shown only for Shiprocket parcels",
-      /isShiprocket\s*&&/.test(timeline));
+      // `isShiprocket && …` or `isShiprocket ? (live scans) : (track on the carrier's site)`.
+      /isShiprocket\s*(?:&&|\?)/.test(timeline));
 
     const adminDetail = await read("../../../kitab-shop-fe/src/pages/admin/AdminOrderDetail.jsx");
     ok("the admin screen has a provider-neutral Shipment card", /title="Shipment"/.test(adminDetail));

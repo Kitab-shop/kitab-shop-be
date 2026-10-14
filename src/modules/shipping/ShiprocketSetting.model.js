@@ -28,6 +28,13 @@ const shiprocketSettingSchema = new mongoose.Schema(
     // Create the Shiprocket shipment automatically once an order is confirmed, rather
     // than waiting for an admin to click Create Shipment.
     autoPushEnabled: { type: Boolean, default: true },
+    // Once an auto-pushed shipment is created, also assign its AWB (courier) straight
+    // away, so the customer has a tracking number without waiting for an admin click.
+    //
+    // Defaults to FALSE for the same reason as reverseShipmentsEnabled: assigning an AWB
+    // books a courier and Shiprocket deducts the freight from the wallet at that moment,
+    // so an existing deployment must not start doing it on deploy.
+    autoAwbEnabled: { type: Boolean, default: false },
     // Accept Shiprocket's status webhook. This is what advances orders to
     // Shipped/Delivered/RTO on its own and, for COD, records cash collection.
     deliveryWebhookEnabled: { type: Boolean, default: true },

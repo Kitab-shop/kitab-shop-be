@@ -53,6 +53,7 @@ const suites = [
   "late-capture-cancelled.regression.mjs",
   "rto-refund-settlement.regression.mjs",
   "cod-amount-guard.regression.mjs",
+  "auto-awb.regression.mjs",
   "shipment-create-idempotency.regression.mjs",
   "return-booking-claims.regression.mjs",
   "order-status-cas.regression.mjs",

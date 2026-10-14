@@ -294,7 +294,10 @@ try {
   ok(
     "customer referral stats return the referred user's unused signup discount coupon",
     (await readFile("src/modules/profiles/profile.controller.js", "utf8")).includes("signupDiscountCoupon") &&
-      (await readFile("../kitab-shop-fe/src/pages/Referral.jsx", "utf8")).includes("Copy Coupon"),
+      // The page shows the code and offers to copy it. Case-insensitive: the button's
+      // wording follows the storefront's sentence-case style, which is not the feature.
+      /signupDiscountCoupon\.couponId/.test(await readFile("../kitab-shop-fe/src/pages/Referral.jsx", "utf8")) &&
+      /copy coupon/i.test(await readFile("../kitab-shop-fe/src/pages/Referral.jsx", "utf8")),
   );
   ok(
     "the customer Refer & Earn page uses backend settings rather than only hard-coded constants",

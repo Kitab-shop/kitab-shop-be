@@ -950,31 +950,52 @@ try {
       `no colour for: ${uncoloured.join(", ")}`,
     );
 
-    // And the two list screens must render from that shared model rather than a private copy,
-    // because a private copy is exactly how one screen fell behind the other.
-    for (const [label, path] of [
-      ["admin orders list", "../../../kitab-shop-fe/src/pages/admin/AdminOrders.jsx"],
-      ["customer My Orders list", "../../../kitab-shop-fe/src/pages/Orders.jsx"],
-    ]) {
-      const source = await readFile(new URL(path, import.meta.url), "utf8");
-      ok(
-        `the ${label} takes its badge colours from the shared model`,
-        source.includes("ORDER_STATUS_BADGE") && !/^const statusColor = \{/m.test(source),
-        "it declares its own status colour map again",
-      );
-    }
-
-    // The customer list must walk the same steps as the customer DETAIL page.
+    // And the two list screens must render from a shared model rather than a private copy,
+    // because a private copy is exactly how one screen fell behind the other. The admin list
+    // uses ORDER_STATUS_BADGE; the customer list uses the storefront's StatusPill, whose
+    // tones live in statusTones.js — either is shared, a local map is not.
+    const adminList = await readFile(
+      new URL("../../../kitab-shop-fe/src/pages/admin/AdminOrders.jsx", import.meta.url),
+      "utf8",
+    );
+    ok(
+      "the admin orders list takes its badge colours from the shared model",
+      adminList.includes("ORDER_STATUS_BADGE") && !/^const statusColor = \{/m.test(adminList),
+      "it declares its own status colour map again",
+    );
     const ordersList = await readFile(
       new URL("../../../kitab-shop-fe/src/pages/Orders.jsx", import.meta.url),
       "utf8",
     );
     ok(
-      "the My Orders timeline uses the shared STEPS/ISSUE_STEPS, not a local 3-step list",
-      ordersList.includes("ISSUE_STATUS_KEYS") &&
-        ordersList.includes("orderDetail.helpers") &&
-        !/^const STEPS = \[/m.test(ordersList),
-      "Orders.jsx still defines its own STEPS",
+      "the customer My Orders list takes its status badge from the shared StatusPill",
+      /<StatusPill kind="order" status=\{o\.status\}/.test(ordersList) &&
+        !/^const statusColor = \{/m.test(ordersList),
+      "it declares its own status colour map again",
+    );
+    // Same invariant as the admin map: every status the backend can store has a customer
+    // tone and label, or the pill falls back to a grey raw enum value.
+    const tones = await readFile(
+      new URL("../../../kitab-shop-fe/src/components/ui/statusTones.js", import.meta.url),
+      "utf8",
+    );
+    const toneStart = tones.indexOf("const ORDER = {");
+    const toneBlock = tones.slice(toneStart, tones.indexOf("\n};", toneStart));
+    const untoned = ORDER_STATUSES.filter(
+      (status) => !toneBlock.includes(`"${status}":`) && !toneBlock.includes(`${status}:`),
+    );
+    ok(
+      "every backend order status has a customer status tone",
+      toneStart >= 0 && untoned.length === 0,
+      `no tone for: ${untoned.join(", ")}`,
+    );
+
+    // The list no longer draws a progress timeline (that lives on the detail page, from
+    // STEPS/ISSUE_STEPS). It must not grow a private one again.
+    ok(
+      "My Orders does not define its own timeline steps",
+      !/^const (?:STEPS|ISSUE_STEPS) = \[/m.test(ordersList),
+      "Orders.jsx defines its own STEPS",
     );
 
     const helpers = await readFile(

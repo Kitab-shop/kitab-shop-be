@@ -158,7 +158,7 @@ export const isShiprocketConfigured = async () => {
  * `configured` is separate on purpose: credentials are a readiness fact, not a choice,
  * and callers report those two failures differently.
  *
- * @returns {Promise<{permitted: boolean, configured: boolean, shipments: boolean, autoPush: boolean, deliveryWebhook: boolean}>}
+ * @returns {Promise<{permitted: boolean, configured: boolean, shipments: boolean, autoPush: boolean, autoAwb: boolean, deliveryWebhook: boolean, reverseShipments: boolean}>}
  */
 export const getShippingCapabilities = async () => {
   const permitted = isShippingEnabled();
@@ -171,13 +171,18 @@ export const getShippingCapabilities = async () => {
   const chosen = (value) => value !== false;
 
   const shipments = permitted && chosen(settings.shipmentsEnabled);
+  // Both nested under shipments: auto-pushing or receiving status for shipments the
+  // store does not create through Shiprocket is meaningless.
+  const autoPush = shipments && shipping.autoCreateOrder && chosen(settings.autoPushEnabled);
   return {
     permitted,
     configured: await isShiprocketConfigured(),
     shipments,
-    // Both nested under shipments: auto-pushing or receiving status for shipments the
-    // store does not create through Shiprocket is meaningless.
-    autoPush: shipments && shipping.autoCreateOrder && chosen(settings.autoPushEnabled),
+    autoPush,
+    // Nested under autoPush: it is the second half of the automatic push. `=== true` like
+    // reverseShipments — a document written before the field existed never opted in to
+    // booking couriers (and spending wallet balance) without a click.
+    autoAwb: autoPush && settings.autoAwbEnabled === true,
     deliveryWebhook: shipments && shipping.webhookEnabled && chosen(settings.deliveryWebhookEnabled),
     // `=== true`, NOT `chosen()`. The others treat a missing field as enabled so existing
     // deployments are unchanged; this one must treat missing as DISABLED, because a
