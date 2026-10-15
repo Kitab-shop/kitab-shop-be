@@ -511,6 +511,64 @@ section("the free delivery amount is validated");
   CheckoutSetting.getSettings = stubbed;
 }
 
+section("how delivery appears on the bill is a validated, public setting");
+
+{
+  const { GetCheckoutSettings, UpdateCheckoutSettings } = await import(
+    "../../src/modules/orders/checkout-settings.controller.js"
+  );
+  // An existing singleton saved before the field existed has no value for it.
+  const saved = { ...checkout };
+  delete saved.invoiceDeliveryDisplay;
+  const stubbed = CheckoutSetting.getSettings;
+  CheckoutSetting.getSettings = async () => {
+    const doc = { ...saved };
+    doc.save = async () => {
+      saved.invoiceDeliveryDisplay = doc.invoiceDeliveryDisplay;
+      return doc;
+    };
+    return doc;
+  };
+  const call = async (handler, body = {}) => {
+    let statusCode = 200;
+    let payload;
+    const res = {
+      status(code) { statusCode = code; return this; },
+      json(data) { payload = data; return this; },
+    };
+    await handler({ body, params: {}, query: {} }, res);
+    return { statusCode, body: payload };
+  };
+
+  const legacy = await call(GetCheckoutSettings);
+  ok(
+    "a store that never chose reads as \"always\" (unchanged bills)",
+    legacy.body?.settings?.invoiceDeliveryDisplay === "always",
+    JSON.stringify(legacy.body?.settings),
+  );
+
+  for (const junk of ["hidden", "", null, 1, true]) {
+    const result = await call(UpdateCheckoutSettings, { invoiceDeliveryDisplay: junk });
+    ok(`${JSON.stringify(junk)} is refused`, result.statusCode === 400, `status=${result.statusCode}`);
+  }
+  ok("… and nothing was saved", saved.invoiceDeliveryDisplay === undefined, `saved=${saved.invoiceDeliveryDisplay}`);
+
+  for (const mode of ["when_charged", "merged", "always"]) {
+    const result = await call(UpdateCheckoutSettings, { invoiceDeliveryDisplay: mode });
+    ok(`"${mode}" is saved`, result.statusCode === 200 && saved.invoiceDeliveryDisplay === mode, `saved=${saved.invoiceDeliveryDisplay}`);
+  }
+
+  await call(UpdateCheckoutSettings, { invoiceDeliveryDisplay: "merged" });
+  const publicView = await call(GetCheckoutSettings);
+  ok(
+    "the storefront can read it",
+    publicView.body?.settings?.invoiceDeliveryDisplay === "merged",
+    JSON.stringify(publicView.body?.settings),
+  );
+
+  CheckoutSetting.getSettings = stubbed;
+}
+
 // ================================================================ GUARD
 
 section("pricing refuses to redeem a coupon");

@@ -62,6 +62,21 @@ const checkoutSettingSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    // How the delivery charge appears on the store's own bill (the PDF customers and admins
+    // download). Presentation only — what the customer is charged never changes, and the bill's
+    // rows always still sum to the amount paid:
+    //   "always"       a Delivery row on every bill, "Free" when nothing was charged (default,
+    //                  the behaviour before this setting existed)
+    //   "when_charged" the row only when delivery cost something
+    //   "merged"       no separate row; a charged delivery is folded into the subtotal, which is
+    //                  then labelled as including delivery
+    // Shiprocket's own invoice is not affected: it is printed from the shipment's
+    // shipping_charges, which must stay separate so the COD amount the courier collects is right.
+    invoiceDeliveryDisplay: {
+      type: String,
+      enum: ["always", "when_charged", "merged"],
+      default: "always",
+    },
     singletonId: {
       type: String,
       default: "default",

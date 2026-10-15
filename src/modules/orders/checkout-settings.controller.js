@@ -9,7 +9,10 @@ const presentSettings = (settings) => ({
   codMinOrderAmount: settings.codMinOrderAmount,
   codMaxOrderAmount: settings.codMaxOrderAmount,
   cancellationWindowHours: settings.cancellationWindowHours,
+  invoiceDeliveryDisplay: settings.invoiceDeliveryDisplay || "always",
 });
+
+const INVOICE_DELIVERY_DISPLAYS = ["always", "when_charged", "merged"];
 
 // Public: the storefront checkout page needs this before login to know
 // which payment methods to offer at all.
@@ -102,6 +105,16 @@ export const UpdateCheckoutSettings = async (req, res) => {
         });
       }
       settings.cancellationWindowHours = nextWindow;
+    }
+
+    if (body.invoiceDeliveryDisplay !== undefined) {
+      if (!INVOICE_DELIVERY_DISPLAYS.includes(body.invoiceDeliveryDisplay)) {
+        return res.status(400).json({
+          success: false,
+          message: `Delivery on the bill must be one of: ${INVOICE_DELIVERY_DISPLAYS.join(", ")}.`,
+        });
+      }
+      settings.invoiceDeliveryDisplay = body.invoiceDeliveryDisplay;
     }
 
     await settings.save();
