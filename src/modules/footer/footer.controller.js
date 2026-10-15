@@ -44,8 +44,8 @@ const defaultFooterSettings = {
   contact: {
     phone: "+91 98XXX XXXXX",
     email: "support@rivermossbooks.com",
-    address: "Rivermoss Books\nIDPL, Rishikesh,\nUttarakhand 249201",
-    mapUrl: "https://www.google.com/maps/search/?api=1&query=IDPL+Rishikesh+Uttarakhand",
+    address: "Rivermoss Books\n143, 3rd Floor, Hari Nagar Ashram,\nNear Khatu Shyam Mandir,\nNew Delhi 110014",
+    mapUrl: "https://www.google.com/maps/search/?api=1&query=Hari+Nagar+Ashram+New+Delhi+110014",
   },
   newsletterEnabled: true,
 };

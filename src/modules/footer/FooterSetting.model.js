@@ -100,12 +100,12 @@ const FooterSettingSchema = new mongoose.Schema(
       },
       address: {
         type: String,
-        default: "Rivermoss Books\nIDPL, Rishikesh,\nUttarakhand 249201",
+        default: "Rivermoss Books\n143, 3rd Floor, Hari Nagar Ashram,\nNear Khatu Shyam Mandir,\nNew Delhi 110014",
         trim: true,
       },
       mapUrl: {
         type: String,
-        default: "https://www.google.com/maps/search/?api=1&query=IDPL+Rishikesh+Uttarakhand",
+        default: "https://www.google.com/maps/search/?api=1&query=Hari+Nagar+Ashram+New+Delhi+110014",
         trim: true,
       },
     },
