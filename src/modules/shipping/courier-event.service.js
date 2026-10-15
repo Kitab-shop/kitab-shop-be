@@ -6,6 +6,8 @@ import { notifyShipmentUpdated } from "../notifications/notification.service.js"
 import { ensureBillNumber } from "../orders/bill-number.service.js";
 import { resolveCourierPath } from "../orders/order-status.rules.js";
 import { recordRtoRefundObligation } from "../payments/return-refund.service.js";
+import { releaseRtoOrderCredits } from "../orders/rto-compensation.service.js";
+import { markReplacementDelivered, markReturnReceived } from "../returns/return-lifecycle.service.js";
 import {
   COURIER_CANCELLED_CODES,
   SHIPMENT_EXCEPTIONS,
@@ -127,10 +129,19 @@ export const resolveWebhookReturn = async (awbCode) => {
 };
 
 /**
- * Records where a return's parcel has got to. Deliberately does NOT change return status.
+ * Records where a return's parcel has got to, and advances the return on delivery.
  *
- * A parcel arriving at the warehouse is not the same event as someone having opened and
- * inspected it, and `received` is the QC step that gates refunds and restocking.
+ * Every event updates the leg's courier status. A "Delivered" event also moves the
+ * return, through the same compare-and-swaps the admin endpoints use
+ * (return-lifecycle.service.js):
+ *   - pickup leg:      pickup_scheduled → received
+ *   - replacement leg: replacement_dispatched → replacement_delivered
+ * Waiting for an operator to notice used to leave returns parked at pickup_scheduled
+ * with the parcel already on the shelf. "received" decides nothing by itself — the QC
+ * disposition, the refund and any restock are still recorded by an operator. A replay
+ * finds the transition already taken and changes nothing.
+ *
+ * @returns {Promise<{advanced: boolean}>}
  */
 export const recordReturnCourierEvent = async ({ returnId, leg, currentStatus, mappedStatus, awbCode }) => {
   const now = new Date();
@@ -149,13 +160,29 @@ export const recordReturnCourierEvent = async ({ returnId, leg, currentStatus, m
   );
   if (!claimed) await ReturnModel.updateOne({ _id: returnId }, { $set: update });
 
+  let advanced = false;
+  if (mappedStatus === "Delivered") {
+    const note = `Courier reported delivered (AWB ${awbCode || "unknown"})`;
+    try {
+      const moved =
+        leg === "pickup"
+          ? await markReturnReceived({ returnId, note })
+          : await markReplacementDelivered({ returnId, note });
+      advanced = Boolean(moved);
+    } catch (error) {
+      // The courier status is recorded either way; an operator can still make the move.
+      logLifecycleError("shipping", "return_courier_transition_failed", error, { returnId, leg, awbCode });
+    }
+  }
+
   logLifecycleEvent("shipping", "return_courier_event_recorded", {
     returnId,
     leg,
     awbCode,
     courierStatus: currentStatus || mappedStatus || null,
-    statusUnchanged: true,
+    statusUnchanged: !advanced,
   });
+  return { advanced };
 };
 
 /**
@@ -213,14 +240,14 @@ export const applyCourierEvent = async (event, { source = "webhook" } = {}) => {
   if (!resolution.orderId) {
     const returnResolution = await resolveWebhookReturn(awbCode);
     if (returnResolution.returnId) {
-      await recordReturnCourierEvent({
+      const { advanced } = await recordReturnCourierEvent({
         returnId: returnResolution.returnId,
         leg: returnResolution.leg,
         currentStatus,
         mappedStatus: mapOrderStatus(statusCode, currentStatus),
         awbCode,
       });
-      return { scope: "return", leg: returnResolution.leg, statusUnchanged: true };
+      return { scope: "return", leg: returnResolution.leg, statusUnchanged: !advanced };
     }
     if (
       returnResolution.reason?.startsWith("ambiguous_") ||
@@ -346,6 +373,10 @@ export const applyCourierEvent = async (event, { source = "webhook" } = {}) => {
         set["shiprocket.syncStatus"] = "rto";
       } else if (mappedStatus === "NDR") {
         set["shiprocket.syncStatus"] = "ndr";
+      } else if (existing.shiprocket?.syncStatus === "ndr") {
+        // Leaving NDR (a re-attempt went Out For Delivery, or it was delivered): the
+        // shipment is no longer an exception, so it stops showing as one.
+        set["shiprocket.syncStatus"] = "awb_assigned";
       }
       // First Delivered wins: re-stamping on a replay silently re-opened an expired
       // return window.
@@ -448,6 +479,11 @@ const runSideEffects = async ({ order, existing, mappedStatus, applyStatus, stat
   if (order.orderStatus === "RTO Received" && (applyStatus || isRtoReceived(statusCode, currentStatus))) {
     await recordRtoRefundObligation(order).catch((error) =>
       logLifecycleError("shipping", "rto_refund_obligation_failed", error, { orderId: String(order._id) }),
+    );
+    // The wallet credit and coupon use the order consumed go back too, same as the
+    // admin move to RTO Received. Idempotent, so a replayed arrival changes nothing.
+    await releaseRtoOrderCredits(order._id).catch((error) =>
+      logLifecycleError("shipping", "rto_credit_release_failed", error, { orderId: String(order._id) }),
     );
   }
 

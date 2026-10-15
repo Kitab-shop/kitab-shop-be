@@ -22,9 +22,10 @@
  *   NEVER COD. A collection takes nothing from the customer, and a replacement is owed —
  *   charging cash on either would take money twice for one sale.
  *
- *   THE COURIER IS ASKED BEFORE THE RETURN MOVES, and a courier event never advances the
- *   return's own status: a parcel reaching the warehouse is not the same event as someone
- *   having inspected it, and `received` is the QC step that gates refunds and restocking.
+ *   THE COURIER IS ASKED BEFORE THE RETURN MOVES. A courier event advances the return only
+ *   on delivery, through the same compare-and-swaps as the admin endpoints: a delivered
+ *   pickup makes the return `received` (QC, the refund and any restock still wait for an
+ *   operator), a delivered replacement makes it `replacement_delivered`. Replays no-op.
  *
  * Run with `npm run test:reverse-logistics` (or `npm test` for everything).
  */
@@ -536,7 +537,7 @@ section("one AWB, one leg, one return");
 
 // ================================================================ WEBHOOK
 
-section("courier events reach the right leg, and change no status");
+section("courier events reach the right leg; delivery advances the return");
 
 {
   const { returnRequest } = await makeReturn({ status: "pickup_scheduled" });
@@ -560,17 +561,57 @@ section("courier events reach the right leg, and change no status");
     after.pickupCourierStatus === "Delivered" && Boolean(after.pickupCourierUpdatedAt),
     JSON.stringify({ s: after.pickupCourierStatus, at: after.pickupCourierUpdatedAt }),
   );
-  // The parcel reaching the warehouse is not the same event as someone inspecting it, and
-  // `received` is what gates refunds and restocking.
+  // The parcel is on the shelf: the return moves to received. QC (the disposition), the
+  // refund and any restock still wait for the operator resolving it.
   ok(
-    "but the return's own status is NOT advanced to received by the courier",
-    after.status === "pickup_scheduled" && after.receivedAt === null,
+    "a delivered pickup moves the return to received",
+    after.status === "received" && Boolean(after.receivedAt),
     JSON.stringify({ status: after.status, receivedAt: after.receivedAt }),
   );
   ok(
-    "and the reply says so rather than implying the return progressed",
-    result.body?.statusUnchanged === true,
+    "and the history says the courier did it",
+    after.statusHistory.at(-1)?.status === "received" &&
+      /Courier reported delivered/.test(after.statusHistory.at(-1)?.note || "") &&
+      (after.statusHistory.at(-1)?.note || "").includes(`${MARKER}-wpick`),
+    JSON.stringify(after.statusHistory.at(-1)),
+  );
+  ok(
+    "and the reply says the return progressed",
+    result.body?.statusUnchanged === false,
     JSON.stringify(result.body),
+  );
+  ok(
+    "nothing about money or stock is decided by the courier",
+    !after.refundedAt && !after.restockedAt && after.disposition === "",
+    JSON.stringify({ refundedAt: after.refundedAt, restockedAt: after.restockedAt, disposition: after.disposition }),
+  );
+
+  const replay = await callController(shippingController.ShippingWebhook, {
+    body: { awb: `${MARKER}-wpick`, shipment_status_id: 7, current_status: "Delivered" },
+  });
+  const replayed = await ReturnModel.findById(returnRequest._id).lean();
+  ok(
+    "a replayed delivery is a no-op",
+    replayed.status === "received" &&
+      String(replayed.receivedAt) === String(after.receivedAt) &&
+      replayed.statusHistory.filter((h) => h.status === "received").length === 1 &&
+      replay.body?.statusUnchanged === true,
+    JSON.stringify({ status: replayed.status, body: replay.body }),
+  );
+}
+
+{
+  // A pickup that has not been scheduled is not moved, whatever the courier says.
+  const { returnRequest } = await makeReturn({ status: "received", resolutionType: "refund" });
+  await ReturnModel.updateOne({ _id: returnRequest._id }, { $set: { pickupAwb: `${MARKER}-wpick-late` } });
+  const result = await callController(shippingController.ShippingWebhook, {
+    body: { awb: `${MARKER}-wpick-late`, shipment_status_id: 18, current_status: "IN TRANSIT" },
+  });
+  const after = await ReturnModel.findById(returnRequest._id).lean();
+  ok(
+    "a non-delivery event only records the courier status",
+    result.body?.statusUnchanged === true && after.status === "received" && after.pickupCourierStatus === "IN TRANSIT",
+    JSON.stringify({ body: result.body, status: after.status }),
   );
 }
 
@@ -596,21 +637,69 @@ section("courier events reach the right leg, and change no status");
     String(after.replacementDeliveredAt),
   );
   ok(
-    "but the status still waits for the admin's confirmation",
-    after.status === "replacement_dispatched",
+    "and the replacement is marked delivered",
+    after.status === "replacement_delivered" && after.statusHistory.at(-1)?.status === "replacement_delivered",
     after.status,
   );
+  ok("the reply says the return progressed", result.body?.statusUnchanged === false, JSON.stringify(result.body));
 
   // Replay: first delivery wins, so the reference point cannot drift.
   const firstStamp = after.replacementDeliveredAt;
   await callController(shippingController.ShippingWebhook, {
     body: { awb: `${MARKER}-wrep`, shipment_status_id: 7, current_status: "Delivered" },
   });
-  const replayed = await ReturnModel.findById(returnRequest._id).select("replacementDeliveredAt");
+  const replayed = await ReturnModel.findById(returnRequest._id).select("replacementDeliveredAt status statusHistory");
   ok(
     "a replayed delivery does not move the timestamp",
     String(replayed.replacementDeliveredAt) === String(firstStamp),
     JSON.stringify({ first: firstStamp, after: replayed.replacementDeliveredAt }),
+  );
+  ok(
+    "and changes nothing else",
+    replayed.status === "replacement_delivered" &&
+      replayed.statusHistory.filter((h) => h.status === "replacement_delivered").length === 1,
+    JSON.stringify(replayed.statusHistory.map((h) => h.status)),
+  );
+
+  // The admin confirming afterwards finds the transition already taken.
+  const confirm = await callController(returnController.ConfirmReplacementDelivery, {
+    params: { id: String(returnRequest._id) },
+    body: {},
+    user: adminUser(),
+  });
+  ok(
+    "an admin confirmation after the courier's is refused, not repeated",
+    confirm.statusCode === 409 && confirm.body?.code === "REPLACEMENT_NOT_DISPATCHED",
+    `${confirm.statusCode} ${JSON.stringify(confirm.body?.code)}`,
+  );
+}
+
+{
+  // The admin confirming FIRST keeps working, and a later courier delivery keeps its own
+  // timestamp only when none was recorded.
+  const { returnRequest } = await makeReturn({ status: "replacement_dispatched" });
+  await ReturnModel.updateOne({ _id: returnRequest._id }, { $set: { replacementAwb: `${MARKER}-wrep2` } });
+  const confirm = await callController(returnController.ConfirmReplacementDelivery, {
+    params: { id: String(returnRequest._id) },
+    body: { adminNote: "customer confirmed by phone" },
+    user: adminUser(),
+  });
+  const confirmed = await ReturnModel.findById(returnRequest._id).lean();
+  ok(
+    "admin confirmation marks it delivered and stamps the time",
+    confirm.statusCode === 200 && confirmed.status === "replacement_delivered" && Boolean(confirmed.replacementDeliveredAt) &&
+      confirmed.adminNote === "customer confirmed by phone",
+    `${confirm.statusCode} ${confirmed.status}`,
+  );
+  const late = await callController(shippingController.ShippingWebhook, {
+    body: { awb: `${MARKER}-wrep2`, shipment_status_id: 7, current_status: "Delivered" },
+  });
+  const after = await ReturnModel.findById(returnRequest._id).lean();
+  ok(
+    "a courier delivery afterwards changes no status",
+    late.body?.statusUnchanged === true && after.status === "replacement_delivered" &&
+      after.statusHistory.filter((h) => h.status === "replacement_delivered").length === 1,
+    JSON.stringify(late.body),
   );
 }
 

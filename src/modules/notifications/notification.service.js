@@ -74,11 +74,55 @@ export const notifyPaymentSuccess = (order) =>
 export const notifyPaymentFailed = ({ orderId, reason }) =>
   queueNotification("payment.failed", { orderId, reason });
 
-export const notifyShipmentUpdated = ({ orderId, status }) =>
-  queueNotification("shipment.updated", { orderId, status });
+/**
+ * Fire an email without awaiting it. The promise is detached and every
+ * failure swallowed, so a slow or broken SMTP server can neither delay nor
+ * fail the order action that triggered the notification.
+ *
+ * order-emails.js is loaded lazily, on the first email, on purpose: it pulls in
+ * the mailer, whose module-level `dotenv.config()` re-reads .env. Importing it
+ * statically here would run that in every module that imports this service
+ * (returns, shipping, cart) — re-injecting variables a caller had deliberately
+ * removed, as the regression helpers do with SHIPROCKET_*. It also keeps this
+ * file free of any import cycle with order-emails.js and the models.
+ */
+const fireEmail = (send) => {
+  import("./order-emails.js")
+    .then(send)
+    .catch((error) => logLifecycleError("notification", "email_failed", error));
+};
 
-export const notifyRefundProcessed = ({ orderId, paymentId }) =>
-  queueNotification("refund.processed", { orderId, paymentId });
+// Only these shipment statuses have a customer email; the rest are tracked on
+// the order page and in the queue row.
+const SHIPMENT_EMAIL_STATUSES = new Set(["Shipped", "Delivered"]);
+
+export const notifyShipmentUpdated = ({ orderId, status }) => {
+  if (orderId && SHIPMENT_EMAIL_STATUSES.has(status)) {
+    fireEmail((emails) => emails.sendShipmentStatusEmail({ orderId, status }));
+  }
+  return queueNotification("shipment.updated", { orderId, status });
+};
+
+// Callers invoke this only once the gateway (or an admin, for a manual payout)
+// has confirmed the money moved — a `pending` gateway reply goes to
+// notifyRefundInitiated instead — so the email can say "processed".
+export const notifyRefundProcessed = ({ orderId, paymentId }) => {
+  if (orderId) fireEmail((emails) => emails.sendRefundProcessedEmail({ orderId }));
+  return queueNotification("refund.processed", { orderId, paymentId });
+};
+
+/**
+ * The gateway accepted a refund but has not settled it yet (Razorpay replied
+ * `pending`, or anything else that is not `processed`/`failed`). The customer
+ * is told the refund is on its way — never that it has been processed. The
+ * poller / webhook sends notifyRefundProcessed once the gateway settles it.
+ */
+export const notifyRefundInitiated = ({ orderId, paymentId }) =>
+  queueNotification("refund.initiated", {
+    orderId,
+    paymentId,
+    message: "Refund initiated; your bank may take 5–7 working days",
+  });
 
 export const notifyReturnUpdated = ({ orderId, userId, status }) =>
   queueNotification("return.updated", {
@@ -87,11 +131,18 @@ export const notifyReturnUpdated = ({ orderId, userId, status }) =>
     message: `Return status updated to ${status}`,
   });
 
+// "system" is the abandoned-checkout sweeper: nobody chose to cancel, the
+// payment window simply ran out.
+const cancelledMessage = (source) =>
+  source === "system"
+    ? "Order cancelled automatically — payment was not completed in time"
+    : `Order cancelled by ${source || "customer"}`;
+
 export const notifyOrderCancelled = ({ orderId, userId, reason, source }) =>
   queueNotification("order.cancelled", {
     orderId,
     userId,
-    message: `Order cancelled by ${source || "customer"}${reason ? ` — ${reason}` : ""}`,
+    message: `${cancelledMessage(source)}${reason ? ` — ${reason}` : ""}`,
   });
 
 // The success sign-off (Delivered → Completed). Distinct from order.closed,

@@ -16,7 +16,8 @@ import {
   isFulfillableStatus,
 } from "../orders/order-status.rules.js";
 import { EXCLUDE_AWAITING_PAYMENT, isAwaitingPayment } from "../orders/order-visibility.js";
-import { logLifecycleEvent } from "../../utils/lifecycle-logger.service.js";
+import { logLifecycleError, logLifecycleEvent } from "../../utils/lifecycle-logger.service.js";
+import { notifyShipmentUpdated } from "../notifications/notification.service.js";
 
 /**
  * PUT /api/v1/order/:orderId/shipment/manual
@@ -171,6 +172,16 @@ export const RecordManualShipment = async (req, res) => {
       advanced: advance,
       recordedBy: req.user?.id || null,
     });
+
+    // Only a real dispatch is news to the customer; correcting a tracking number on a
+    // parcel already shipped is not. Same notification a courier "Shipped" event sends.
+    if (advance) {
+      await notifyShipmentUpdated({ orderId: updated._id, status: "Shipped" }).catch((error) =>
+        logLifecycleError("shipping", "manual_shipment_notification_failed", error, {
+          orderId: String(updated._id),
+        }),
+      );
+    }
 
     return res.status(200).json({
       success: true,

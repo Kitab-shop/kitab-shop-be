@@ -8,7 +8,12 @@ import ReturnModel, {
 } from "./return.model.js";
 import UserModel from "../../model/User.model.js";
 import { createAuditLog } from "../audit/audit-log.js";
-import { notifyRefundProcessed, notifyReturnUpdated } from "../notifications/notification.service.js";
+import {
+  notifyRefundInitiated,
+  notifyRefundProcessed,
+  notifyReturnUpdated,
+} from "../notifications/notification.service.js";
+import { markReplacementDelivered } from "./return-lifecycle.service.js";
 import { ADMIN_PERMISSIONS } from "../../config/admin-permissions.config.js";
 import {
   proportionalRefundAmount,
@@ -56,6 +61,9 @@ const STATUS_TRANSITIONS = {
   replacement_dispatched: ["replacement_delivered"],
   replacement_delivered: [],
   rejected: [],
+  // Customer-only (CancelMyReturn), and terminal. Nothing moves INTO it from here:
+  // an admin who wants to stop a return rejects it, which records a reason.
+  cancelled: [],
 };
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -183,7 +191,7 @@ export const CreateReturnRequest = async (req, res) => {
 
     // ── HOW MANY UNITS OF THIS LINE ARE STILL RETURNABLE ─────────────────────
     // Three things consume a line: cancellation, and any return that is not
-    // rejected. Cancelled units were restocked and refunded at cancellation time,
+    // rejected or cancelled. Cancelled units were restocked and refunded at cancellation time,
     // and returned units were restocked and refunded (or replaced) at resolution
     // time — counting either again pays for the same unit twice.
     //
@@ -196,7 +204,8 @@ export const CreateReturnRequest = async (req, res) => {
     // `returnRequest.quantity` per return, so the stock would inflate with every
     // repeat.
     //
-    // Rejected returns are excluded: those goods went back to the customer.
+    // Rejected and cancelled returns are excluded: those goods went back to (or
+    // never left) the customer.
     const consumedByReturns = await ReturnModel.aggregate([
       {
         $match: {
@@ -512,6 +521,27 @@ export const AdminGetReturns = async (req, res) => {
   }
 };
 
+/**
+ * Undoes AdminUpdateReturnStatus's "refunded" claim after the money did not move.
+ *
+ * A compare-and-swap on "refunded", not a blind write: anything that moved the
+ * return in the meantime (a Razorpay refund.failed webhook already rolling it back,
+ * say) must not be overwritten with a stale status.
+ */
+const releaseRefundClaim = async (returnId, previousStatus) => {
+  try {
+    await ReturnModel.updateOne({ _id: returnId, status: "refunded" }, { $set: { status: previousStatus } });
+  } catch (error) {
+    // E11000 from one_open_return_per_order_line: another open return was raised
+    // for the line while this one read as refunded. Logged for an operator; the
+    // response still reports the refund failure.
+    logLifecycleError("returns", "return_refund_claim_release_failed", error, {
+      returnId: String(returnId),
+      previousStatus,
+    });
+  }
+};
+
 export const AdminUpdateReturnStatus = async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
@@ -545,13 +575,15 @@ export const AdminUpdateReturnStatus = async (req, res) => {
       });
     }
 
-    // "received" can move to either refunded or replaced in the abstract,
-    // but a given request is only ever eligible for the one matching its
-    // own resolutionType (decided at request time from the product's policy).
+    // "received" resolves to exactly one outcome, the one matching the request's
+    // own resolutionType (decided at request time from the product's policy). A
+    // replacement is resolved through the dispatch-replacement endpoint; the legacy
+    // "replaced" status is not reachable any more, so pointing at it was a dead end.
     if (status === "refunded" && returnRequest.resolutionType !== "refund") {
       return res.status(400).json({
         success: false,
-        message: "This return is a replacement, not a refund — use the replaced status instead",
+        message: "This return is a replacement — dispatch the replacement instead",
+        code: "NOT_A_REFUND",
       });
     }
     if (status === "replaced" && returnRequest.resolutionType !== "replacement") {
@@ -603,6 +635,43 @@ export const AdminUpdateReturnStatus = async (req, res) => {
       });
     }
 
+    // ── MANUAL PICKUP ────────────────────────────────────────────────────────
+    // Scheduling a collection by hand (no Shiprocket booking) used to record nothing
+    // about the parcel, so no courier event could ever be matched to it and nothing
+    // told the operator how the goods were coming back. It now needs either the AWB
+    // the courier issued (courier events then track it, and a Delivered event marks
+    // the return received), or an explicit `selfShip: true` saying the customer is
+    // sending it back themselves. Written inside the claim below, so the AWB and the
+    // status move land together.
+    const manualPickup = status === "pickup_scheduled" && !returnRequest.pickupShipmentId;
+    const pickupSet = {};
+    let pickupNote = "";
+    if (manualPickup) {
+      // A Shiprocket booking in flight (or with an unknown outcome) may already have
+      // sent a courier; scheduling another by hand is how a customer gets two.
+      if (returnRequest.pickupBookingClaimedAt) {
+        return res.status(409).json(claimHeldBody(BOOKING_LEGS.pickup, returnRequest));
+      }
+      const pickupAwb = String(req.body?.pickupAwb ?? "").trim();
+      const pickupCourier = String(req.body?.pickupCourier ?? "").trim().slice(0, 80);
+      const selfShip = req.body?.selfShip === true || req.body?.selfShip === "true";
+      if (pickupAwb ? !AWB_PATTERN.test(pickupAwb) : !selfShip) {
+        return res.status(400).json({
+          success: false,
+          code: "AWB_REQUIRED",
+          message: pickupAwb
+            ? "Enter the pickup AWB exactly as the courier issued it (letters, digits and dashes, 4–64 characters)."
+            : "Enter the pickup AWB (and courier) for this collection, or mark it as sent back by the customer themselves.",
+        });
+      }
+      if (pickupAwb) pickupSet.pickupAwb = pickupAwb;
+      if (pickupCourier) pickupSet.pickupCourier = pickupCourier;
+      if (selfShip) pickupSet.pickupSelfShip = true;
+      pickupNote = pickupAwb
+        ? `Pickup AWB ${pickupAwb} recorded${pickupCourier ? ` (${pickupCourier})` : ""}${selfShip ? " — customer is sending it back themselves" : ""}`
+        : "Customer is sending the parcel back themselves";
+    }
+
     // Money moves BEFORE the status flips. Marking a return "refunded" used to
     // be a status change only, so the customer was told "refund processed" while
     // their money was still with the store until an admin separately remembered
@@ -615,11 +684,30 @@ export const AdminUpdateReturnStatus = async (req, res) => {
     // transition here, with the expected current status in the FILTER, means
     // exactly one request proceeds. This runs BEFORE any money moves.
     const previousStatus = returnRequest.status;
-    const claimed = await ReturnModel.findOneAndUpdate(
-      { _id: returnRequest._id, status: previousStatus },
-      { $set: { status } },
-      { returnDocument: "after" },
-    );
+    let claimed;
+    try {
+      claimed = await ReturnModel.findOneAndUpdate(
+        {
+          _id: returnRequest._id,
+          status: previousStatus,
+          // A booking started or completed since the read above wins over the manual move.
+          ...(manualPickup ? { pickupShipmentId: null, pickupBookingClaimedAt: null } : {}),
+        },
+        { $set: { status, ...pickupSet } },
+        { returnDocument: "after" },
+      );
+    } catch (error) {
+      // return_pickupAwb_unique: courier events are matched by AWB alone, so one AWB
+      // on two returns would let a parcel's events land on the wrong one.
+      if (error?.code === 11000 && pickupSet.pickupAwb) {
+        return res.status(409).json({
+          success: false,
+          code: "AWB_IN_USE",
+          message: `AWB ${pickupSet.pickupAwb} is already recorded against another return.`,
+        });
+      }
+      throw error;
+    }
 
     if (!claimed) {
       return res.status(409).json({
@@ -632,11 +720,12 @@ export const AdminUpdateReturnStatus = async (req, res) => {
     returnRequest = claimed;
 
     let refundResult;
+    let refundStatus = null;
     if (status === "refunded") {
       const order = await OrderModel.findById(returnRequest.order);
       if (!order) {
         // Put the status back — nothing was settled.
-        await ReturnModel.updateOne({ _id: returnRequest._id }, { $set: { status: previousStatus } });
+        await releaseRefundClaim(returnRequest._id, previousStatus);
         return res.status(404).json({
           success: false,
           message: "The order for this return no longer exists",
@@ -654,12 +743,30 @@ export const AdminUpdateReturnStatus = async (req, res) => {
         // The claim moved the status to "refunded" before the money was
         // attempted, so it has to be released again — otherwise the return
         // would read as refunded with nothing settled, which is the precise
-        // failure this module exists to prevent.
-        await ReturnModel.updateOne({ _id: returnRequest._id }, { $set: { status: previousStatus } });
+        // failure this module exists to prevent. This includes Razorpay
+        // declining the refund outright (GATEWAY_REFUND_REJECTED): the return goes
+        // back to received so the refund can be retried.
+        await releaseRefundClaim(returnRequest._id, previousStatus);
         return res.status(error.statusCode || 502).json({
           success: false,
           message: error.message,
           code: error.code,
+        });
+      }
+
+      // What the gateway actually said. A wallet-only or manual (COD) refund has no
+      // asynchronous settlement, so it is complete; a Razorpay refund can come back
+      // "created" (accepted, not yet settled). `refund.status` is the fallback for a
+      // result that does not carry refundStatus.
+      refundStatus = refundResult?.refundStatus || refundResult?.refund?.status || "processed";
+      if (refundStatus === "failed") {
+        // Normally thrown by refundReturnRequest as GATEWAY_REFUND_REJECTED; handled
+        // here as well so a declined refund can never read as refunded.
+        await releaseRefundClaim(returnRequest._id, previousStatus);
+        return res.status(502).json({
+          success: false,
+          message: "Razorpay declined this refund; the return is back at Received — retry it",
+          code: "GATEWAY_REFUND_REJECTED",
         });
       }
     }
@@ -694,7 +801,7 @@ export const AdminUpdateReturnStatus = async (req, res) => {
     returnRequest.statusHistory.push({
       status,
       changedBy: req.user.id,
-      note: adminNote,
+      note: [adminNote, pickupNote].filter(Boolean).join(" — "),
     });
     await returnRequest.save();
     await notifyReturnUpdated({
@@ -703,10 +810,13 @@ export const AdminUpdateReturnStatus = async (req, res) => {
       status,
     });
     if (status === "refunded") {
-      await notifyRefundProcessed({
-        orderId: returnRequest.order,
-        paymentId: refundResult?.refund?.providerRefundId || null,
-      });
+      // "Processed" only when the money has actually moved. A refund Razorpay has
+      // accepted but not settled is announced as initiated; the refund poller or
+      // webhook sends the processed notification when it settles. `notified` means
+      // the refund service already sent it while reconciling an earlier attempt.
+      const refundNotice = { orderId: returnRequest.order, paymentId: refundResult?.refund?.providerRefundId || null };
+      if (refundStatus === "created") await notifyRefundInitiated(refundNotice);
+      else if (!refundResult?.notified) await notifyRefundProcessed(refundNotice);
     }
 
     await createAuditLog({
@@ -734,6 +844,9 @@ export const AdminUpdateReturnStatus = async (req, res) => {
       refundResult?.walletCredited > 0
         ? `₹${refundResult.walletCredited} of wallet credit returned`
         : "",
+      refundStatus === "created"
+        ? "Razorpay accepted the refund and will settle it in 5–7 working days — the customer was told it is on its way"
+        : "",
     ].filter(Boolean);
     return res.status(200).json({
       success: true,
@@ -743,6 +856,7 @@ export const AdminUpdateReturnStatus = async (req, res) => {
       data: populatedReturn,
       restockedQuantity,
       walletCredited: refundResult?.walletCredited || 0,
+      ...(refundStatus ? { refundStatus, pending: refundStatus === "created" } : {}),
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -1739,7 +1853,8 @@ export const DispatchReplacement = async (req, res) => {
  *
  * Records only a timestamp — no stock moves (the unit left the shelf at dispatch)
  * and no money moves (a replacement never involves any). Repeat confirmations lose
- * the status claim and get the same 409 the rest of the module uses.
+ * the status claim and get the same 409 the rest of the module uses. A courier
+ * Delivered event on the replacement AWB makes the same move automatically.
  */
 export const ConfirmReplacementDelivery = async (req, res) => {
   try {
@@ -1760,11 +1875,16 @@ export const ConfirmReplacementDelivery = async (req, res) => {
       });
     }
 
-    const claimed = await ReturnModel.findOneAndUpdate(
-      { _id: returnRequest._id, status: "replacement_dispatched" },
-      { $set: { status: "replacement_delivered", replacementDeliveredAt: new Date() } },
-      { returnDocument: "after" },
-    );
+    // The same transition a courier Delivered event drives (return-lifecycle.service),
+    // so whichever arrives second finds it taken. It writes the history entry and
+    // notifies the customer; replacementDeliveredAt keeps the courier's own delivery
+    // time when that is already recorded.
+    const adminNote = String(req.body?.adminNote || "").trim();
+    const claimed = await markReplacementDelivered({
+      returnId: returnRequest._id,
+      actorId: req.user.id,
+      note: adminNote,
+    });
     if (!claimed) {
       return res.status(409).json({
         success: false,
@@ -1772,21 +1892,10 @@ export const ConfirmReplacementDelivery = async (req, res) => {
         code: "RETURN_STATUS_CONFLICT",
       });
     }
+    if (adminNote) {
+      await ReturnModel.updateOne({ _id: claimed._id }, { $set: { adminNote } });
+    }
 
-    const adminNote = String(req.body?.adminNote || "").trim();
-    if (adminNote) claimed.adminNote = adminNote;
-    claimed.statusHistory.push({
-      status: "replacement_delivered",
-      changedBy: req.user.id,
-      note: adminNote,
-    });
-    await claimed.save();
-
-    await notifyReturnUpdated({
-      orderId: claimed.order,
-      userId: claimed.user,
-      status: "replacement_delivered",
-    });
     await createAuditLog({
       admin: req.user.id,
       action: "CONFIRM_REPLACEMENT_DELIVERY",
@@ -1804,5 +1913,102 @@ export const ConfirmReplacementDelivery = async (req, res) => {
     });
   } catch (error) {
     return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// Statuses a customer may still withdraw from: nothing physical has happened yet.
+const CUSTOMER_CANCELLABLE_RETURN_STATUSES = ["pending", "approved"];
+
+/**
+ * POST /api/v1/returns/:id/cancel — the customer withdraws their own return request.
+ *
+ * Allowed only while nothing physical has happened: the return is pending or
+ * approved, no courier has been booked (no shipment id), no booking is in flight or
+ * awaiting a human check (no booking claim), and no pickup AWB is recorded. All four
+ * are in the FILTER of one compare-and-swap, so a pickup booked a moment earlier, or
+ * an admin moving the return concurrently, wins and the cancellation is refused.
+ *
+ * `cancelled` is neither open nor quantity-consuming, so the order line is free for a
+ * fresh request straight away.
+ */
+export const CancelMyReturn = async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid return id" });
+    }
+
+    const now = new Date();
+    const cancelled = await ReturnModel.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        user: req.user.id,
+        status: { $in: CUSTOMER_CANCELLABLE_RETURN_STATUSES },
+        pickupShipmentId: null,
+        pickupBookingClaimedAt: null,
+        // The setter stores an unset AWB as absent; "" covers older documents.
+        pickupAwb: { $in: [null, ""] },
+      },
+      {
+        $set: { status: "cancelled", cancelledAt: now },
+        $push: {
+          statusHistory: { status: "cancelled", changedBy: req.user.id, note: "Cancelled by customer", changedAt: now },
+        },
+      },
+      { returnDocument: "after" },
+    );
+
+    if (!cancelled) {
+      const current = await ReturnModel.findById(req.params.id)
+        .select("user status pickupShipmentId pickupBookingClaimedAt pickupAwb")
+        .lean();
+      if (!current) {
+        return res.status(404).json({ success: false, message: "Return not found" });
+      }
+      if (String(current.user) !== String(req.user.id)) {
+        return res.status(403).json({ success: false, message: "You cannot cancel this return" });
+      }
+      // A double click: the first request already did it.
+      if (current.status === "cancelled") {
+        return res.status(200).json({
+          success: true,
+          alreadyCancelled: true,
+          message: "This return request is already cancelled.",
+          data: withoutOperatorFields(
+            redactRefundDestination(await populateReturnLean(ReturnModel.findById(current._id)), { isOwner: true }),
+          ),
+        });
+      }
+      const pickupUnderway =
+        CUSTOMER_CANCELLABLE_RETURN_STATUSES.includes(current.status) &&
+        (current.pickupShipmentId || current.pickupBookingClaimedAt || current.pickupAwb);
+      return res.status(409).json({
+        success: false,
+        code: "RETURN_NOT_CANCELLABLE",
+        currentStatus: current.status,
+        message: pickupUnderway
+          ? "A pickup is already being arranged for this return, so it can no longer be cancelled here. Contact support if you no longer want to return it."
+          : `This return is ${current.status.replace(/_/g, " ")} and can no longer be cancelled.`,
+      });
+    }
+
+    await notifyReturnUpdated({
+      orderId: cancelled.order,
+      userId: cancelled.user,
+      status: "cancelled",
+    });
+    logLifecycleEvent("returns", "return_cancelled_by_customer", {
+      returnId: String(cancelled._id),
+      returnNumber: cancelled.returnNumber,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Your return request has been cancelled.",
+      data: withoutOperatorFields(
+        redactRefundDestination(await populateReturnLean(ReturnModel.findById(cancelled._id)), { isOwner: true }),
+      ),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 };

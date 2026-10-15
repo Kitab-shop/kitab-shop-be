@@ -124,7 +124,8 @@ const advanceToReceived = async (returnId) => {
   for (const status of ["approved", "pickup_scheduled", "received"]) {
     const response = await callController(returnController.AdminUpdateReturnStatus, {
       params: { id: String(returnId) },
-      body: { status },
+      // A manual pickup_scheduled needs an AWB or an explicit self-ship.
+      body: status === "pickup_scheduled" ? { status, selfShip: true } : { status },
       user: admin(),
     });
     if (response.statusCode !== 200) return response;

@@ -19,7 +19,12 @@ const GATEWAY_ATTEMPT_STALE_MS = 2 * 60 * 1000;
  * A crash between steps leaves a visible `pending` row rather than money that
  * moved with nothing to show for it.
  *
- * @returns {{record, refunded: boolean, alreadyHandled: boolean}}
+ * `gatewayStatus` is what Razorpay said about the refund THIS call issued or
+ * adopted (`processed`, `pending`, `failed`…); absent when nothing was asked. Only
+ * `processed` means the money has moved — a caller telling the customer must say
+ * "initiated" for anything else.
+ *
+ * @returns {{record, refunded: boolean, alreadyHandled: boolean, gatewayStatus?: string}}
  */
 export const refundOrphanedCapture = async ({
   paymentId,
@@ -172,7 +177,12 @@ export const refundOrphanedCapture = async ({
           },
           { returnDocument: "after" },
         );
-        return { record: adopted, refunded: match.status !== "failed", alreadyHandled: true };
+        return {
+          record: adopted,
+          refunded: match.status !== "failed",
+          alreadyHandled: true,
+          gatewayStatus: match.status,
+        };
       }
     }
 
@@ -209,6 +219,13 @@ export const refundOrphanedCapture = async ({
     return { record: failed || record, refunded: false, alreadyHandled: false };
   }
 
+  // Deliberately NOT mapped through mapGatewayRefundStatus: here "accepted by
+  // Razorpay" (`pending` as well as `processed`) counts as refunded. This row
+  // tracks whether the money has been SENT BACK, not a customer-facing ledger
+  // status, and a `pending` refund needs no further action from us. If Razorpay
+  // later fails it, the refund.failed webhook finds no order row for this refund
+  // id and marks this record `failed` by its refundId (applyRazorpayRefundWebhook,
+  // refund-sync.service.js), which puts it back in front of an operator.
   const settled = await UnmatchedPayment.findOneAndUpdate(
     { _id: record._id },
     {
@@ -229,7 +246,12 @@ export const refundOrphanedCapture = async ({
     unmatchedPaymentId: record._id,
   });
 
-  return { record: settled || record, refunded: refund?.status !== "failed", alreadyHandled: false };
+  return {
+    record: settled || record,
+    refunded: refund?.status !== "failed",
+    alreadyHandled: false,
+    gatewayStatus: refund?.status,
+  };
 };
 
 /**

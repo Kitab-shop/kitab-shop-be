@@ -62,6 +62,14 @@ const suites = [
   "shipping-reconciliation.regression.mjs",
   "customer-shipping-endpoints.regression.mjs",
   "reverse-awb.regression.mjs",
+  "refund-ledger-sync.regression.mjs",
+  "unmatched-payment-resolve.regression.mjs",
+  "rto-credits.regression.mjs",
+  "refund-retry.regression.mjs",
+  "return-cancel.regression.mjs",
+  "return-refund-flow.regression.mjs",
+  "order-auto-complete.regression.mjs",
+  "order-emails.regression.mjs",
 ];
 
 const run = (file) =>

@@ -14,6 +14,11 @@ import mongoose from "mongoose";
  */
 const webhookEventSchema = new mongoose.Schema(
   {
+    // Only "razorpay" is written today. "shiprocket" is reserved and unused:
+    // Shiprocket sends no event id, and genuine repeats (OFD → NDR → OFD on a
+    // re-attempt) carry identical payloads and must all apply, so courier events are
+    // not deduplicated here. Courier-time ordering (shiprocket.lastEventAt) plus
+    // idempotent side effects in courier-event.service.js cover replays instead.
     provider: {
       type: String,
       required: true,

@@ -2,6 +2,8 @@ import StockReservation from "../../model/StockReservation.model.js";
 import OrderModel from "../orders/Order.model.js";
 import { incrementStock, resolveVariantId } from "./variant.service.js";
 import { logLifecycleEvent, logLifecycleError } from "../../utils/lifecycle-logger.service.js";
+import { closeUnpaidCheckout } from "../payments/unpaid-checkout.service.js";
+import { syncPendingGatewayRefunds } from "../payments/refund-sync.service.js";
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 let cleanupTimer = null;
@@ -64,12 +66,19 @@ export const cleanupExpiredStockReservations = async ({ limit = 100 } = {}) => {
  * They are moved to Cancelled rather than deleted — a checkout that was attempted
  * is a fact worth keeping, and `Pending → Cancelled` is already a legal transition.
  *
- * No stock or money is touched here on purpose: an unpaid order never held either.
- * Reserved stock is released by the reservation sweeper above, keyed on its own
- * expiry, so the two never both act on the same units.
+ * No money is touched here: an unpaid order never held any. After each cancellation
+ * wins, closeUnpaidCheckout expires the payment intent and releases its stock hold —
+ * the same close-out the customer and admin cancel paths run. Expiring the intent is
+ * what stops RetryRazorpayOrder minting a fresh Razorpay order for a checkout that is
+ * already Cancelled; a "created" intent left behind used to make that possible.
+ * releaseReservation's active-only claim means this and the reservation sweeper above
+ * can never both restock the same units.
  *
- * The status filter makes it a claim, so a concurrent payment that completes at the
- * same moment wins and its order is never cancelled out from under it.
+ * The filter (`orderStatus: "Pending"` AND `paymentStatus: "Pending"`) makes it a
+ * claim, so a concurrent payment that completes at the same moment wins and its order
+ * is never cancelled out from under it, and an order some other path already moved on
+ * is never rewritten. `cancelledBy: "system"` keeps the admin banner and the customer
+ * wording from blaming the customer for a timeout.
  */
 export const cancelAbandonedCheckouts = async ({ limit = 200 } = {}) => {
   const now = new Date();
@@ -79,6 +88,7 @@ export const cancelAbandonedCheckouts = async ({ limit = 200 } = {}) => {
     const order = await OrderModel.findOneAndUpdate(
       {
         paymentMethod: "RAZORPAY",
+        orderStatus: "Pending",
         paymentStatus: "Pending",
         paymentExpiresAt: { $ne: null, $lte: now },
       },
@@ -91,6 +101,7 @@ export const cancelAbandonedCheckouts = async ({ limit = 200 } = {}) => {
             reason: "Other",
             details: "Payment was not completed before the checkout expired",
             cancelledAt: now,
+            cancelledBy: "system",
           },
         },
         $push: {
@@ -107,6 +118,8 @@ export const cancelAbandonedCheckouts = async ({ limit = 200 } = {}) => {
     );
     if (!order) break;
     cancelled += 1;
+    // Never throws — the cancellation above is already durable.
+    await closeUnpaidCheckout({ orderId: order._id, razorpayOrderId: order.razorpayOrderId });
   }
 
   return cancelled;
@@ -134,6 +147,21 @@ export const startStockReservationCleanup = () => {
       }
     } catch (error) {
       logLifecycleError("orders", "abandoned_checkout_sweep_failed", error);
+    }
+    // Refunds Razorpay accepted but has not settled yet (`created` rows with a refund
+    // id). The webhook settles them when it is delivered; this poll is the backstop for
+    // a missed or unsubscribed webhook. It only reads refund state from Razorpay and
+    // never issues a refund. Independent of the two sweeps above, so a failure in one
+    // never skips the others.
+    if (process.env.REFUND_STATUS_SYNC_ENABLED !== "false") {
+      try {
+        const { changed = 0, checked = 0, errors = 0 } = (await syncPendingGatewayRefunds()) || {};
+        if (changed > 0) {
+          logLifecycleEvent("payments", "gateway_refunds_synced", { checked, changed, errors });
+        }
+      } catch (error) {
+        logLifecycleError("payments", "refund_sync_failed", error);
+      }
     }
   };
 

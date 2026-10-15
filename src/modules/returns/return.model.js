@@ -21,6 +21,10 @@ export const RETURN_STATUSES = [
   "replacement_dispatched",
   "replacement_delivered",
   "rejected",
+  // Withdrawn by the customer before anything physical happened (pending or
+  // approved, no pickup booked or claimed, no AWB). Terminal, and set only through
+  // CancelMyReturn — an admin cannot move a return here; they reject it instead.
+  "cancelled",
 ];
 
 /**
@@ -46,13 +50,14 @@ export const OPEN_RETURN_STATUSES = [
  * Statuses whose units are spoken for, and therefore count against how much of an
  * order line can still be returned.
  *
- * Everything except `rejected`: a rejected return's goods go back to the customer
- * and nothing is refunded or restocked, so it consumes no units. Same shape as
- * `sumRefunded` in return-refund.service.js, which likewise counts everything
- * except its one failed state.
+ * Everything except `rejected` and `cancelled`: a rejected return's goods go back to
+ * the customer, and a cancelled one never left them, so neither refunds nor restocks
+ * anything and neither consumes units. Same shape as `sumRefunded` in
+ * return-refund.service.js, which likewise counts everything except its failed state.
  */
+const NON_CONSUMING_RETURN_STATUSES = ["rejected", "cancelled"];
 export const QUANTITY_CONSUMING_RETURN_STATUSES = RETURN_STATUSES.filter(
-  (status) => status !== "rejected",
+  (status) => !NON_CONSUMING_RETURN_STATUSES.includes(status),
 );
 
 const statusHistorySchema = new mongoose.Schema(
@@ -158,8 +163,10 @@ const returnSchema = new mongoose.Schema(
       min: 0,
     },
     // Decided once at request time from the product's returnPolicy.kind (see
-    // CreateReturnRequest) — not a customer choice. Determines which terminal
-    // status ("refunded" vs "replaced") this request is allowed to reach.
+    // CreateReturnRequest) — not a customer choice. Determines which resolution
+    // this request is allowed to reach: "refunded" for a refund, or
+    // replacement_dispatched → replacement_delivered for a replacement (the legacy
+    // single-step "replaced" is no longer reachable).
     resolutionType: {
       type: String,
       enum: ["refund", "replacement"],
@@ -200,9 +207,11 @@ const returnSchema = new mongoose.Schema(
     pickupAwb: { type: String, trim: true, set: emptyToUndefined },
     pickupShipmentId: { type: Number, default: null },
     pickupShiprocketOrderId: { type: Number, default: null },
-    // Last courier status seen on each leg. Recorded, never acted on: a parcel arriving
-    // at the warehouse is not the same event as someone having inspected it, so the
-    // status transition stays with the operator doing QC.
+    // Last courier status seen on each leg. Only a "Delivered" event is acted on (see
+    // return-lifecycle.service.js): a delivered pickup moves pickup_scheduled → received,
+    // a delivered replacement moves replacement_dispatched → replacement_delivered. That
+    // is safe because "received" no longer decides anything by itself — QC (the
+    // disposition) and the refund are still recorded by an operator when resolving.
     pickupCourierStatus: { type: String, trim: true, default: "" },
     pickupCourierUpdatedAt: { type: Date, default: null },
     replacementCourierStatus: { type: String, trim: true, default: "" },
@@ -225,6 +234,12 @@ const returnSchema = new mongoose.Schema(
     // rather than showing a button that silently refuses.
     pickupBookingError: { type: String, trim: true, default: "" },
     replacementBookingError: { type: String, trim: true, default: "" },
+
+    // Set when an admin scheduled the collection by hand with `selfShip: true`: the
+    // customer sends the parcel back themselves, so there is no booked courier and
+    // possibly no AWB. Lets the admin screen say why a pickup_scheduled return has
+    // neither a shipment nor an AWB.
+    pickupSelfShip: { type: Boolean, default: false },
 
     pickupScheduledAt: {
       type: Date,
@@ -275,6 +290,11 @@ const returnSchema = new mongoose.Schema(
       default: "",
     },
     replacedAt: {
+      type: Date,
+      default: null,
+    },
+    // Stamped by CancelMyReturn when the customer withdraws the request.
+    cancelledAt: {
       type: Date,
       default: null,
     },

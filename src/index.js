@@ -40,6 +40,7 @@ import { router as seoRoutes } from "./modules/seo/index.js";
 import mongoose from "mongoose";
 import { startStockReservationCleanup, stopStockReservationCleanup } from "./modules/inventory/stock-reservation-cleanup.service.js";
 import { startShippingReconciliation, stopShippingReconciliation } from "./modules/shipping/shipping-reconciliation.service.js";
+import { startOrderAutoComplete, stopOrderAutoComplete } from "./modules/orders/order-auto-complete.service.js";
 import { getHttpConfig } from "./config/features.config.js";
 import {
 	ensureUploadDirs,
@@ -61,6 +62,10 @@ startStockReservationCleanup();
 // cancellations / failed auto-pushes. Self-gating — it does nothing unless Shiprocket
 // is in use and reconciliation is enabled (SHIPPING_RECONCILE_ENABLED, admin panel).
 startShippingReconciliation();
+// Delivered → Completed once the return window (plus grace) has passed with no open
+// return and no refund in flight. Hourly by default; ORDER_AUTO_COMPLETE_ENABLED=false
+// turns it off.
+startOrderAutoComplete();
 
 const app = express();
 const httpConfig = getHttpConfig();
@@ -251,6 +256,7 @@ const shutdown = async (signal) => {
 		await new Promise((resolve) => server.close(resolve));
 		stopStockReservationCleanup();
 		stopShippingReconciliation();
+		stopOrderAutoComplete();
 		await mongoose.connection.close(false);
 		console.log("Shutdown complete");
 		process.exit(0);

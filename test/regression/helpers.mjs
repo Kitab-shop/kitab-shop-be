@@ -21,6 +21,22 @@ for (const key of Object.keys(process.env)) {
 }
 process.env.SHIPROCKET_BASE_URL = "https://shiprocket.invalid/v1/external";
 
+// The same for mail. A developer's .env holds a real SMTP account and a Gmail fallback
+// (EMAIL / EMAIL_PASSWORD), and every order/refund/return path fires a customer email,
+// so without this a suite run mails real addresses. Blanked to "" rather than deleted:
+// src/utils/mailer.js calls dotenv.config() when it is imported, and dotenv re-adds a
+// deleted variable but never overrides one that exists. With user/password empty,
+// mailConfig().configured is false and sendMail() returns false without connecting —
+// and with EMAIL empty there is no Gmail fallback either. A suite that stubs nodemailer
+// and sets SMTP_* itself (order-emails, order-auto-complete) still wins, because its
+// top-level assignments run after this module's import.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("SMTP_")) process.env[key] = "";
+}
+for (const key of ["SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "EMAIL", "EMAIL_PASSWORD"]) {
+  process.env[key] = "";
+}
+
 export const mongoUri = () =>
   process.env.mango_url ||
   process.env.mongo_url ||

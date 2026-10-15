@@ -5,6 +5,7 @@ import ProductModel from "../products/Product.model.js";
 import CategoryModel from "../categories/Category.model.js";
 import UserModel from "../../model/User.model.js";
 import {
+  COUPON_RELEASED_ORDER_STATUSES,
   calculateCouponDiscount,
   couponError,
   globalCapReached,
@@ -565,12 +566,16 @@ export const GetAvailableCoupons = async (req, res) => {
     // it hid that coupon from this list forever, while calculateCouponDiscount --
     // which has always applied the filter -- would still have accepted it. The
     // customer could no longer see the coupon they were still entitled to use.
+    // COUPON_RELEASED_ORDER_STATUSES for the same reason: a cancelled or
+    // returned-to-origin order handed its use back, and the checkout validator
+    // (countOrdersWithCoupon) skips them too.
     const couponOrderCounts = await OrderModel.aggregate([
       {
         $match: {
           user: new mongoose.Types.ObjectId(String(req.user.id)),
           coupon: { $ne: null },
           paymentStatus: { $ne: "Failed" },
+          orderStatus: { $nin: COUPON_RELEASED_ORDER_STATUSES },
           ...EXCLUDE_AWAITING_PAYMENT,
         },
       },

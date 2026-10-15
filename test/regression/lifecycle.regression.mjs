@@ -20,6 +20,8 @@ await connect();
 const OrderModel = (await import("../../src/modules/orders/Order.model.js")).default;
 const ProductModel = (await import("../../src/modules/products/Product.model.js")).default;
 const ReturnModel = (await import("../../src/modules/returns/return.model.js")).default;
+const PaymentIntent = (await import("../../src/modules/payments/PaymentIntent.model.js")).default;
+const StockReservation = (await import("../../src/model/StockReservation.model.js")).default;
 const { ORDER_STATUS_TRANSITIONS, canTransitionOrderStatus } = await import(
   "../../src/modules/orders/order-status.rules.js"
 );
@@ -44,7 +46,7 @@ const { cancelAbandonedCheckouts } = await import(
 const { isStockEnforced } = await import("../../src/config/features.config.js");
 
 const MARKER = marker("life");
-const trash = { orders: [], products: [], returns: [] };
+const trash = { orders: [], products: [], returns: [], intents: [] };
 let seq = 0;
 
 const makeOrder = async (fields = {}) => {
@@ -331,6 +333,39 @@ try {
     razorpayOrderId: `order_${MARKER}_b`,
     paymentExpiresAt: new Date(Date.now() + 600_000),
   });
+  // The abandoned checkout's payment side, as CreateRazorpayOrder leaves it: an open
+  // intent pointing at the order and an active stock hold. An empty hold is enough —
+  // what is asserted is that the sweeper closes it, not how many units it held.
+  const abandonedIntent = await PaymentIntent.create({
+    user: abandoned.user,
+    idempotencyKey: `${MARKER}-abandoned-key`,
+    razorpayOrderId: abandoned.razorpayOrderId,
+    amount: 100000,
+    currency: "INR",
+    items: [{ product: new mongoose.Types.ObjectId(), name: `${MARKER} line`, price: 1000, quantity: 1 }],
+    shippingAddress: addressFixture(),
+    subtotal: 1000,
+    totalAmount: 1000,
+    pendingOrder: abandoned._id,
+  });
+  trash.intents.push(abandonedIntent._id);
+  const abandonedHold = await StockReservation.create({
+    user: abandoned.user,
+    paymentIntent: abandonedIntent._id,
+    idempotencyKey: `${MARKER}-abandoned-key`,
+    items: [],
+    status: "active",
+    // Still inside its own window, so only the checkout sweep can be what releases it.
+    expiresAt: new Date(Date.now() + 600_000),
+  });
+  // Already moved on by another path but never had its paymentStatus fixed — the
+  // sweeper's orderStatus condition must leave it alone.
+  const movedOn = await makeOrder({
+    paymentStatus: "Pending",
+    orderStatus: "Cancelled",
+    razorpayOrderId: `order_${MARKER}_c`,
+    paymentExpiresAt: new Date(Date.now() - 60_000),
+  });
   const sweptCount = await cancelAbandonedCheckouts({ limit: 50 });
   ok("the sweeper closes at least the expired one", sweptCount >= 1, String(sweptCount));
   const sweptOrder = await OrderModel.findById(abandoned._id);
@@ -338,6 +373,34 @@ try {
   ok("and Failed rather than Pending", sweptOrder.paymentStatus === "Failed", sweptOrder.paymentStatus);
   ok("with a reason recorded", Boolean(sweptOrder.cancellation?.details));
   ok("and a history entry naming the sweeper", sweptOrder.statusHistory.at(-1)?.source === "abandoned_checkout_sweeper");
+  ok(
+    'cancelledBy is "system", not the customer',
+    sweptOrder.cancellation?.cancelledBy === "system",
+    sweptOrder.cancellation?.cancelledBy,
+  );
+  {
+    const intentAfter = await PaymentIntent.findById(abandonedIntent._id);
+    ok(
+      "its payment intent is expired, so RetryRazorpayOrder can no longer reopen it",
+      intentAfter?.status === "expired",
+      intentAfter?.status,
+    );
+    const holdAfter = await StockReservation.findById(abandonedHold._id);
+    ok(
+      "its stock hold is released straight away, not left to its own expiry",
+      holdAfter?.status === "released",
+      holdAfter?.status,
+    );
+  }
+  {
+    const movedOnAfter = await OrderModel.findById(movedOn._id);
+    ok(
+      "an order no longer at Pending is not rewritten by the sweeper",
+      movedOnAfter.paymentStatus === "Pending" &&
+        !movedOnAfter.statusHistory.some((entry) => entry.source === "abandoned_checkout_sweeper"),
+      `${movedOnAfter.orderStatus}/${movedOnAfter.paymentStatus}`,
+    );
+  }
   ok(
     "a checkout still inside its window is untouched",
     (await OrderModel.findById(stillOpen._id)).orderStatus === "Pending",
@@ -653,6 +716,8 @@ try {
     OrderModel.deleteMany({ _id: { $in: trash.orders } }),
     ProductModel.deleteMany({ _id: { $in: trash.products } }),
     ReturnModel.deleteMany({ _id: { $in: trash.returns } }),
+    PaymentIntent.deleteMany({ _id: { $in: trash.intents } }),
+    StockReservation.deleteMany({ idempotencyKey: new RegExp(`^${MARKER}`) }),
   ]);
   await mongoose.disconnect();
 }

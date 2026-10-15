@@ -699,6 +699,76 @@ try {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  section("14 — leaving NDR clears the ndr syncStatus");
+  {
+    const target = await makeOrder({ orderStatus: "Shipped" });
+    await applyCourierEvent(ev(target, 21, "UNDELIVERED", { ndrReason: "Door locked" }), { source: "webhook" });
+    let after = await reload(target.order._id);
+    ok("NDR sets syncStatus ndr", after.orderStatus === "NDR" && after.shiprocket?.syncStatus === "ndr",
+      `${after.orderStatus} ${after.shiprocket?.syncStatus}`);
+
+    await applyCourierEvent(ev(target, 17, "OUT FOR DELIVERY"), { source: "webhook" });
+    after = await reload(target.order._id);
+    ok("…a re-attempt (OFD) resets it to awb_assigned",
+      after.orderStatus === "Out For Delivery" && after.shiprocket?.syncStatus === "awb_assigned",
+      `${after.orderStatus} ${after.shiprocket?.syncStatus}`);
+    ok("…and keeps the ndrReason for the record", after.shiprocket?.ndrReason === "Door locked", after.shiprocket?.ndrReason);
+
+    await applyCourierEvent(ev(target, 7, "DELIVERED"), { source: "webhook" });
+    after = await reload(target.order._id);
+    ok("…Delivered leaves it at awb_assigned",
+      after.orderStatus === "Delivered" && after.shiprocket?.syncStatus === "awb_assigned",
+      `${after.orderStatus} ${after.shiprocket?.syncStatus}`);
+
+    const direct = await makeOrder({ orderStatus: "Shipped" });
+    await applyCourierEvent(ev(direct, 21, "UNDELIVERED"), { source: "webhook" });
+    await applyCourierEvent(ev(direct, 7, "DELIVERED"), { source: "webhook" });
+    const directAfter = await reload(direct.order._id);
+    ok("NDR straight to Delivered also resets it",
+      directAfter.orderStatus === "Delivered" && directAfter.shiprocket?.syncStatus === "awb_assigned",
+      `${directAfter.orderStatus} ${directAfter.shiprocket?.syncStatus}`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  section("15 — a delivered pickup leg marks the return received");
+  {
+    const delivered = await makeOrder({ orderStatus: "Delivered", paymentMethod: "COD", paymentStatus: "Paid",
+      withShiprocket: false, deliveredAt: new Date(Date.now() - 24 * HOUR) });
+    const p = await product();
+    const pickupAwb = `RPICKD-${MARKER}`;
+    const returnRequest = await ReturnModel.create({
+      order: delivered.order._id,
+      user: delivered.order.user,
+      product: p._id,
+      productSnapshot: { name: p.name, image: "x.png", price: p.price },
+      quantity: 1,
+      reason: "damaged on arrival",
+      refundAmount: p.price,
+      resolutionType: "refund",
+      status: "pickup_scheduled",
+      returnNumber: `${MARKER}-RET-2`,
+      pickupAwb,
+    });
+    trash.returns.push(returnRequest._id);
+
+    const res = await sendWebhook({ awb: pickupAwb, shipment_status_id: 7, shipment_status: "DELIVERED" });
+    const after = await ReturnModel.findById(returnRequest._id).lean();
+    ok("resolved to the pickup leg and reported as a move",
+      res.body?.scope === "return" && res.body?.leg === "pickup" && res.body?.statusUnchanged === false,
+      JSON.stringify(res.body));
+    ok("return is received, with receivedAt", after.status === "received" && Boolean(after.receivedAt), after.status);
+    const replay = await sendWebhook({ awb: pickupAwb, shipment_status_id: 7, shipment_status: "DELIVERED" });
+    const replayed = await ReturnModel.findById(returnRequest._id).lean();
+    ok("a replay is a no-op",
+      replay.body?.statusUnchanged === true &&
+        replayed.statusHistory.filter((h) => h.status === "received").length === 1,
+      JSON.stringify(replay.body));
+    const order = await reload(delivered.order._id);
+    ok("the parent order is untouched", order.orderStatus === "Delivered" && (order.statusHistory || []).length === 0,
+      order.orderStatus);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   section("Z — the pipeline never called Shiprocket");
   ok("zero outbound fetch calls", fetchCalls.length === 0, JSON.stringify(fetchCalls));
 } catch (error) {

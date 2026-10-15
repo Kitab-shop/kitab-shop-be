@@ -132,7 +132,14 @@ try {
     // replacement_dispatched) must occupy the line automatically, while a new
     // TERMINAL status has to be declared here deliberately — that is the direction
     // where forgetting is dangerous, because a line would stay locked forever.
-    const TERMINAL_STATUSES = ["refunded", "replaced", "replacement_delivered", "rejected"];
+    // "cancelled": a customer withdrew the return before pickup, so the line is free again.
+    const TERMINAL_STATUSES = [
+      "refunded",
+      "replaced",
+      "replacement_delivered",
+      "rejected",
+      "cancelled",
+    ];
     ok(
       "every status is either open or terminal — none is unaccounted for",
       RETURN_STATUSES.every(
@@ -151,9 +158,10 @@ try {
       TERMINAL_STATUSES.every((status) => !OPEN_RETURN_STATUSES.includes(status)),
     );
     ok(
-      "quantity-consuming statuses are everything EXCEPT rejected",
+      "quantity-consuming statuses are everything EXCEPT rejected and cancelled",
       !QUANTITY_CONSUMING_RETURN_STATUSES.includes("rejected") &&
-        QUANTITY_CONSUMING_RETURN_STATUSES.length === RETURN_STATUSES.length - 1,
+        !QUANTITY_CONSUMING_RETURN_STATUSES.includes("cancelled") &&
+        QUANTITY_CONSUMING_RETURN_STATUSES.length === RETURN_STATUSES.length - 2,
       JSON.stringify(QUANTITY_CONSUMING_RETURN_STATUSES),
     );
     ok(

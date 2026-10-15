@@ -245,11 +245,6 @@ const OrderSchema = new mongoose.Schema(
       index: true,
     },
 
-    // Set once, the moment orderStatus first becomes "Delivered" (see
-    // UpdateOrderStatus and the Shiprocket webhook handler) — this is what a
-    // product's returnPolicy.windowDays counts down from. Orders placed
-    // before this field existed will have it as null; return eligibility
-    // for those falls back to "no window check" rather than blocking them.
     // Stamped when an RTO parcel is confirmed back with the seller and its units
     // are returned to sellable stock. Doubles as the idempotency claim, so a
     // retried courier webhook cannot restock the same parcel twice.
@@ -273,6 +268,11 @@ const OrderSchema = new mongoose.Schema(
       default: "",
     },
 
+    // Set once, the moment orderStatus first becomes "Delivered" (see
+    // UpdateOrderStatus and the Shiprocket webhook handler) — this is what a
+    // product's returnPolicy.windowDays counts down from. Orders placed
+    // before this field existed will have it as null; return eligibility
+    // for those falls back to "no window check" rather than blocking them.
     deliveredAt: {
       type: Date,
       default: null,
@@ -381,9 +381,12 @@ const OrderSchema = new mongoose.Schema(
       // Who initiated the full cancellation. statusHistory records it too, but
       // the banner on the admin order page reads this subdocument alone —
       // without it every cancellation displayed as "Cancelled by customer".
+      // "system" is the abandoned-checkout sweeper closing a prepaid order whose
+      // payment was never completed in time: neither the customer nor an admin
+      // decided it, and saying either would be untrue.
       cancelledBy: {
         type: String,
-        enum: ["customer", "admin"],
+        enum: ["customer", "admin", "system"],
         default: "customer",
       },
     },
@@ -492,6 +495,19 @@ const OrderSchema = new mongoose.Schema(
           // because the winner's call had not landed yet, and conclude the
           // earlier attempt never happened. "Not yet" is not "never".
           gatewayAttemptedAt: { type: Date, default: null },
+          // When the background refund sync (or a webhook) last asked Razorpay
+          // about this row. Only the poller reads it, to check each `created` row
+          // at most once per resync window instead of re-fetching the same pending
+          // refund every tick. Deliberately NOT indexed: production runs with
+          // autoIndex off, and the poller's query is bounded by a limit.
+          gatewaySyncedAt: { type: Date, default: null },
+          // The customer has ALREADY been told this refund was processed, so the
+          // settlement that later confirms it must not tell them again. Set only by
+          // scripts/backfill-refund-statuses.js --apply, which moves a row that was
+          // wrongly recorded `processed` (Razorpay still pending) back to `created`
+          // — under the old code its "refund processed" notice had already gone
+          // out. applyGatewayRefundState reads it. Absent on every other row.
+          suppressProcessedNotice: { type: Boolean },
           processedAt: { type: Date, default: null },
           createdBy: {
             type: mongoose.Schema.Types.ObjectId,
@@ -552,6 +568,17 @@ const OrderSchema = new mongoose.Schema(
 
     coupon: {
       type: String,
+      default: null,
+    },
+
+    // When this order's coupon redemption was handed back (cancellation, or an
+    // RTO parcel received). Doubles as the claim that makes the release happen
+    // at most once per order: releaseOrderCouponRedemption only decrements the
+    // redemption count after a conditional write moves this from null, so a
+    // cancellation racing an RTO, or a replayed courier event, cannot free two
+    // slots against one real redemption.
+    couponReleasedAt: {
+      type: Date,
       default: null,
     },
 

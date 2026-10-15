@@ -45,6 +45,10 @@ import {
 } from "../returns/return.controller.js";
 import { AdminGetOwedRefunds, AdminSettleOwedRefundManually } from "../payments/owed-refund.controller.js";
 import {
+  AdminGetUnmatchedPayments,
+  AdminResolveUnmatchedPayment,
+} from "../payments/unmatched-payment.controller.js";
+import {
   GetShippingReconciliationStatus,
   RunShippingReconciliation,
 } from "../shipping/shipping-ops.controller.js";
@@ -75,6 +79,11 @@ router.get("/refunds/owed", isAdmin, requirePermission(ADMIN_PERMISSIONS.ORDERS_
 // Settles an owed refund that no gateway can pay (COD and other offline money).
 // Gateway-payable rows are refused and routed to the Razorpay refund endpoint.
 router.post("/refunds/:orderId/:refundId/settle-manual", isAdmin, requirePermission(ADMIN_PERMISSIONS.ORDERS_MANAGE), AdminSettleOwedRefundManually);
+// Captured payments that never became an order (the System Health "unmatched" count).
+// Listing is read-only; resolve only records how an operator settled one by hand and
+// moves no money. orders:manage, the same as the owed-refunds queue above.
+router.get("/payments/unmatched", isAdmin, requirePermission(ADMIN_PERMISSIONS.ORDERS_MANAGE), AdminGetUnmatchedPayments);
+router.post("/payments/unmatched/:id/resolve", isAdmin, requirePermission(ADMIN_PERMISSIONS.ORDERS_MANAGE), AdminResolveUnmatchedPayment);
 router.patch("/returns/:id/status", isAdmin, requirePermission(ADMIN_PERMISSIONS.RETURNS_MANAGE), AdminUpdateReturnStatus);
 // Manual replacement fulfilment. Separate from the status endpoint because dispatch
 // records the courier/AWB and takes the outbound unit out of stock — side effects a

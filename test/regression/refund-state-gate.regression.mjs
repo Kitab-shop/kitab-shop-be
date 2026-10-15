@@ -19,8 +19,12 @@
  * Run with `npm run test:refund-state-gate` (or `npm test` for everything).
  *
  * Refunds are left deliberately UNSETTLED here (payments disabled, so
- * canAutoRefund is false and rows stay "created"), which is exactly the condition
- * that produces "Refund Pending".
+ * canAutoRefund is false and rows are recorded "owed" — nothing will send them),
+ * which is exactly the condition that produces "Refund Pending".
+ *
+ * The last sections cover the owed-refunds queue those rows land in: they are
+ * listed with `manualPayable`, settle by hand, and legacy never-attempted
+ * `created` rows (what cancellations wrote before `owed`) are settleable too.
  */
 process.env.INVENTORY_ENFORCE_STOCK = "false";
 process.env.NOTIFICATIONS_ENABLED = "false";
@@ -40,6 +44,7 @@ const { sumRefunded, sumSettledRefunds } = await import(
   "../../src/modules/payments/return-refund.service.js"
 );
 const orderController = await import("../../src/modules/orders/order.controller.js");
+const owedController = await import("../../src/modules/payments/owed-refund.controller.js");
 
 const MARKER = marker("refundgate");
 const trash = { orders: [], products: [] };
@@ -112,7 +117,14 @@ try {
 
     const after = await OrderModel.findById(order._id);
     ok("one refund row was recorded", after.refunds.length === 1, String(after.refunds.length));
-    ok("it is unsettled", after.refunds[0].status === "created", after.refunds[0].status);
+    // `owed`, not `created`: with payments off nothing will ever call the gateway
+    // for it, and `created` means "the gateway was called, outcome unknown".
+    ok("it is unsettled — recorded as owed", after.refunds[0].status === "owed", after.refunds[0].status);
+    ok(
+      "confirmed through the gateway (a Razorpay order), once Razorpay can pay it",
+      after.refunds[0].confirmationMethod === "gateway",
+      after.refunds[0].confirmationMethod,
+    );
     ok("nothing has settled", sumSettledRefunds(after) === 0, String(sumSettledRefunds(after)));
     ok(
       'so the order sits at "Refund Pending" — the state neither cancel path recognised',
@@ -316,6 +328,11 @@ try {
     const afterFirst = await OrderModel.findById(order._id);
     ok("a collected COD order records the obligation", afterFirst.refunds.length === 1, String(afterFirst.refunds.length));
     ok("as a manual payout", afterFirst.refunds[0].paymentProvider === "manual", afterFirst.refunds[0].paymentProvider);
+    ok(
+      "owed, and confirmed by a human — COD never reaches the gateway",
+      afterFirst.refunds[0].status === "owed" && afterFirst.refunds[0].confirmationMethod === "manual",
+      `${afterFirst.refunds[0].status} ${afterFirst.refunds[0].confirmationMethod}`,
+    );
     ok("leaving Refund Pending", afterFirst.paymentStatus === "Refund Pending", afterFirst.paymentStatus);
 
     await partialCancel(order, product, 1);
@@ -332,7 +349,7 @@ try {
 
   {
     // Payments are disabled in this suite, so nothing can reach Razorpay at all —
-    // every row stays "created". The guard that matters is that no row is ever
+    // every row is recorded "owed". The guard that matters is that no row is ever
     // recorded twice under one key, which is what settleGatewayRefund keys on.
     const product = await makeProduct("no-dupes");
     const order = await makeOrder({ product, units: 4 });
@@ -351,6 +368,127 @@ try {
       `${money(sumRefunded(after))} of ${after.totalAmount}`,
     );
     ok("which is exactly 800", money(sumRefunded(after)) === 800, String(money(sumRefunded(after))));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  section("the owed rows are in the owed-refunds queue, and settle by hand");
+
+  const admin = { id: String(new mongoose.Types.ObjectId()), roles: ["admin"] };
+  // The queue is global and paginated; walk it to find this suite's rows.
+  const owedListRows = async () => {
+    const rows = [];
+    for (let page = 1; page <= 50; page += 1) {
+      let payload;
+      await owedController.AdminGetOwedRefunds(
+        { query: { page: String(page), limit: "100" }, user: admin },
+        { status() { return this; }, json(data) { payload = data; return this; } },
+      );
+      rows.push(...(payload?.data || []));
+      if (!payload || page >= (payload.pagination?.totalPages || 1)) break;
+    }
+    return rows;
+  };
+  const settleManual = (orderId, refundId, reference) =>
+    callController(owedController.AdminSettleOwedRefundManually, {
+      params: { orderId: String(orderId), refundId: String(refundId) },
+      body: { method: "upi", reference },
+      user: admin,
+    });
+
+  {
+    const product = await makeProduct("owed-queue");
+    const order = await makeOrder({ product, units: 2 }); // Razorpay, payments off
+    await fullCancel(order);
+    const cancelled = await OrderModel.findById(order._id);
+    const row = cancelled.refunds[0];
+    ok("the cancellation refund is owed", row?.status === "owed", row?.status);
+
+    const listed = (await owedListRows()).find((entry) => String(entry.refundId) === String(row._id));
+    ok("it appears in the owed-refunds list", Boolean(listed));
+    ok(
+      "marked manualPayable — Razorpay cannot pay it while payments are off",
+      listed?.manualPayable === true && listed?.gatewayPayable === false,
+      JSON.stringify({ manualPayable: listed?.manualPayable, gatewayPayable: listed?.gatewayPayable }),
+    );
+    ok("with its refundStatus", listed?.refundStatus === "owed", listed?.refundStatus);
+
+    const settled = await settleManual(order._id, row._id, `UTR-${MARKER}-owed`);
+    ok("settle-manual accepts it", settled.statusCode === 200, `${settled.statusCode} ${settled.body?.message}`);
+    const after = await OrderModel.findById(order._id);
+    ok("the row is processed", after.refunds[0].status === "processed", after.refunds[0].status);
+    ok("and the order Refunded", after.paymentStatus === "Refunded", after.paymentStatus);
+
+    const again = await settleManual(order._id, row._id, `UTR-${MARKER}-owed-2`);
+    ok("a second settle is refused", again.statusCode === 409 && again.body?.code === "REFUND_NOT_OWED",
+      `${again.statusCode} ${again.body?.code}`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  section("legacy never-attempted `created` rows are settleable; attempted ones are not");
+
+  {
+    const product = await makeProduct("legacy-created");
+    const order = await makeOrder({ product, units: 5, paymentMethod: "COD", paymentStatus: "Paid" }); // 1000
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const legacyRow = (overrides = {}) => ({
+      _id: new mongoose.Types.ObjectId(),
+      paymentProvider: "manual",
+      amount: 100,
+      reason: "Order cancelled by customer — legacy",
+      status: "created",
+      idempotencyKey: `legacy-${new mongoose.Types.ObjectId()}`,
+      createdAt: hourAgo,
+      ...overrides,
+    });
+    const legacy = legacyRow();
+    const fresh = legacyRow({ createdAt: new Date() });
+    const attempted = legacyRow({ gatewayAttemptedAt: hourAgo });
+    const withFailure = legacyRow({ failureReason: "BAD_REQUEST_ERROR" });
+    const forReturn = legacyRow({ returnRequest: new mongoose.Types.ObjectId() });
+    const withRefundId = legacyRow({ providerRefundId: `rfnd_${MARKER}_legacy` });
+    await OrderModel.updateOne(
+      { _id: order._id },
+      {
+        $set: { paymentStatus: "Refund Pending" },
+        $push: { refunds: { $each: [legacy, fresh, attempted, withFailure, forReturn, withRefundId] } },
+      },
+    );
+
+    const listedIds = new Set((await owedListRows()).map((entry) => String(entry.refundId)));
+    ok("the old never-attempted created row is listed", listedIds.has(String(legacy._id)));
+    ok("a fresh one is not (its gateway call may be a moment away)", !listedIds.has(String(fresh._id)));
+    ok(
+      "rows with an attempt time, failure reason, return or refund id are not listed",
+      ![attempted, withFailure, forReturn, withRefundId].some((row) => listedIds.has(String(row._id))),
+    );
+    const listedLegacy = (await owedListRows()).find((entry) => String(entry.refundId) === String(legacy._id));
+    ok("it is manualPayable (COD)", listedLegacy?.manualPayable === true, String(listedLegacy?.manualPayable));
+    ok("and reports refundStatus created", listedLegacy?.refundStatus === "created", listedLegacy?.refundStatus);
+
+    const settled = await settleManual(order._id, legacy._id, `UTR-${MARKER}-legacy`);
+    ok("settle-manual settles the legacy created row", settled.statusCode === 200,
+      `${settled.statusCode} ${settled.body?.message}`);
+    const afterLegacy = await OrderModel.findById(order._id);
+    ok("it is processed", afterLegacy.refunds.id(legacy._id)?.status === "processed",
+      afterLegacy.refunds.id(legacy._id)?.status);
+
+    for (const [label, row] of [
+      ["a gatewayAttemptedAt", attempted],
+      ["a failureReason", withFailure],
+      ["a returnRequest", forReturn],
+    ]) {
+      const refused = await settleManual(order._id, row._id, `UTR-${MARKER}-${row._id}`);
+      ok(
+        `a created row with ${label} is refused (409 REFUND_NOT_OWED)`,
+        refused.statusCode === 409 && refused.body?.code === "REFUND_NOT_OWED",
+        `${refused.statusCode} ${refused.body?.code}`,
+      );
+    }
+    const untouched = await OrderModel.findById(order._id);
+    ok(
+      "and none of them moved",
+      [attempted, withFailure, forReturn].every((row) => untouched.refunds.id(row._id)?.status === "created"),
+    );
   }
 } catch (error) {
   console.error(`\nSUITE ABORTED: ${error?.stack || error}`);

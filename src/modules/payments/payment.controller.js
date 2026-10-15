@@ -7,6 +7,7 @@ import {
 } from "../../config/features.config.js";
 import {
   notifyPaymentFailed,
+  notifyRefundInitiated,
   notifyRefundProcessed,
 } from "../notifications/notification.service.js";
 import { orderError, prepareOrderData } from "../orders/order-pricing.service.js";
@@ -29,9 +30,11 @@ import {
   claimRefundSlot,
   deriveRefundIdempotencyKey,
   findGatewayRefundByNote,
-  recomputeRefundState,
+  mapGatewayRefundStatus,
   settleRefundRecord,
+  writeRefundSettlement,
 } from "./return-refund.service.js";
+import { applyRazorpayRefundWebhook } from "./refund-sync.service.js";
 import {
   isUnrecoverableCapture,
   refundOrphanedCapture,
@@ -381,7 +384,9 @@ export const VerifyRazorpayPayment = async (req, res) => {
           paymentIntentId: intent._id,
           reason: "payment_refunded_after_order_failure",
         });
-        await notifyRefundProcessed({
+        // "Processed" only when Razorpay said so; a normal-speed refund replies
+        // `pending`, and the customer is told it has been initiated.
+        await (outcome.gatewayStatus === "processed" ? notifyRefundProcessed : notifyRefundInitiated)({
           orderId: storeOrder?._id || intent.storeOrder || null,
           paymentId: capturedPayment.id,
         });
@@ -416,8 +421,10 @@ export const VerifyRazorpayPayment = async (req, res) => {
     // this path is reachable via a 409 from a concurrent verify/webhook that
     // actually succeeded.
     if (!orderExistsForIntent) {
+      // pendingOrder is the order the customer was shown at checkout (order-first);
+      // without it this notification had no order and reached nobody useful.
       await notifyPaymentFailed({
-        orderId: storeOrder?._id || intent?.storeOrder || null,
+        orderId: storeOrder?._id || intent?.storeOrder || intent?.pendingOrder || null,
         reason: getRazorpayErrorMessage(error),
       });
     }
@@ -457,6 +464,40 @@ export const RetryRazorpayOrder = async (req, res) => {
       });
     }
 
+    // ── THE ORDER MUST STILL BE PAYABLE ──────────────────────────────────────
+    // Claimed BEFORE a new Razorpay order is minted. The intent alone is not
+    // enough: an order swept to Cancelled (or cancelled by the customer/admin)
+    // could leave its intent at "created"/"failed", and a retry then took a
+    // payment for a checkout that could never be promoted — the capture landed on
+    // a Cancelled order and had to be refunded. Extending paymentExpiresAt in the
+    // same write also stops the abandoned-checkout sweeper cancelling the order
+    // while the customer is paying on the new Razorpay order.
+    if (intent.pendingOrder) {
+      const live = await OrderModel.findOneAndUpdate(
+        { _id: intent.pendingOrder, orderStatus: "Pending", paymentStatus: "Pending" },
+        { $set: { paymentExpiresAt: new Date(Date.now() + AWAITING_PAYMENT_TTL_MS) } },
+        { returnDocument: "after" },
+      );
+      if (!live) {
+        // Close the intent too, so this checkout is refused at the intent lookup
+        // next time instead of reaching this check again.
+        await PaymentIntent.updateOne(
+          { _id: intent._id, status: { $in: ["created", "failed"] }, storeOrder: null },
+          {
+            $set: {
+              status: "expired",
+              failureReason: "Order is no longer awaiting payment",
+            },
+          },
+        );
+        return res.status(409).json({
+          success: false,
+          code: "ORDER_NOT_PAYABLE",
+          message: "This checkout has expired — please start a new checkout",
+        });
+      }
+    }
+
     const { razorpay, keyId } = getRazorpay();
     const receipt = createRazorpayReceipt("retry");
     const razorpayOrder = await razorpay.orders.create({
@@ -489,7 +530,7 @@ export const RetryRazorpayOrder = async (req, res) => {
     // retry — the same failure H-14 fixed on the intent side.
     if (intent.pendingOrder) {
       await OrderModel.updateOne(
-        { _id: intent.pendingOrder, paymentStatus: "Pending" },
+        { _id: intent.pendingOrder, orderStatus: "Pending", paymentStatus: "Pending" },
         {
           $set: {
             razorpayOrderId: razorpayOrder.id,
@@ -640,24 +681,54 @@ export const RefundRazorpayPayment = async (req, res) => {
     // attempt may or may not have reached Razorpay. Ask before trying again —
     // "unknown" is not "didn't happen".
     if (!claim.created) {
+      // Refunds already recorded on OTHER rows are not this row's. Without the
+      // exclusion, a retry after a declined refund (same key, new row) would find
+      // the old declined refund by its note and mark this row failed too.
+      const excludeRefundIds = (claim.order?.refunds || [])
+        .filter((row) => String(row._id) !== String(pending._id) && row.providerRefundId)
+        .map((row) => String(row.providerRefundId));
       const gatewayRefund = await findGatewayRefundByNote({
         order: claim.order,
         noteKey: "refundKey",
         noteValue: idempotencyKey,
         label: `order ${order._id}`,
+        excludeRefundIds,
       });
       if (gatewayRefund) {
+        // Mapped, not assumed: `pending` is NOT `processed`. Treating every
+        // non-failed reply as processed showed orders as Refunded before any
+        // money had moved.
+        const adoptedStatus = mapGatewayRefundStatus(gatewayRefund.status);
         const settled = await settleRefundRecord({
           orderId: order._id,
           refundId: pending._id,
           providerRefundId: gatewayRefund.id,
-          status: gatewayRefund.status === "failed" ? "failed" : "processed",
+          status: adoptedStatus,
+          ...(adoptedStatus === "failed"
+            ? { failureReason: gatewayRefund.error_description || "Razorpay declined the refund" }
+            : {}),
         });
+        if (adoptedStatus === "failed") {
+          // The earlier attempt reached Razorpay and was declined. The row is now
+          // `failed`, which claimRefundSlot ignores, so retrying with the same
+          // key records a fresh attempt rather than adopting this one again.
+          return res.status(502).json({
+            success: false,
+            message:
+              "Razorpay declined the earlier attempt at this refund, so no money has moved. You can retry the refund.",
+            code: "GATEWAY_REFUND_REJECTED",
+            order: settled,
+          });
+        }
         return res.status(200).json({
           success: true,
-          message: "Refund reconciled against Razorpay — no second refund was issued",
+          message:
+            adoptedStatus === "processed"
+              ? "Refund reconciled against Razorpay — no second refund was issued"
+              : "Refund already accepted by Razorpay — settles in 5–7 working days. No second refund was issued.",
           idempotent: true,
           adopted: true,
+          ...(adoptedStatus === "created" ? { pending: true } : {}),
           order: settled,
         });
       }
@@ -699,24 +770,74 @@ export const RefundRazorpayPayment = async (req, res) => {
     // Positional update rather than order.save(): the claim wrote via the
     // collection, so saving this stale in-memory document could drop a refund row
     // a concurrent handler legitimately added.
-    order = await settleRefundRecord({
-      orderId: order._id,
+    //
+    // What Razorpay said, mapped: `processed` is settled, `failed` is declined,
+    // and anything else (`pending` is the normal reply at speed "normal") is
+    // accepted-but-unsettled and stays `created` until the refund webhook or the
+    // refund-status poller settles it. Only a settled refund is "processed".
+    const replyStatus = mapGatewayRefundStatus(refund.status);
+    const orderId = order._id;
+    const razorpayPaymentId = order.razorpayPaymentId;
+    const settlement = await writeRefundSettlement({
+      orderId,
       refundId: pending._id,
       providerRefundId: refund.id,
-      status: refund.status === "failed" ? "failed" : "processed",
+      status: replyStatus,
+      ...(replyStatus === "failed"
+        ? { failureReason: refund.error_description || "Razorpay declined the refund" }
+        : {}),
     });
+    order = settlement.order;
+    // The refund webhook can land between Razorpay's reply and the write above
+    // (it finds the row by notes.refundKey). It then settled the row and sent the
+    // customer notice itself, and our guarded write matched nothing. Report what
+    // the ROW says, and do not notify a second time.
+    const settledElsewhere = !settlement.transitioned;
+    const refundStatus = settledElsewhere
+      ? order?.refunds?.id(pending._id)?.status || replyStatus
+      : replyStatus;
 
+    // Written for every outcome, including a decline: the admin did ask for money
+    // to move, and the record of that request must not depend on the answer.
+    const outcomeLabel = {
+      processed: "Refunded",
+      created: "Refund accepted by Razorpay (pending)",
+      failed: "Refund declined by Razorpay",
+    }[refundStatus];
     await createAuditLog({
       admin: req.user.id,
       action: "REFUND_PAYMENT",
       module: "PAYMENT",
-      targetId: order._id,
-      targetName: String(order._id),
-      description: `Refunded ₹${amountRupees} (${speed}) — ${String(req.body?.reason || "no reason given")}`,
+      targetId: orderId,
+      targetName: String(orderId),
+      description: `${outcomeLabel} ₹${amountRupees} (${speed}) — ${String(req.body?.reason || "no reason given")}`,
       req,
     });
 
-    await notifyRefundProcessed({ orderId: order._id, paymentId: order.razorpayPaymentId });
+    if (refundStatus === "failed") {
+      return res.status(502).json({
+        success: false,
+        message: `Razorpay declined this refund${
+          refund.error_description ? `: ${refund.error_description}` : ""
+        }. No money has moved — you can retry the refund.`,
+        code: "GATEWAY_REFUND_REJECTED",
+        refund,
+        order,
+      });
+    }
+
+    if (refundStatus === "created") {
+      if (!settledElsewhere) await notifyRefundInitiated({ orderId, paymentId: razorpayPaymentId });
+      return res.status(200).json({
+        success: true,
+        pending: true,
+        message: "Refund accepted by Razorpay — settles in 5–7 working days",
+        refund,
+        order,
+      });
+    }
+
+    if (!settledElsewhere) await notifyRefundProcessed({ orderId, paymentId: razorpayPaymentId });
 
     return res.status(200).json({
       success: true,
@@ -900,7 +1021,10 @@ export const RazorpayWebhook = async (req, res) => {
             });
           }
 
-          await notifyRefundProcessed({
+          // "Processed" only when Razorpay said so. A normal-speed refund replies
+          // `pending` (and an earlier delivery's outcome is not re-read here), so
+          // anything else is announced as initiated.
+          await (outcome.gatewayStatus === "processed" ? notifyRefundProcessed : notifyRefundInitiated)({
             orderId: intent.pendingOrder || null,
             paymentId: payment.id,
           }).catch(() => {});
@@ -932,13 +1056,37 @@ export const RazorpayWebhook = async (req, res) => {
         { returnDocument: "after" },
       );
 
+      //
+      // Matched on the CURRENT razorpayOrderId only, never on
+      // previousRazorpayOrderIds. A failure on a superseded Razorpay order is about
+      // an attempt the customer has already moved on from; matching it would mark
+      // the live retry failed and release the stock it is holding while the
+      // customer is still paying for it.
       if (failed) {
         await releaseReservation({ paymentIntentId: failed._id, reason: "payment_failed" });
-        await notifyPaymentFailed({ orderId: failed.storeOrder || null, reason: "Payment failed" });
+        // pendingOrder first: order-first checkouts carry the order the customer
+        // was shown there, and storeOrder is never set on an attempt that failed.
+        await notifyPaymentFailed({
+          orderId: failed.pendingOrder || failed.storeOrder || null,
+          reason: "Payment failed",
+        });
+      } else {
+        // Nothing matched: the intent was already completed or refunded, so this
+        // is a stale/duplicate event, or the failure belongs to a superseded
+        // Razorpay order. Ignoring it also stops the customer being told their
+        // successful payment failed. Read-only check, logged so a superseded-id
+        // failure is distinguishable from a genuinely unknown one.
+        const superseded = await PaymentIntent.exists({
+          previousRazorpayOrderIds: payment.order_id,
+        });
+        if (superseded) {
+          logLifecycleEvent("payments", "payment_failed_on_superseded_order", {
+            paymentIntentId: String(superseded._id),
+            razorpayOrderId: payment.order_id,
+            paymentId: payment.id || "",
+          });
+        }
       }
-      // Nothing matched: the intent was already completed or refunded, so this
-      // is a stale/duplicate event. Ignoring it also stops the customer being
-      // told their successful payment failed.
     }
 
     // ─── REFUND EVENTS ──────────────────────────────────────────────────────
@@ -947,31 +1095,19 @@ export const RazorpayWebhook = async (req, res) => {
     // gateway-failed refund stayed "processed" in our ledger forever with the
     // customer already notified — the exact "says refunded but isn't" failure
     // this system is built to avoid.
+    //
+    // The resolution lives in applyRazorpayRefundWebhook: it finds the ledger row
+    // by refund id (or by payment id plus the refund's notes when the row never
+    // learned its id), moves it with a compare-and-swap so a replayed or
+    // out-of-order event cannot regress a settled row, recomputes paymentStatus,
+    // and notifies only on the write that actually changed something. A refund
+    // with no order behind it (an orphaned-capture refund) marks its
+    // unmatchedpayments row failed instead. Errors propagate to the 5xx below so
+    // Razorpay retries.
     if (event === "refund.processed" || event === "refund.failed") {
       const refundEntity = req.body?.payload?.refund?.entity;
-      const refundId = refundEntity?.id;
-
-      if (refundId) {
-        const order = await OrderModel.findOne({ "refunds.providerRefundId": refundId });
-        if (order) {
-          const record = order.refunds.find(
-            (entry) => String(entry.providerRefundId) === String(refundId),
-          );
-          if (record) {
-            if (event === "refund.processed") {
-              record.status = "processed";
-              record.processedAt = new Date();
-              record.failureReason = "";
-            } else {
-              record.status = "failed";
-              record.failureReason =
-                refundEntity?.error_description || "Razorpay reported the refund as failed";
-            }
-            // Recomputes paymentStatus from settled money only, so a failed
-            // refund correctly drops the order back out of "Refunded".
-            await recomputeRefundState(order);
-          }
-        }
+      if (refundEntity?.id) {
+        await applyRazorpayRefundWebhook({ event, refundEntity });
       }
     }
 

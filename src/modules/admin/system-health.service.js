@@ -8,6 +8,7 @@ import {
   listPickupLocations,
 } from "../shipping/shiprocket.service.js";
 import { countUnresolvedOrphanedCaptures } from "../payments/orphaned-capture.service.js";
+import { listUnresolvedFailedRefunds } from "../payments/return-refund.service.js";
 
 /**
  * Operational health / configuration report for the admin panel.
@@ -180,6 +181,26 @@ const paymentChecks = async () => {
     );
   } catch {
     // Collection not created yet — nothing has ever been orphaned, so not a fault.
+  }
+
+  // Failed gateway refunds nothing has replaced. A failed row is outside every
+  // ledger sum, so the order no longer reads as owing anything — the debt is
+  // visible only here and in the outstanding-refunds queue.
+  try {
+    const failedRefunds = (await listUnresolvedFailedRefunds()).length;
+    checks.push(
+      failedRefunds === 0
+        ? check("pay.failedRefunds", "Failed refunds", OK, "None outstanding — every failed refund has been retried or re-issued.")
+        : check(
+            "pay.failedRefunds",
+            "Failed refunds",
+            WARN,
+            `${failedRefunds} refund(s) failed at Razorpay and have not been retried.`,
+            "The customer is still owed this money. Retry each one from Outstanding Refunds (or the order page) once the cause is resolved.",
+          ),
+    );
+  } catch {
+    // Reporting only — a failed count must not take the health page down.
   }
 
   return checks;

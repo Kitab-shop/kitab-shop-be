@@ -1,10 +1,7 @@
 import mongoose from "mongoose";
 import OrderModel from "./Order.model.js";
-import PaymentIntent from "../payments/PaymentIntent.model.js";
 import UserProfile from "../profiles/UserProfile.model.js";
 import ReferralSetting from "../referral/ReferralSetting.model.js";
-import CouponModel from "../coupons/coupon.model.js";
-import CouponRedemption from "../coupons/coupon-redemption.model.js";
 import CheckoutSetting from "./CheckoutSetting.model.js";
 import CodVerification from "./CodVerification.model.js";
 import { isStockEnforced } from "../../config/features.config.js";
@@ -13,7 +10,9 @@ import {
   notifyOrderClosed,
   notifyOrderCompleted,
   notifyOrderPlaced,
+  notifyRefundInitiated,
   notifyRefundProcessed,
+  notifyShipmentUpdated,
 } from "../notifications/notification.service.js";
 import {
   sendOrderCancelledEmail,
@@ -23,7 +22,10 @@ import {
 } from "../notifications/order-emails.js";
 import UserModel from "../../model/User.model.js";
 import { prepareOrderData } from "./order-pricing.service.js";
-import { calculateCouponDiscount } from "../coupons/coupon.service.js";
+import {
+  calculateCouponDiscount,
+  releaseOrderCouponRedemption,
+} from "../coupons/coupon.service.js";
 import { ADMIN_PERMISSIONS, hasAdminRole } from "../../config/admin-permissions.config.js";
 // No direct Shiprocket import here any more: courier calls, their feature-flag
 // gating and their failure recording all live in order-shipping.service.js, so
@@ -40,8 +42,10 @@ import {
   resolveVariantId,
 } from "../inventory/variant.service.js";
 import { restockRtoOrder } from "../inventory/restock.service.js";
-import { releaseReservation } from "../inventory/inventory-reservation.service.js";
+import { closeUnpaidCheckout } from "../payments/unpaid-checkout.service.js";
+import { releaseRtoOrderCredits } from "./rto-compensation.service.js";
 import { createAuditLog } from "../audit/audit-log.js";
+import ReturnModel from "../returns/return.model.js";
 import {
   AWAITING_PAYMENT_TTL_MS,
   EXCLUDE_AWAITING_PAYMENT,
@@ -50,6 +54,8 @@ import {
 import {
   canAutoRefund,
   cancellationRefundKey,
+  claimRefundSlot,
+  findRefundReissue,
   proportionalRefundAmount,
   proportionalWalletRefund,
   recordRtoRefundObligation,
@@ -65,7 +71,7 @@ import { canTransitionOrderStatus } from "./order-status.rules.js";
 // cancellation path.
 import { adminHasPermission } from "../../config/admin-access.service.js";
 import { ensureBillNumber } from "./bill-number.service.js";
-import { logLifecycleError, logLifecycleEvent } from "../../utils/lifecycle-logger.service.js";
+import { logLifecycleError } from "../../utils/lifecycle-logger.service.js";
 
 const ADMIN_PURCHASE_MESSAGE =
   "Admin accounts cannot add products to cart or place orders. Please use a customer account.";
@@ -580,6 +586,17 @@ const SHIPMENT_PROVIDERS_FOR_MIRROR = OrderModel.schema
 const hasRecordedShipmentProvider = (order) =>
   SHIPMENT_PROVIDERS_FOR_MIRROR.includes(order?.shipment?.provider);
 
+// The statuses a courier feed reports. A manual move to one of them is announced
+// to the customer the same way the courier webhook announces it.
+const SHIPMENT_NOTIFY_STATUSES = [
+  "Shipped",
+  "Out For Delivery",
+  "NDR",
+  "Delivered",
+  "RTO",
+  "RTO Received",
+];
+
 // The customer's email for lifecycle mails. Best-effort: a missing account or
 // a lookup failure returns "", and the mail senders no-op on an empty address.
 const emailForOrder = async (order) => {
@@ -839,6 +856,14 @@ export const UpdateOrderStatus = async (req, res) => {
     if (hasRecordedShipmentProvider(order)) {
       set["shipment.status"] = orderStatus;
     }
+    // Leaving NDR by hand clears the courier-side "ndr" flag, the same as a courier
+    // event that moves the parcel on does (courier-event.service.js). Left behind,
+    // it kept the order in the shipping-exceptions queue — which filters on
+    // syncStatus — long after the delivery problem was resolved. A move to RTO
+    // records that instead; anything else is back on an assigned AWB.
+    if (order.shiprocket?.syncStatus === "ndr" && orderStatus !== "NDR") {
+      set["shiprocket.syncStatus"] = orderStatus === "RTO" ? "rto" : "awb_assigned";
+    }
 
     const updated = await OrderModel.findOneAndUpdate(
       { _id: order._id, orderStatus: previousStatus },
@@ -931,6 +956,22 @@ export const UpdateOrderStatus = async (req, res) => {
           source: "manual_status_update",
         });
       }
+
+      // The wallet balance and coupon use the order spent come back too — on COD
+      // as well as prepaid, since an RTO delivered nothing. Its own try for the
+      // same reason as the obligation above, and idempotent against the courier
+      // webhook making the same move (see rto-compensation.service.js).
+      try {
+        const credits = await releaseRtoOrderCredits(order._id);
+        if (credits.walletCredited > 0 || credits.couponReleased) {
+          order = (await OrderModel.findById(order._id)) || order;
+        }
+      } catch (error) {
+        logLifecycleError("orders", "rto_credit_release_failed", error, {
+          orderId: String(order._id),
+          source: "manual_status_update",
+        });
+      }
     }
 
     // Delivery is the point of supply, so it is where the bill of supply gets its
@@ -959,6 +1000,14 @@ export const UpdateOrderStatus = async (req, res) => {
           orderStatus,
         });
       }
+    }
+
+    // A courier-type move made by hand tells the customer exactly what the courier
+    // webhook would have: an operator recording a dispatch or a delivery the feed
+    // missed is the same news to the customer. Only the request that won the status
+    // CAS reaches here, so a double-click notifies once. Fire-and-forget.
+    if (SHIPMENT_NOTIFY_STATUSES.includes(orderStatus)) {
+      notifyShipmentUpdated({ orderId: order._id, status: orderStatus }).catch(() => {});
     }
 
     // The success sign-off: tell the customer their order completed. Fire-and-
@@ -1263,7 +1312,13 @@ export const PartialCancelOrder = async (req, res) => {
           providerPaymentId: order.razorpayPaymentId || "",
           amount: refundAmount,
           reason: String(reason || "Partial cancellation").trim(),
-          status: "created",
+          // `created` only when the gateway call below will actually be made: the
+          // state means "the gateway was called and the outcome is unknown". A row
+          // nothing will ever send — COD, or Razorpay switched off — is `owed`, so
+          // it lands in the owed-refunds queue instead of reading as an attempt
+          // stuck in flight that no queue ever offered for payment.
+          status: canAutoRefund(order) ? "created" : "owed",
+          confirmationMethod: order.paymentMethod === "RAZORPAY" ? "gateway" : "manual",
           idempotencyKey: refundKey,
           createdBy: req.user.id,
         });
@@ -1319,6 +1374,7 @@ export const PartialCancelOrder = async (req, res) => {
     // Money moves only after the cancellation is durably committed — an external
     // payment call inside the transaction could succeed while the transaction
     // rolled back.
+    let refundStatus = null;
     if (refundOwed && canAutoRefund(order)) {
       const pending = order.refunds.find((entry) => entry.idempotencyKey === refundKey);
       if (pending) {
@@ -1326,7 +1382,7 @@ export const PartialCancelOrder = async (req, res) => {
         // The behaviour here was already close to correct; what it lacked was
         // `notes.refundKey`, so a lost gateway response left a `created` row with
         // no way to ask Razorpay whether the money had actually gone.
-        await settleGatewayRefund({
+        const settled = await settleGatewayRefund({
           order,
           refundId: pending._id,
           amount: refundAmountOwed,
@@ -1334,6 +1390,7 @@ export const PartialCancelOrder = async (req, res) => {
           reason: `Partial cancellation on order ${order._id}`,
         });
         order = await OrderModel.findById(req.params.orderId);
+        refundStatus = settledRefundStatus(settled, order, pending._id);
       }
     }
 
@@ -1341,15 +1398,10 @@ export const PartialCancelOrder = async (req, res) => {
     // order stays active AND has no shipment (the guard above), and Shiprocket's
     // /orders/cancel cancels a whole order and cannot express "one unit of two".
 
-    // Only claim a refund to the customer once one has demonstrably happened.
-    // This previously fired unconditionally — even on a COD order still at
-    // "Pending", where nothing was ever owed.
-    if (order.paymentStatus === "Refunded" || order.paymentStatus === "Partially Refunded") {
-      await notifyRefundProcessed({
-        orderId: order._id,
-        paymentId: order.razorpayPaymentId || null,
-      });
-    }
+    // Tell the customer what THIS refund's gateway reply actually said. It used to
+    // read the order's paymentStatus, which describes every refund on the order —
+    // an earlier settled refund made this one look processed too.
+    await notifyCancellationRefund({ order, refundStatus });
 
     return res.status(200).json({
       success: true,
@@ -1559,16 +1611,134 @@ export const ReconcileOrderRefund = async (req, res) => {
       });
     }
 
-    // Rows written before reconciliation keys existed have nothing to match on at
-    // the gateway. Say so rather than refunding blindly, which is the one thing
-    // this endpoint must never do.
-    if (!record.idempotencyKey) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "This refund predates reconciliation keys, so it cannot be matched at Razorpay automatically. Check the Razorpay dashboard and settle it manually.",
-        code: "REFUND_NOT_RECONCILABLE",
+    // The return this row settles, when it settles one. Its number is the key every
+    // gateway refund for a return carries (notes.returnNumber), so it is how a
+    // keyless return row is found at Razorpay and what a retry for it must carry.
+    let returnNumber = null;
+    if (record.returnRequest) {
+      const returnDoc = await ReturnModel.findById(record.returnRequest)
+        .select("returnNumber")
+        .lean();
+      returnNumber = returnDoc?.returnNumber || null;
+    }
+
+    // What the settle below is told. Defaults describe an ordinary keyed row.
+    const originalRecord = record;
+    let refundKey = record.idempotencyKey || null;
+    let lookupNote;
+    let extraNotes = returnNumber ? { returnNumber } : {};
+    let forceLookup = false;
+    let isRetry = false;
+
+    // ── A FAILED ROW: RETRY IT AS A NEW ROW, NEVER BY REVIVING THE OLD ONE ────
+    // `failed` is a settled fact — Razorpay said the money did not move — and the
+    // row stays failed forever, so the ledger keeps the history. A retry is a new
+    // refund, recorded as its own row before any gateway call, exactly like every
+    // other refund: claimRefundSlot puts the idempotency key and the order-total
+    // ceiling in the FILTER of one conditional push, so two operators pressing
+    // "Retry refund" together create one row, and the gateway-attempt claim inside
+    // settleGatewayRefund then lets one of them call Razorpay.
+    //
+    // The key is derived from the failed row's chain root (`retry:<rootId>`), so a
+    // repeat of the same retry — from any failed link of the chain — adopts the
+    // row it already created rather than issuing a second one. The REASON is copied unchanged on purpose: an RTO obligation is
+    // recognised by its reason (`RTO <orderId>`), so a retry row carrying it is
+    // what stops a replayed courier event from recording the debt a second time.
+    if (record.status === "failed") {
+      if (record.confirmationMethod === "manual" || !canAutoRefund(order)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "This refund cannot be retried through Razorpay. Pay the customer directly and record the payout and its reference from the owed refunds list.",
+          code: "MANUAL_REFUND_ONLY",
+        });
+      }
+
+      // ── ONE KEY PER RETRY CHAIN ───────────────────────────────────────────
+      // A failed retry row is itself retryable, and keying ITS retry on its own id
+      // gave every link of the chain a fresh key: A fails → retry R1 fails → retry
+      // A again (R2, live) → retry R1 (R3, new key) paid the customer twice. Every
+      // row of a chain therefore shares the root's key, so a live row anywhere in
+      // the chain is found by claimRefundSlot and adopted, while a chain whose
+      // every attempt failed can still be retried (failed rows never block).
+      const retryKey = String(record.idempotencyKey || "").startsWith("retry:")
+        ? record.idempotencyKey
+        : `retry:${record._id}`;
+
+      // ── ALREADY RE-ISSUED ANOTHER WAY ─────────────────────────────────────
+      // The chain's own live row is adopted below; anything else that already pays
+      // this money makes a retry a second payout: a failed RETURN refund re-issued
+      // through the returns flow, or the same refund re-sent through the generic
+      // Refund form after this one failed (findRefundReissue).
+      const reissued = findRefundReissue(order, record, { includeChain: false });
+      if (reissued) {
+        return res.status(409).json({
+          success: false,
+          message: record.returnRequest
+            ? "This return has already been refunded again through a newer refund on this order. Check that one instead — retrying this row would pay the customer twice."
+            : "This refund has already been issued again through a newer refund on this order. Check that one instead — retrying this row would pay the customer twice.",
+          code: "REFUND_ALREADY_REISSUED",
+        });
+      }
+
+      const slot = await claimRefundSlot({
+        orderId: order._id,
+        idempotencyKey: retryKey,
+        amount: record.amount,
+        // The check above read the ledger; this repeats the return half of it in
+        // the claim's filter, so a refund pushed from the Returns page in between
+        // still stops the retry.
+        blockIfLiveForReturn: record.returnRequest || null,
+        record: {
+          paymentProvider: "razorpay",
+          providerPaymentId: record.providerPaymentId || order.razorpayPaymentId || "",
+          returnRequest: record.returnRequest || null,
+          reason: record.reason,
+          status: "created",
+          confirmationMethod: "gateway",
+          createdBy: req.user.id,
+        },
       });
+
+      if (!slot.created && slot.refund?.status === "processed") {
+        return res.status(200).json({
+          success: true,
+          message: "This refund was already retried, and the retry has settled",
+          idempotent: true,
+          order: slot.order,
+        });
+      }
+
+      order = slot.order;
+      record = order.refunds.id(slot.refund._id);
+      if (!record) {
+        return res.status(404).json({ success: false, message: "Refund record not found on this order" });
+      }
+      refundKey = retryKey;
+      isRetry = true;
+    } else if (!record.idempotencyKey) {
+      // ── A KEYLESS ROW: RECONCILABLE IF RAZORPAY CAN STILL BE ASKED ABOUT IT ──
+      // Rows written before reconciliation keys existed, and every return row (the
+      // returns flow keys on returnNumber instead), have no notes.refundKey to
+      // match. Two facts still identify them at Razorpay:
+      //   - a recorded Razorpay refund id: the row is looked up by it directly;
+      //   - a return: its gateway refunds all carry notes.returnNumber, so the
+      //     lookup runs by that, forced, before anything is issued.
+      // A row with neither has nothing to match on, and refunding it blindly is
+      // the one thing this endpoint must never do.
+      if (record.providerRefundId) {
+        // settleGatewayRefund looks a `created` row with a refund id up by that id.
+      } else if (record.returnRequest && returnNumber) {
+        lookupNote = { key: "returnNumber", value: returnNumber };
+        forceLookup = true;
+      } else {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This refund predates reconciliation keys, so it cannot be matched at Razorpay automatically. Check the Razorpay dashboard and settle it manually.",
+          code: "REFUND_NOT_RECONCILABLE",
+        });
+      }
     }
 
     if (!canAutoRefund(order)) {
@@ -1584,11 +1754,15 @@ export const ReconcileOrderRefund = async (req, res) => {
       order,
       refundId: record._id,
       amount: record.amount,
-      refundKey: record.idempotencyKey,
       reason: record.reason || `Refund on order ${order._id}`,
+      ...(refundKey ? { refundKey } : {}),
+      ...(lookupNote ? { lookupNote } : {}),
+      ...(Object.keys(extraNotes).length > 0 ? { extraNotes } : {}),
+      ...(forceLookup ? { forceLookup } : {}),
     });
 
     const fresh = await OrderModel.findById(orderId);
+    const refundStatus = result.refundStatus || fresh?.refunds.id(record._id)?.status || null;
 
     if (result.outcome === "in_progress") {
       return res.status(409).json({
@@ -1613,6 +1787,21 @@ export const ReconcileOrderRefund = async (req, res) => {
         order: fresh,
       });
     }
+    if (result.outcome === "row_failed") {
+      // The row turned `failed` between the read above and the settle (a webhook
+      // or the poller recorded Razorpay's rejection). Retrying it is a separate,
+      // deliberate action — the "Retry refund" button — not something to do here.
+      return res.status(409).json({
+        success: false,
+        message:
+          "Razorpay has reported this refund as failed. Reload the order and use Retry refund to issue a new one.",
+        code: "REFUND_ROW_FAILED",
+        order: fresh,
+      });
+    }
+
+    const providerRefundId =
+      result.providerRefundId || fresh?.refunds.id(record._id)?.providerRefundId || "";
 
     await createAuditLog({
       admin: req.user.id,
@@ -1622,22 +1811,55 @@ export const ReconcileOrderRefund = async (req, res) => {
       targetName: String(order._id),
       description:
         result.outcome === "reconciled"
-          ? `Adopted existing Razorpay refund ${result.providerRefundId} for ₹${record.amount} — no second refund issued`
-          : record.status === "owed"
-            ? `Paid owed refund of ₹${record.amount} through Razorpay (${result.providerRefundId})`
-            : `Issued Razorpay refund ${result.providerRefundId} for ₹${record.amount} after confirming none existed`,
+          ? `Adopted existing Razorpay refund ${providerRefundId} for ₹${record.amount} (${refundStatus}) — no second refund issued`
+          : isRetry
+            ? `Retried failed refund ${originalRecord._id} of ₹${record.amount} through Razorpay (${providerRefundId}, ${refundStatus})`
+            : originalRecord.status === "owed"
+              ? `Paid owed refund of ₹${record.amount} through Razorpay (${providerRefundId}, ${refundStatus})`
+              : `Issued Razorpay refund ${providerRefundId} for ₹${record.amount} after confirming none existed (${refundStatus})`,
       req,
     });
 
+    // Razorpay rejected the refund outright. The row is `failed`; nothing moved.
+    if (refundStatus === "failed") {
+      return res.status(502).json({
+        success: false,
+        message:
+          "Razorpay declined this refund, so no money moved. Check the failure reason on the refund row, then use Retry refund once it is resolved.",
+        code: "GATEWAY_REFUND_REJECTED",
+        order: fresh,
+      });
+    }
+
+    // A refund this request issued is news for the customer; one it only adopted
+    // was announced by whoever issued it (or by the sync that settled it). Nor one
+    // the refund webhook settled — and announced — before Razorpay's reply was
+    // written (`notified`).
+    if (result.outcome === "refunded" && !result.notified) {
+      const payload = { orderId: order._id, paymentId: order.razorpayPaymentId || null };
+      if (refundStatus === "processed") {
+        await notifyRefundProcessed(payload).catch(() => {});
+      } else if (refundStatus === "created") {
+        await notifyRefundInitiated(payload).catch(() => {});
+      }
+    }
+
+    const pending = refundStatus === "created";
     return res.status(200).json({
       success: true,
-      message:
-        result.outcome === "reconciled"
+      message: pending
+        ? "Refund accepted by Razorpay — settles in 5–7 working days"
+        : result.outcome === "reconciled"
           ? "Refund reconciled against Razorpay — no second refund was issued"
-          : record.status === "owed"
-            ? "Owed refund paid through Razorpay"
-            : "Refund issued (Razorpay confirmed no earlier refund existed)",
+          : isRetry
+            ? "Failed refund retried through Razorpay"
+            : originalRecord.status === "owed"
+              ? "Owed refund paid through Razorpay"
+              : "Refund issued (Razorpay confirmed no earlier refund existed)",
       reconciled: result.outcome === "reconciled",
+      ...(pending ? { pending: true } : {}),
+      refundStatus,
+      ...(isRetry ? { retriedRefundId: originalRecord._id, refundId: record._id } : {}),
       order: fresh,
     });
   } catch (error) {
@@ -1754,6 +1976,42 @@ const CANCEL_REASONS = [
   "Want to change the address or payment method",
   "Other",
 ];
+
+/**
+ * What a cancellation refund's gateway call actually left the row at, for the
+ * customer notice: "processed" | "created" | "failed", or null when there is
+ * nothing to announce.
+ *
+ * Only an outcome where Razorpay actually answered about THIS refund counts:
+ * `refunded` (this call issued it) or `reconciled` (an earlier attempt was found).
+ * `gateway_failed`, `unconfirmed` and `in_progress` also report `created`, but
+ * there it means "outcome unknown", which is not news for the customer. A notice
+ * settleGatewayRefund already sent itself (`notified`) is not sent twice. Read per
+ * ROW, never off the order's paymentStatus, which sums every refund on the order.
+ */
+const settledRefundStatus = (settled, order, refundId) => {
+  if (!settled || settled.notified || settled.alreadySettled) return null;
+  if (!["refunded", "reconciled"].includes(settled.outcome)) return null;
+  return settled.refundStatus || order?.refunds?.id(refundId)?.status || null;
+};
+
+/**
+ * Tells the customer about a cancellation refund, by the gateway's answer:
+ * `processed` → refund processed; `created` (Razorpay accepted it, settlement
+ * pending) → refund initiated; anything else — failed, an owed row nothing has
+ * sent, an unknown outcome — says nothing, because nothing has demonstrably
+ * moved. The poller and the refund webhook send "processed" when a pending one
+ * settles. Never throws: the cancellation is already durable.
+ */
+const notifyCancellationRefund = async ({ order, refundStatus }) => {
+  if (!order) return;
+  const payload = { orderId: order._id, paymentId: order.razorpayPaymentId || null };
+  if (refundStatus === "processed") {
+    await notifyRefundProcessed(payload).catch(() => {});
+  } else if (refundStatus === "created") {
+    await notifyRefundInitiated(payload).catch(() => {});
+  }
+};
 
 /**
  * Shared core of a FULL order cancellation — everything after the caller's own
@@ -1913,7 +2171,8 @@ const executeOrderCancellation = async ({
       // made the claim above see a paid order instead).
       //
       // The stock hold and the payment intent live outside this transaction and
-      // are closed after commit — see closeUnpaidCheckout.
+      // are closed after commit — see closeUnpaidCheckout
+      // (payments/unpaid-checkout.service.js).
       if (isAwaitingPayment(claimed)) {
         await OrderModel.updateOne(
           { _id: claimed._id, paymentMethod: "RAZORPAY", paymentStatus: "Pending" },
@@ -1961,29 +2220,11 @@ const executeOrderCancellation = async ({
         session,
       });
 
-      if (claimed.coupon && claimed.couponDiscount > 0) {
-        // Two conditional updates rather than read-modify-save: the `$gte: 1` in each
-        // filter makes the decrement atomic, and updateOne skips Mongoose validators
-        // so this does not depend on the schema's `min` at all.
-        //
-        // Per-customer count first, coupon total second, and the total moves ONLY if
-        // the per-customer row actually did. Ordering it the other way, or moving the
-        // total unconditionally, would let a double-release free two global slots
-        // against one real redemption — which, with globalMaxRedemptions now gating
-        // money, is the difference between a budget of 100 and a budget of 101.
-        const released = await CouponRedemption.updateOne(
-          { coupon: claimed.coupon, user: claimed.user, count: { $gte: 1 } },
-          { $inc: { count: -1 } },
-          { session },
-        );
-        if (released.modifiedCount === 1) {
-          await CouponModel.updateOne(
-            { couponId: claimed.coupon, usage: { $gte: 1 } },
-            { $inc: { usage: -1 } },
-            { session },
-          );
-        }
-      }
+      // Shared with the RTO path (releaseRtoOrderCredits), and claimed per order
+      // through `couponReleasedAt`, so however an order ends without being
+      // delivered its redemption is handed back exactly once. In this session, so
+      // a rolled-back cancellation leaves the coupon redeemed.
+      await releaseOrderCouponRedemption({ orderId: claimed._id, session });
 
       // Record that a refund is OWED, not that it happened. The gateway call is
       // deliberately made after this transaction commits: calling an external
@@ -2042,7 +2283,11 @@ const executeOrderCancellation = async ({
                 providerPaymentId: claimed.razorpayPaymentId || "",
                 amount: outstanding,
                 reason: `Order cancelled by ${source} — ${cancelReason}`,
-                status: "created",
+                // `created` only when the post-commit gateway call below will be
+                // made; otherwise the liability is `owed` and waits in the
+                // owed-refunds queue (see PartialCancelOrder for why).
+                status: canAutoRefund(claimed) ? "created" : "owed",
+                confirmationMethod: claimed.paymentMethod === "RAZORPAY" ? "gateway" : "manual",
                 idempotencyKey: refundKey,
                 createdBy: actorId,
               },
@@ -2059,11 +2304,14 @@ const executeOrderCancellation = async ({
     // collection, not this document), so re-read before using or returning it.
     order = await OrderModel.findById(orderId);
 
+    // Expires the payment intent and releases the stock hold — shared with the
+    // abandoned-checkout sweeper (payments/unpaid-checkout.service.js). Never throws.
     if (unpaidCheckout) await closeUnpaidCheckout(unpaidCheckout);
 
     // Now that the cancellation is durably committed, actually move the money.
     // A failure here leaves the order cancelled and the refund visibly pending
     // with its reason recorded, so it can be retried — never silently lost.
+    let refundStatus = null;
     if (refundOwed && order && canAutoRefund(order)) {
       // Located by its key, not by position: `.at(-1)` happened to work only
       // because nothing else could have appended in between.
@@ -2085,7 +2333,7 @@ const executeOrderCancellation = async ({
         //     `pending` (its normal-speed default) and might yet fail.
         //
         // paymentStatus is now derived from the ledger rather than asserted here.
-        await settleGatewayRefund({
+        const settled = await settleGatewayRefund({
           order,
           refundId: pendingRefund._id,
           // The outstanding balance, not the whole order total — a prior partial
@@ -2095,6 +2343,7 @@ const executeOrderCancellation = async ({
           reason: `Cancelled order ${order._id}`,
         });
         order = await OrderModel.findById(orderId);
+        refundStatus = settledRefundStatus(settled, order, pendingRefund._id);
       }
     }
 
@@ -2105,7 +2354,8 @@ const executeOrderCancellation = async ({
     // attempted per order.
     //
     // A failure here does not fail the cancellation. Safe because cancellation is
-    // only permitted before dispatch (Pending/Confirmed) and every fulfilment
+    // only permitted before dispatch (Pending/Confirmed, plus Packed for an admin
+    // or a delegated partial cancellation) and every fulfilment
     // endpoint refuses a Cancelled order (ensureFulfillable), so the parcel cannot
     // be progressed by this system afterwards. The shipment is left in the derived
     // pending state with the reason recorded, and is retryable.
@@ -2114,13 +2364,9 @@ const executeOrderCancellation = async ({
       order = await OrderModel.findById(orderId);
     }
 
-    // Only claim a refund to the customer once one has actually been processed.
-    if (order.paymentStatus === "Refunded") {
-      await notifyRefundProcessed({
-        orderId: order._id,
-        paymentId: order.razorpayPaymentId || null,
-      });
-    }
+    // Only claim a refund to the customer once Razorpay has said so — and say
+    // "initiated" when it has only accepted it.
+    await notifyCancellationRefund({ order, refundStatus });
 
     // Tell the customer. Queue row for future channels + a real email now —
     // both fire-and-forget: the cancellation is already durable, and a mail
@@ -2146,70 +2392,6 @@ const executeOrderCancellation = async ({
     return { order, shipmentCancellation, walletCredited };
   } finally {
     if (session) await session.endSession();
-  }
-};
-
-/**
- * Closes the payment side of a cancelled, never-paid checkout: expires its payment
- * intent and gives its stock hold back. Runs after the cancellation has committed.
- *
- * The intent is EXPIRED, not deleted and not failed. Deleting it would destroy the
- * only link from a late capture back to this customer and cart; "failed" is
- * retryable (RetryRazorpayOrder accepts it), and a retry would mint a new Razorpay
- * order for a checkout the customer has called off. An expired intent is refused by
- * both payment paths — completeCapturedIntent throws 409 "Payment session is
- * expired" — so a capture that lands anyway is recorded and refunded through
- * refundOrphanedCapture rather than promoted.
- *
- * Compare-and-swap from "created"/"failed" only. A "processing" intent has a
- * capture in flight; it is left alone, because that capture cannot win anyway — the
- * order is no longer at Pending, so its promotion compare-and-swap misses and it
- * takes the same 409 → refund path on its own.
- *
- * The reservation is released through releaseReservation, whose own active-only
- * claim means the expiry sweeper (cleanupExpiredStockReservations) and this call
- * can never both restock it. Reservation-less checkouts (reserveDuringPayment off)
- * took no stock, and releaseReservation simply finds nothing.
- *
- * Never throws: the cancellation is already durable. Anything left undone here is
- * still safe — the sweeper returns the stock when the hold expires, and the order's
- * own status refuses a late promotion.
- */
-const closeUnpaidCheckout = async ({ orderId, razorpayOrderId }) => {
-  try {
-    const links = [{ pendingOrder: orderId }];
-    if (razorpayOrderId) {
-      links.push({ razorpayOrderId }, { previousRazorpayOrderIds: razorpayOrderId });
-    }
-    const intents = await PaymentIntent.find({ $or: links }).select("_id status storeOrder");
-
-    for (const intent of intents) {
-      // An intent that produced a paid order is never this checkout's to close.
-      if (intent.storeOrder) continue;
-      const expired = await PaymentIntent.updateOne(
-        { _id: intent._id, status: { $in: ["created", "failed"] }, storeOrder: null },
-        {
-          $set: {
-            status: "expired",
-            failureReason: "Order was cancelled before the payment was captured",
-          },
-        },
-      );
-      const released = await releaseReservation({
-        paymentIntentId: intent._id,
-        reason: "order_cancelled_unpaid",
-      });
-      logLifecycleEvent("orders", "unpaid_checkout_closed", {
-        orderId: String(orderId),
-        paymentIntentId: String(intent._id),
-        intentExpired: expired.modifiedCount === 1,
-        reservationReleased: Boolean(released),
-      });
-    }
-  } catch (error) {
-    logLifecycleError("orders", "unpaid_checkout_close_failed", error, {
-      orderId: String(orderId),
-    });
   }
 };
 
@@ -2304,10 +2486,20 @@ export const CancelOrder = async (req, res) => {
  *     and "contact support" past the window hands off to precisely this
  *     endpoint.
  *
- * The Pending/Confirmed gate stays: once the order is Packed the parcel is
- * moving, and the path for that is Returns (after delivery) — same rule the
- * status machine enforces everywhere. Per-item partial cancellation is no longer
- * a route out once a parcel exists: PartialCancelOrder refuses it then (S1).
+ * The status gate is wider than the customer's by one step: Pending, Confirmed
+ * AND Packed. A Packed order may already be booked with a courier, but it has not
+ * been handed over, and the shared core's post-commit step cancels the booking
+ * (a failure there is recorded and retryable through RetryShipmentCancellation).
+ * From Shipped onward the parcel is moving and the paths are Returns (after
+ * delivery) or the RTO close-out — the status machine has no Cancelled edge out of
+ * them. Per-item partial cancellation is no longer a route out once a parcel
+ * exists: PartialCancelOrder refuses it then (S1).
+ *
+ * `cancellation.cancelledBy` is recorded as "admin" (the customer path records
+ * "customer", the abandoned-checkout sweeper "system"), and the cancellation is
+ * audit-logged as CANCEL_ORDER. Refunds follow the shared core: an auto-refundable
+ * order is refunded through Razorpay after commit; anything else is recorded as an
+ * `owed` row for the owed-refunds queue.
  */
 export const AdminCancelOrder = async (req, res) => {
   try {

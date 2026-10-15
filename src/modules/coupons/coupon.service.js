@@ -62,8 +62,12 @@ export const redemptionCountFor = async ({ couponId, userId, session = null }) =
 export const perUserCouponLimit = (coupon) => Math.max(1, Number(coupon?.maxLimit) || 1);
 
 export const couponUsesRemaining = (coupon, redemptionCount = 0, ordersWithCoupon = 0) => {
-  // The redemption counter is decremented on cancellation while order history is the
-  // durable fact, so the higher of the two is the honest usage.
+  // Two independent records of the same usage: the redemption counter, and the
+  // customer's live orders that carry the coupon. Each excludes what was handed
+  // back (the counter is decremented, the order count skips
+  // COUPON_RELEASED_ORDER_STATUSES), so the higher of the two is the honest usage —
+  // and an RTO from before the release existed, whose counter was never
+  // decremented, still counts through the counter.
   const used = Math.max(Number(redemptionCount) || 0, Number(ordersWithCoupon) || 0);
   return Math.max(0, perUserCouponLimit(coupon) - used);
 };
@@ -88,6 +92,73 @@ export const globalCapReached = (coupon) => {
 export const GLOBAL_CAP_MESSAGE = "This coupon has reached its redemption limit";
 
 /**
+ * Order statuses whose coupon use has been handed back to the customer.
+ *
+ * A cancelled order releases its redemption in the cancellation transaction, and
+ * an RTO parcel received back releases it through releaseRtoOrderCredits ("RTO" is
+ * included so the order does not briefly count while it is on its way back, and
+ * "Closed" is only reachable from "RTO Received"). Neither order delivered
+ * anything, so neither should spend the customer's allowance.
+ *
+ * POLICY: this is a deliberate change — before it, a customer whose earlier order
+ * was cancelled still had that use counted against them by the order-history
+ * cross-check, even though the redemption counter had been decremented. Both the
+ * checkout validator and the customer's coupon list read this one list, so they
+ * cannot disagree.
+ */
+export const COUPON_RELEASED_ORDER_STATUSES = ["Cancelled", "RTO", "RTO Received", "Closed"];
+
+/**
+ * Hands one order's coupon redemption back, at most once per order.
+ *
+ * The order's own `couponReleasedAt` is the claim: a conditional write moves it
+ * from null, and only the caller that wins it decrements anything. Without the
+ * claim, a cancellation and an RTO arrival — or a courier event and an admin's
+ * manual move to "RTO Received" racing each other — could each decrement the
+ * counter, freeing two slots against one real redemption.
+ *
+ * Per-customer count first, coupon total second, and the total moves ONLY if the
+ * per-customer row actually did. Ordering it the other way, or moving the total
+ * unconditionally, would let a double-release free two global slots against one
+ * real redemption — which, with globalMaxRedemptions gating money, is the
+ * difference between a budget of 100 and a budget of 101. The `$gte: 1` in each
+ * filter keeps the decrement atomic and independent of the schema's `min`.
+ *
+ * Pass the caller's `session` to make the claim and both decrements part of its
+ * transaction, so a rolled-back cancellation does not leave the coupon released.
+ *
+ * @returns {Promise<boolean>} true when this call released a redemption.
+ */
+export const releaseOrderCouponRedemption = async ({ orderId, session = null }) => {
+  const options = session ? { session } : {};
+  const claimed = await OrderModel.findOneAndUpdate(
+    {
+      _id: orderId,
+      coupon: { $type: "string" },
+      couponDiscount: { $gt: 0 },
+      couponReleasedAt: null,
+    },
+    { $set: { couponReleasedAt: new Date() } },
+    { ...options, projection: { coupon: 1, user: 1 } },
+  );
+  if (!claimed || !claimed.coupon) return false;
+
+  const released = await CouponRedemption.updateOne(
+    { coupon: claimed.coupon, user: claimed.user, count: { $gte: 1 } },
+    { $inc: { count: -1 } },
+    options,
+  );
+  if (released.modifiedCount !== 1) return false;
+
+  await CouponModel.updateOne(
+    { couponId: claimed.coupon, usage: { $gte: 1 } },
+    { $inc: { usage: -1 } },
+    options,
+  );
+  return true;
+};
+
+/**
  * How many live orders this user has already placed with this coupon.
  *
  * A COUNT rather than the old boolean: with maxLimit now enforced as the
@@ -99,6 +170,9 @@ const countOrdersWithCoupon = async ({ couponId, userId, session }) => {
     user: userId,
     coupon: normalizeCouponId(couponId),
     paymentStatus: { $ne: "Failed" },
+    // Cancelled and returned-to-origin orders handed their use back — see
+    // COUPON_RELEASED_ORDER_STATUSES.
+    orderStatus: { $nin: COUPON_RELEASED_ORDER_STATUSES },
     // An unpaid prepaid checkout is not a use. Without this, starting a Razorpay
     // checkout with a coupon and abandoning it would consume the customer's
     // allowance for a discount they never received.

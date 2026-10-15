@@ -24,6 +24,12 @@
  * checkout notify (and push to the courier) once, not twice; and the
  * PAYMENT_NOT_CAPTURED refusals on the admin status dropdown and manual shipment.
  *
+ * And the retry door (sections 7-9): the abandoned-checkout sweeper closes the
+ * intent and the stock hold as well as the order, RetryRazorpayOrder refuses an
+ * order that is no longer Pending/Pending (409 ORDER_NOT_PAYABLE, no new Razorpay
+ * order), and payment.failed notifies against the pending order and ignores a
+ * failure on a superseded Razorpay order id.
+ *
  * Run with `npm run test:late-capture-cancelled` (or `npm test` for everything).
  *
  * The Razorpay SDK is stubbed on its cached instance and `globalThis.fetch` throws
@@ -67,7 +73,7 @@ const { completeCapturedIntent, completeCapturedIntentWithOutcome } = await impo
   "../../src/modules/payments/payment-order.service.js"
 );
 const { reserveStockForIntent } = await import("../../src/modules/inventory/inventory-reservation.service.js");
-const { cleanupExpiredStockReservations } = await import(
+const { cleanupExpiredStockReservations, cancelAbandonedCheckouts } = await import(
   "../../src/modules/inventory/stock-reservation-cleanup.service.js"
 );
 const razorpayService = await import("../../src/modules/payments/razorpay.service.js");
@@ -77,12 +83,15 @@ await UnmatchedPayment.init();
 await WebhookEvent.init();
 
 // ── Razorpay stub ───────────────────────────────────────────────────────────
-const razorpayCalls = { refund: [], fetch: [] };
+const razorpayCalls = { refund: [], fetch: [], ordersCreate: [] };
 const { razorpay: sharedRazorpay } = razorpayService.getRazorpay();
 let refundSeq = 0;
+// What Razorpay replies to a refund. "processed" unless a test says otherwise; a
+// normal-speed refund really replies "pending".
+let refundReplyStatus = "processed";
 sharedRazorpay.payments.refund = async (paymentId, options) => {
   razorpayCalls.refund.push({ paymentId, options });
-  return { id: `rfnd_lcc_${process.pid}_${++refundSeq}`, status: "processed" };
+  return { id: `rfnd_lcc_${process.pid}_${++refundSeq}`, status: refundReplyStatus };
 };
 sharedRazorpay.payments.fetchMultipleRefund = async () => ({ items: [] });
 // What the verify endpoint fetches: a captured payment on the checkout's Razorpay
@@ -93,6 +102,12 @@ sharedRazorpay.payments.fetch = async (paymentId) => {
   const payment = capturedPayments.get(paymentId);
   if (!payment) throw new Error(`unknown payment ${paymentId}`);
   return payment;
+};
+
+let retryOrderSeq = 0;
+sharedRazorpay.orders.create = async (options) => {
+  razorpayCalls.ordersCreate.push(options);
+  return { id: `order_${MARKER}_retry_${++retryOrderSeq}`, currency: options?.currency || "INR" };
 };
 
 // No outbound HTTP at all in this suite.
@@ -272,6 +287,35 @@ const verifyLate = ({ intent, order, paymentId, userId }) => {
 };
 
 let eventSeq = 0;
+const sendWebhook = (body) => {
+  const rawBody = JSON.stringify(body);
+  const signature = crypto
+    .createHmac("sha256", process.env.RAZORPAY_WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest("hex");
+  return callController(paymentController.RazorpayWebhook, {
+    body,
+    rawBody,
+    headers: {
+      "x-razorpay-signature": signature,
+      "x-razorpay-event-id": `evt_${MARKER}_${++eventSeq}`,
+    },
+  });
+};
+const webhookPaymentFailed = ({ razorpayOrderId, paymentId }) =>
+  sendWebhook({
+    event: "payment.failed",
+    payload: {
+      payment: {
+        entity: {
+          id: paymentId,
+          order_id: razorpayOrderId,
+          status: "failed",
+          error_description: "Bank declined the payment",
+        },
+      },
+    },
+  });
 const webhookLate = ({ intent, order, paymentId }) => {
   const body = {
     event: "payment.captured",
@@ -442,6 +486,36 @@ try {
       replay.statusCode === 200 && razorpayCalls.refund.length === 1,
       `${replay.statusCode} — ${razorpayCalls.refund.length} refunds`);
     ok("the order is still Cancelled", (await OrderModel.findById(checkout.order._id)).orderStatus === "Cancelled");
+    ok("Razorpay said processed, so the customer is told processed",
+      (await NotificationEvent.countDocuments({ order: checkout.order._id, event: "refund.processed" })) >= 1);
+  }
+
+  {
+    // Same path, but Razorpay only ACCEPTED the refund (`pending`). The customer
+    // must be told it was initiated — not that money has moved.
+    razorpayCalls.refund = [];
+    refundReplyStatus = "pending";
+    try {
+      const product = await makeProduct("webhook-pending", 10);
+      const userId = new mongoose.Types.ObjectId();
+      const checkout = await makeUnpaidCheckout({ product, quantity: 1, userId });
+      await callController(orderController.CancelOrder, {
+        params: { orderId: String(checkout.order._id) },
+        body: { reason: "Ordered by mistake" },
+        user: { id: String(userId) },
+      });
+      const hook = await webhookLate(checkout);
+      ok("a pending orphan refund still answers CAPTURE_REFUNDED_ORDER_NOT_PROMOTABLE",
+        hook.statusCode === 200 && hook.body?.code === "CAPTURE_REFUNDED_ORDER_NOT_PROMOTABLE",
+        `${hook.statusCode} ${hook.body?.code}`);
+      const count = (event) => NotificationEvent.countDocuments({ order: checkout.order._id, event });
+      ok("  the customer is told the refund was initiated", (await count("refund.initiated")) === 1,
+        String(await count("refund.initiated")));
+      ok("  and NOT that it was processed", (await count("refund.processed")) === 0,
+        String(await count("refund.processed")));
+    } finally {
+      refundReplyStatus = "processed";
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -578,6 +652,186 @@ try {
     });
     ok("a Pending COD order can still be confirmed by hand", codConfirm.statusCode === 200,
       `${codConfirm.statusCode} ${codConfirm.body?.code || ""}`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  section("7 — the sweeper closes the whole checkout; a retry is then refused");
+
+  {
+    razorpayCalls.ordersCreate = [];
+    const product = await makeProduct("swept", 10);
+    const userId = new mongoose.Types.ObjectId();
+    const checkout = await makeUnpaidCheckout({ product, quantity: 2, userId });
+    ok("the reservation took the units (10 → 8)", (await stockOf(product._id)) === 8, String(await stockOf(product._id)));
+
+    // The checkout window runs out. The hold itself is still inside its own TTL, so
+    // only the checkout sweep can be what gives the stock back.
+    await OrderModel.updateOne(
+      { _id: checkout.order._id },
+      { $set: { paymentExpiresAt: new Date(Date.now() - 60_000) } },
+    );
+    await cancelAbandonedCheckouts({ limit: 200 });
+
+    const swept = await OrderModel.findById(checkout.order._id);
+    ok("the order is Cancelled/Failed", swept.orderStatus === "Cancelled" && swept.paymentStatus === "Failed",
+      `${swept.orderStatus}/${swept.paymentStatus}`);
+    ok('cancelledBy is "system"', swept.cancellation?.cancelledBy === "system", swept.cancellation?.cancelledBy);
+    ok("the payment intent is expired",
+      (await PaymentIntent.findById(checkout.intent._id))?.status === "expired",
+      (await PaymentIntent.findById(checkout.intent._id))?.status);
+    ok("the reservation is released",
+      (await StockReservation.findById(checkout.reservation._id))?.status === "released",
+      (await StockReservation.findById(checkout.reservation._id))?.status);
+    ok("stock is back exactly once", (await stockOf(product._id)) === 10, String(await stockOf(product._id)));
+    const swept2 = await runSweeperOn(checkout.reservation._id);
+    ok(`the expiry sweeper does not restock it again (${swept2})`,
+      swept2 !== "claimed" && (await stockOf(product._id)) === 10, `${swept2}, stock ${await stockOf(product._id)}`);
+
+    const retry = await callController(paymentController.RetryRazorpayOrder, {
+      params: { intentId: String(checkout.intent._id) },
+      user: { id: String(userId) },
+    });
+    ok("RetryRazorpayOrder on the swept checkout → 404 (its intent is closed)",
+      retry.statusCode === 404, `${retry.statusCode} ${retry.body?.code || ""} ${retry.body?.message || ""}`);
+    ok("  no new Razorpay order was minted", razorpayCalls.ordersCreate.length === 0,
+      String(razorpayCalls.ordersCreate.length));
+    ok("  the order keeps its original Razorpay order id",
+      (await OrderModel.findById(checkout.order._id)).razorpayOrderId === checkout.order.razorpayOrderId);
+
+    const again = await cancelAbandonedCheckouts({ limit: 200 });
+    const history = (await OrderModel.findById(checkout.order._id)).statusHistory
+      .filter((entry) => entry.source === "abandoned_checkout_sweeper");
+    ok("a second sweep does not touch it again", history.length === 1, `${history.length} sweeper entries (${again} swept)`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  section("8 — RetryRazorpayOrder refuses an order that is no longer awaiting payment");
+
+  {
+    // Data from before the sweeper closed intents: the order is Cancelled (paymentStatus
+    // never fixed) but its intent is still `failed`, which the intent lookup accepts.
+    // Only the order check stands between it and a fresh Razorpay order that could be
+    // paid but never promoted.
+    razorpayCalls.ordersCreate = [];
+    const product = await makeProduct("legacy-retry", 10);
+    const userId = new mongoose.Types.ObjectId();
+    const checkout = await makeUnpaidCheckout({ product, quantity: 1, userId });
+    await OrderModel.updateOne(
+      { _id: checkout.order._id },
+      { $set: { orderStatus: "Cancelled", "cancellation.cancelledAt": new Date() } },
+    );
+    await PaymentIntent.updateOne({ _id: checkout.intent._id }, { $set: { status: "failed" } });
+
+    const retry = await callController(paymentController.RetryRazorpayOrder, {
+      params: { intentId: String(checkout.intent._id) },
+      user: { id: String(userId) },
+    });
+    ok("→ 409 ORDER_NOT_PAYABLE", retry.statusCode === 409 && retry.body?.code === "ORDER_NOT_PAYABLE",
+      `${retry.statusCode} ${retry.body?.code} ${retry.body?.message || ""}`);
+    ok("  no Razorpay order was created", razorpayCalls.ordersCreate.length === 0,
+      String(razorpayCalls.ordersCreate.length));
+    const intentAfter = await PaymentIntent.findById(checkout.intent._id);
+    ok("  the intent is expired so the next retry stops at the lookup", intentAfter?.status === "expired",
+      intentAfter?.status);
+    ok("  and keeps its Razorpay order id (nothing was superseded)",
+      intentAfter?.razorpayOrderId === checkout.intent.razorpayOrderId &&
+        (intentAfter?.previousRazorpayOrderIds || []).length === 0);
+    const orderAfter = await OrderModel.findById(checkout.order._id);
+    ok("  the order is untouched", orderAfter.orderStatus === "Cancelled" &&
+      orderAfter.razorpayOrderId === checkout.order.razorpayOrderId, orderAfter.orderStatus);
+
+    const second = await callController(paymentController.RetryRazorpayOrder, {
+      params: { intentId: String(checkout.intent._id) },
+      user: { id: String(userId) },
+    });
+    ok("a second retry → 404", second.statusCode === 404, String(second.statusCode));
+
+    // Paid by another path in the meantime (Pending order, Paid payment) — also refused.
+    const paidCheckout = await makeUnpaidCheckout({ product, quantity: 1, userId });
+    await OrderModel.updateOne({ _id: paidCheckout.order._id }, { $set: { paymentStatus: "Paid" } });
+    const paidRetry = await callController(paymentController.RetryRazorpayOrder, {
+      params: { intentId: String(paidCheckout.intent._id) },
+      user: { id: String(userId) },
+    });
+    ok("an order already marked Paid → 409 ORDER_NOT_PAYABLE",
+      paidRetry.statusCode === 409 && paidRetry.body?.code === "ORDER_NOT_PAYABLE",
+      `${paidRetry.statusCode} ${paidRetry.body?.code}`);
+    ok("  still no Razorpay order created", razorpayCalls.ordersCreate.length === 0);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  section("9 — a live checkout still retries; payment.failed targets the pending order");
+
+  {
+    razorpayCalls.ordersCreate = [];
+    const product = await makeProduct("live-retry", 10);
+    const userId = new mongoose.Types.ObjectId();
+    const checkout = await makeUnpaidCheckout({ product, quantity: 1, userId });
+    const originalRzpOrderId = checkout.order.razorpayOrderId;
+    // Close to expiry, so the extension is visible.
+    await OrderModel.updateOne(
+      { _id: checkout.order._id },
+      { $set: { paymentExpiresAt: new Date(Date.now() + 30_000) } },
+    );
+
+    const retry = await callController(paymentController.RetryRazorpayOrder, {
+      params: { intentId: String(checkout.intent._id) },
+      user: { id: String(userId) },
+    });
+    ok("RetryRazorpayOrder on a Pending/Pending order → 201", retry.statusCode === 201,
+      `${retry.statusCode} ${retry.body?.code || ""} ${retry.body?.message || ""}`);
+    ok("  exactly one Razorpay order created", razorpayCalls.ordersCreate.length === 1,
+      String(razorpayCalls.ordersCreate.length));
+    const newRzpOrderId = retry.body?.data?.razorpayOrderId;
+    const intentAfter = await PaymentIntent.findById(checkout.intent._id);
+    ok("  the intent moved to the new Razorpay order and kept the old one",
+      intentAfter.razorpayOrderId === newRzpOrderId &&
+        intentAfter.previousRazorpayOrderIds.includes(originalRzpOrderId));
+    const orderAfter = await OrderModel.findById(checkout.order._id);
+    ok("  the order follows the new Razorpay order id", orderAfter.razorpayOrderId === newRzpOrderId,
+      orderAfter.razorpayOrderId);
+    ok("  and its payment window was extended",
+      orderAfter.paymentExpiresAt && orderAfter.paymentExpiresAt.getTime() > Date.now() + 5 * 60 * 1000,
+      String(orderAfter.paymentExpiresAt));
+
+    // A late failure on the SUPERSEDED Razorpay order must not touch the live attempt.
+    const stale = await webhookPaymentFailed({
+      razorpayOrderId: originalRzpOrderId,
+      paymentId: `pay_${MARKER}_stale_${seq}`,
+    });
+    ok("payment.failed on the superseded id is acknowledged", stale.statusCode === 200, String(stale.statusCode));
+    ok("  the live intent stays created",
+      (await PaymentIntent.findById(checkout.intent._id))?.status === "created",
+      (await PaymentIntent.findById(checkout.intent._id))?.status);
+    ok("  its stock hold stays active",
+      (await StockReservation.findById(checkout.reservation._id))?.status === "active",
+      (await StockReservation.findById(checkout.reservation._id))?.status);
+    ok("  and the customer is not told their payment failed",
+      (await NotificationEvent.countDocuments({ order: checkout.order._id, event: "payment.failed" })) === 0);
+
+    // A failure on the CURRENT id is real.
+    const live = await webhookPaymentFailed({
+      razorpayOrderId: newRzpOrderId,
+      paymentId: `pay_${MARKER}_live_${seq}`,
+    });
+    ok("payment.failed on the current id is acknowledged", live.statusCode === 200, String(live.statusCode));
+    ok("  the intent is failed", (await PaymentIntent.findById(checkout.intent._id))?.status === "failed");
+    ok("  its stock hold is released",
+      (await StockReservation.findById(checkout.reservation._id))?.status === "released",
+      (await StockReservation.findById(checkout.reservation._id))?.status);
+    const failedNotices = await NotificationEvent.countDocuments({
+      order: checkout.order._id,
+      event: "payment.failed",
+    });
+    ok("  the payment.failed notification names the pending order", failedNotices === 1, String(failedNotices));
+
+    // The customer can still retry a failed attempt on a live order.
+    const retryAgain = await callController(paymentController.RetryRazorpayOrder, {
+      params: { intentId: String(checkout.intent._id) },
+      user: { id: String(userId) },
+    });
+    ok("a failed attempt on a live order can be retried (201)", retryAgain.statusCode === 201,
+      `${retryAgain.statusCode} ${retryAgain.body?.code || ""}`);
   }
 } catch (error) {
   console.error(`\nSUITE ABORTED: ${error?.stack || error}`);

@@ -25,12 +25,14 @@ await connect();
 const OrderModel = (await import("../../src/modules/orders/Order.model.js")).default;
 const PaymentIntent = (await import("../../src/modules/payments/PaymentIntent.model.js")).default;
 const UnmatchedPayment = (await import("../../src/modules/payments/UnmatchedPayment.model.js")).default;
+const NotificationEvent = (await import("../../src/model/NotificationEvent.model.js")).default;
 const {
   canAutoRefund,
   cancellationRefundKey,
   claimGatewayAttempt,
   claimRefundSlot,
   deriveRefundIdempotencyKey,
+  mapGatewayRefundStatus,
   recordRefundObligation,
   settleGatewayRefund,
   settleRefundRecord,
@@ -89,6 +91,13 @@ sharedRazorpay.payments.fetchMultipleRefund = async () => {
   if (fetchShouldThrow) throw new Error("gateway unreachable");
   return { items: gatewayRefundsOnRecord };
 };
+// What Razorpay says NOW about one refund id — the lookup a `created` row that
+// already carries a gateway id goes through instead of being refunded again.
+let fetchRefundBehaviour = (paymentId, refundId) => ({ id: refundId, status: "processed" });
+sharedRazorpay.payments.fetchRefund = async (paymentId, refundId) => {
+  calls.fetchRefund = (calls.fetchRefund || 0) + 1;
+  return fetchRefundBehaviour(paymentId, refundId);
+};
 
 const resetGateway = () => {
   calls.refund = [];
@@ -96,6 +105,8 @@ const resetGateway = () => {
   gatewayRefundsOnRecord = [];
   fetchShouldThrow = false;
   refundBehaviour = () => ({ id: nextRefundId(), status: "processed" });
+  calls.fetchRefund = 0;
+  fetchRefundBehaviour = (paymentId, refundId) => ({ id: refundId, status: "processed" });
 };
 
 const makeOrder = async (fields = {}) => {
@@ -175,7 +186,7 @@ const attemptRefund = async ({ order, amount, reason = "Admin refund", idempoten
         orderId: order._id,
         refundId: claim.refund._id,
         providerRefundId: match.id,
-        status: match.status === "failed" ? "failed" : "processed",
+        status: mapGatewayRefundStatus(match.status),
       });
       return { outcome: "reconciled" };
     }
@@ -204,7 +215,7 @@ const attemptRefund = async ({ order, amount, reason = "Admin refund", idempoten
     orderId: order._id,
     refundId: claim.refund._id,
     providerRefundId: refund.id,
-    status: refund.status === "failed" ? "failed" : "processed",
+    status: mapGatewayRefundStatus(refund.status),
   });
   return { outcome: "refunded", refundId: refund.id };
 };
@@ -1013,6 +1024,110 @@ try {
     ok("and reports already-settled", again.alreadySettled === true, JSON.stringify(again));
   }
 
+  section("1.6 — Razorpay replies `pending` (normal-speed refunds)");
+
+  {
+    ok("pending maps to created", mapGatewayRefundStatus("pending") === "created");
+    ok("processed maps to processed", mapGatewayRefundStatus("processed") === "processed");
+    ok("failed maps to failed", mapGatewayRefundStatus("failed") === "failed");
+    ok("an unknown status is treated as not-yet-settled", mapGatewayRefundStatus("queued") === "created");
+    ok("a missing status is treated as not-yet-settled", mapGatewayRefundStatus(undefined) === "created");
+  }
+
+  {
+    // The admin path: a `pending` reply is accepted, NOT money moved.
+    resetGateway();
+    const order = await makeOrder();
+    refundBehaviour = () => ({ id: nextRefundId(), status: "pending" });
+    const key = `adm-${MARKER}-pending`;
+    const first = await attemptRefund({ order, amount: 1000, idempotencyKey: key });
+    ok("a pending reply still counts as a refund call", first.outcome === "refunded", first.outcome);
+
+    const fresh = await OrderModel.findById(order._id);
+    const row = fresh.refunds.find((r) => r.idempotencyKey === key);
+    ok("the row is `created`, not `processed`", row?.status === "created", row?.status);
+    ok("the gateway refund id is kept for the poller", Boolean(row?.providerRefundId), "missing");
+    ok("no processedAt is stamped", !row?.processedAt, String(row?.processedAt));
+    ok(
+      "the order reads Refund Pending, NOT Refunded",
+      fresh.paymentStatus === "Refund Pending",
+      fresh.paymentStatus,
+    );
+    ok("nothing is counted as settled", sumSettledRefunds(fresh) === 0, `${sumSettledRefunds(fresh)}`);
+    ok("but the ceiling still holds the money", Math.abs(sumRefunded(fresh) - 1000) < 0.01);
+
+    const replay = await attemptRefund({ order, amount: 1000, idempotencyKey: key });
+    ok(
+      "a replay of the same key sends nothing further",
+      calls.refund.length === 1 && replay.outcome !== "refunded",
+      `${calls.refund.length}x, ${replay.outcome}`,
+    );
+  }
+
+  {
+    // The shared settle path (cancellations, returns).
+    resetGateway();
+    const order = await makeOrder();
+    const refundKey = cancellationRefundKey({ orderId: order._id });
+    const row = await seedCancellationRefund({ order, amount: 1000, refundKey });
+    refundBehaviour = () => ({ id: nextRefundId(), status: "pending" });
+
+    const result = await settleGatewayRefund({ order, refundId: row._id, amount: 1000, refundKey, reason: "c" });
+    ok("the call reports refunded", result.outcome === "refunded", result.outcome);
+    ok("but refundStatus says created", result.refundStatus === "created", result.refundStatus);
+
+    let fresh = await OrderModel.findById(order._id);
+    ok("the row is created with its gateway id", fresh.refunds.id(row._id).status === "created" &&
+      Boolean(fresh.refunds.id(row._id).providerRefundId), fresh.refunds.id(row._id).status);
+    ok("the order is Refund Pending", fresh.paymentStatus === "Refund Pending", fresh.paymentStatus);
+
+    // A second settle never refunds again: it LOOKS the refund up by id.
+    fetchRefundBehaviour = (paymentId, refundId) => ({ id: refundId, status: "pending" });
+    const stillPending = await settleGatewayRefund({ order, refundId: row._id, amount: 1000, refundKey, reason: "c" });
+    ok("a re-check while pending reconciles", stillPending.outcome === "reconciled", stillPending.outcome);
+    ok("and still says created", stillPending.refundStatus === "created", stillPending.refundStatus);
+    ok("without a second gateway refund", calls.refund.length === 1, `${calls.refund.length}x`);
+    ok("it asked Razorpay by refund id", calls.fetchRefund === 1, `${calls.fetchRefund}x`);
+
+    fetchRefundBehaviour = (paymentId, refundId) => ({ id: refundId, status: "processed" });
+    const settled = await settleGatewayRefund({ order, refundId: row._id, amount: 1000, refundKey, reason: "c" });
+    ok("once Razorpay settles it, the re-check reports processed", settled.refundStatus === "processed", settled.refundStatus);
+    ok("and says it already notified the customer", settled.notified === true, String(settled.notified));
+    ok("still exactly one gateway refund", calls.refund.length === 1, `${calls.refund.length}x`);
+    fresh = await OrderModel.findById(order._id);
+    ok("the order is now Refunded", fresh.paymentStatus === "Refunded", fresh.paymentStatus);
+  }
+
+  {
+    // Late or replayed `pending` must not downgrade a row already settled.
+    resetGateway();
+    const order = await makeOrder();
+    const refundKey = cancellationRefundKey({ orderId: order._id });
+    const row = await seedCancellationRefund({ order, amount: 1000, refundKey });
+    await settleGatewayRefund({ order, refundId: row._id, amount: 1000, refundKey, reason: "c" });
+    await settleRefundRecord({ orderId: order._id, refundId: row._id, status: "created" });
+    const fresh = await OrderModel.findById(order._id);
+    ok("a processed row ignores a later `created` settle", fresh.refunds.id(row._id).status === "processed",
+      fresh.refunds.id(row._id).status);
+    ok("and the order stays Refunded", fresh.paymentStatus === "Refunded", fresh.paymentStatus);
+  }
+
+  {
+    // A gateway that DECLINES the refund outright.
+    resetGateway();
+    const order = await makeOrder();
+    const refundKey = cancellationRefundKey({ orderId: order._id });
+    const row = await seedCancellationRefund({ order, amount: 1000, refundKey });
+    refundBehaviour = () => ({ id: nextRefundId(), status: "failed" });
+    const declined = await settleGatewayRefund({ order, refundId: row._id, amount: 1000, refundKey, reason: "c" });
+    ok("a failed reply reports refundStatus failed", declined.refundStatus === "failed", declined.refundStatus);
+    const again = await settleGatewayRefund({ order, refundId: row._id, amount: 1000, refundKey, reason: "c" });
+    ok("a failed row is final — settling it again is row_failed", again.outcome === "row_failed", again.outcome);
+    ok("and sends nothing", calls.refund.length === 1, `${calls.refund.length}x`);
+    const fresh = await OrderModel.findById(order._id);
+    ok("the order falls back to Paid", fresh.paymentStatus === "Paid", fresh.paymentStatus);
+  }
+
   section("1.5 — ceiling interaction with the admin refund path");
 
   {
@@ -1076,6 +1191,9 @@ try {
   ok("suite ran to completion", false, error?.message);
 } finally {
   await OrderModel.deleteMany({ _id: { $in: trash.orders } });
+  // The pending → processed re-check notifies the customer (queued as `skipped`
+  // when notifications are off), so it leaves rows keyed on these orders.
+  await NotificationEvent.deleteMany({ order: { $in: trash.orders } });
   await PaymentIntent.deleteMany({ _id: { $in: trash.intents } });
   await UnmatchedPayment.deleteMany({ paymentId: { $in: trash.unmatched } });
   const { failed } = finish();
