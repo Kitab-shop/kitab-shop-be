@@ -445,6 +445,47 @@ try {
       JSON.stringify(check),
     );
   }
+
+  section("7. Only a COD order can be acknowledged, and only COD needs a person");
+  {
+    resetStubs();
+    const order = await booksPlusShipping({ paymentMethod: "RAZORPAY", paymentStatus: "Paid" });
+    sr.show = () => jsonResponse({ data: { net_total: 300 } });
+    await createShipment(order);
+    const refused = await acknowledge(order);
+    const after = await fresh(order);
+    ok(
+      "acknowledging a prepaid mismatch is refused",
+      refused.statusCode === 409 && refused.body?.code === "AMOUNT_ACK_NOT_COD" && !after.shiprocket.amountCheck?.acknowledgedAt,
+      `${refused.statusCode} ${refused.body?.code}`,
+    );
+    ok(
+      "and nothing is audited",
+      (await AuditLog.countDocuments({ targetId: order._id, action: "ACK_COD_AMOUNT" })) === 0,
+    );
+  }
+  {
+    resetStubs();
+    const cod = await booksPlusShipping();
+    sr.show = () => jsonResponse({ data: { net_total: 429 } });
+    await createShipment(cod);
+    const prepaid = await booksPlusShipping({ paymentMethod: "RAZORPAY", paymentStatus: "Paid" });
+    await createShipment(prepaid);
+
+    const { buildShippingExceptions } = await import("../../src/modules/shipping/shipping-exceptions.service.js");
+    const queue = await buildShippingExceptions();
+    const category = queue.categories.find((entry) => entry.key === "cod_amount_unconfirmed");
+    const ids = (category?.items || []).map((entry) => entry.orderId);
+    ok("a goods-only COD order without an AWB is in the exceptions queue", ids.includes(String(cod._id)), JSON.stringify(ids));
+    ok("the prepaid one is not", !ids.includes(String(prepaid._id)), JSON.stringify(ids));
+
+    await assignAwb(cod);
+    const after = await buildShippingExceptions();
+    const stillListed = (after.categories.find((entry) => entry.key === "cod_amount_unconfirmed")?.items || []).some(
+      (entry) => entry.orderId === String(cod._id),
+    );
+    ok("once the AWB is assigned it leaves the queue", !stillListed);
+  }
 } catch (error) {
   console.error(`\nSUITE ABORTED: ${error?.stack || error}`);
   ok("suite ran to completion", false, error?.message);

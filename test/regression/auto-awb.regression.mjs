@@ -217,6 +217,38 @@ try {
     ok("the reason is on the order", /acknowledge the mismatch/i.test(after.shiprocket?.lastError || ""), after.shiprocket?.lastError);
   }
 
+  section("5b. A COD figure that leaves out shipping is held for a person too");
+  {
+    // ₹429 of books + ₹99 shipping; Shiprocket's only total shows the ₹429.
+    resetStubs();
+    sr.show = () => jsonResponse({ data: { net_total: 429 } });
+    const order = await makeOrder({
+      paymentMethod: "COD",
+      paymentStatus: "Pending",
+      items: [{ product: book._id, name: book.name, image: "x.png", price: 429, quantity: 1 }],
+      subtotal: 429,
+      shippingCharge: 99,
+      totalAmount: 528,
+    });
+    await syncOrderToShiprocketIfEnabled(order);
+    const after = await settle(order, hasError);
+    ok(
+      "the check reads unverified (goods_only_total)",
+      after.shiprocket?.amountCheck?.status === "unverified" && after.shiprocket.amountCheck.reason === "goods_only_total",
+      JSON.stringify(after.shiprocket?.amountCheck),
+    );
+    ok("auto-AWB books no courier", sr.awbCalls.length === 0 && !after.shiprocket?.awbCode, `${sr.awbCalls.length} calls`);
+    ok("the reason is on the order", /leaves out shipping/i.test(after.shiprocket?.lastError || ""), after.shiprocket?.lastError);
+
+    const clicked = await callController(shippingController.AssignAwb, { params: { orderId: String(order._id) } });
+    const assigned = await fresh(order);
+    ok(
+      "the admin can still assign it by hand",
+      clicked.statusCode === 200 && Boolean(assigned.shiprocket?.awbCode),
+      `${clicked.statusCode} ${clicked.body?.message}`,
+    );
+  }
+
   section("6. Shiprocket answers without an AWB: reported, not recorded as assigned");
   {
     resetStubs();

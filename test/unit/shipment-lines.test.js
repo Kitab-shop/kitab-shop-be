@@ -243,6 +243,22 @@ test("classifyReportedAmount: without a shipping charge there is no goods-only e
   assert.equal(verdict.status, "mismatch");
 });
 
+test("classifyReportedAmount: on a COD order, cod_amount decides alone when present", () => {
+  assert.deepEqual(
+    classifyReportedAmount({ amounts: { total: 528, cod_amount: 429 }, expected: 528, goodsTotal: 429, cod: true }),
+    { status: "mismatch", reported: 429, matchedField: "cod_amount", reason: null },
+  );
+  assert.deepEqual(
+    classifyReportedAmount({ amounts: { net_total: 429, cod_amount: 528 }, expected: 528, goodsTotal: 429, cod: true }),
+    { status: "ok", reported: 528, matchedField: "cod_amount", reason: null },
+  );
+  // Prepaid: cod_amount is just another total field.
+  assert.equal(
+    classifyReportedAmount({ amounts: { total: 528, cod_amount: 429 }, expected: 528, goodsTotal: 429 }).status,
+    "ok",
+  );
+});
+
 test("classifyReportedAmount: nothing readable, or nothing to compare with, is unverified", () => {
   assert.deepEqual(classifyReportedAmount({ amounts: { sub_total: 429 }, expected: 528, goodsTotal: 429 }), {
     status: "unverified",

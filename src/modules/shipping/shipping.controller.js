@@ -283,6 +283,13 @@ export const AcknowledgeAmountMismatch = async (req, res) => {
         message: "There is no amount mismatch on this order to acknowledge.",
       });
     }
+    if (result.outcome === "not_cod") {
+      return res.status(409).json({
+        success: false,
+        code: "AMOUNT_ACK_NOT_COD",
+        message: "Only a COD order's amount can be acknowledged. Nothing is collected on delivery for this order.",
+      });
+    }
     if (result.outcome === "acknowledged") {
       const check = result.order.shiprocket?.amountCheck || {};
       await createAuditLog({

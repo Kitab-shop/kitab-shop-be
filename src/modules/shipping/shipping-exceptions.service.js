@@ -120,6 +120,36 @@ export const buildShippingExceptions = async ({ now = Date.now() } = {}) => {
       },
     },
     {
+      key: "cod_amount_unconfirmed",
+      label: "COD amount at Shiprocket not confirmed",
+      severity: "high",
+      action:
+        "Shiprocket's figure leaves out shipping. Check the COD amount in Shiprocket, then assign the AWB from the order page. Automatic AWB assignment is held until then.",
+      load: async () => {
+        const { rows, capped } = await findLimited(
+          OrderModel,
+          {
+            paymentMethod: "COD",
+            "shiprocket.amountCheck.status": "unverified",
+            "shiprocket.amountCheck.reason": "goods_only_total",
+            "shiprocket.awbCode": { $in: [null, ""] },
+            orderStatus: { $nin: FINISHED },
+          },
+          ORDER_FIELDS,
+        );
+        return {
+          capped,
+          items: rows.map((o) =>
+            orderItem(
+              o,
+              `Shiprocket shows ₹${o.shiprocket?.amountCheck?.reported}, expected ₹${o.shiprocket?.amountCheck?.expected}`,
+              o.shiprocket?.amountCheck?.checkedAt,
+            ),
+          ),
+        };
+      },
+    },
+    {
       key: "cancel_pending",
       label: "Cancelled here, still live at the courier",
       severity: "high",

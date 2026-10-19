@@ -404,12 +404,18 @@ const AMOUNT_TOLERANCE = 0.5;
  *
  * `goodsTotal` is the goods without shipping (the payload's sub_total). A reported
  * figure equal to it is a field that excludes shipping, not a wrong amount, so it reads
- * `unverified` rather than `mismatch` — see classifyReportedAmount. Every amount field
- * Shiprocket returned is stored in `fields` so the real one can be identified.
+ * `unverified` rather than `mismatch` — see classifyReportedAmount. `cod` makes
+ * Shiprocket's `cod_amount` decide when present. Every amount field Shiprocket returned
+ * is stored in `fields` so the real one can be identified.
  *
  * @returns {Promise<{status: "ok"|"mismatch"|"unverified", expected: number|null, reported: number|null, reason: string|null}>}
  */
-export const runShipmentAmountCheck = async (orderId, shiprocketOrderId, expected, goodsTotal = null) => {
+export const runShipmentAmountCheck = async (
+  orderId,
+  shiprocketOrderId,
+  expected,
+  { goodsTotal = null, cod = false } = {},
+) => {
   const toAmount = (value) =>
     value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Number(value);
   const expectedAmount = toAmount(expected);
@@ -422,6 +428,7 @@ export const runShipmentAmountCheck = async (orderId, shiprocketOrderId, expecte
       amounts,
       expected: expectedAmount ?? NaN,
       goodsTotal: toAmount(goodsTotal) ?? NaN,
+      cod,
       tolerance: AMOUNT_TOLERANCE,
     });
   } catch (error) {
@@ -632,12 +639,10 @@ export const createForwardShipment = async (
     return { outcome: "created", order: await OrderModel.findById(claimed._id), amountCheck: null };
   }
 
-  const amountCheck = await runShipmentAmountCheck(
-    claimed._id,
-    shiprocketOrderId,
-    lines?.declaredTotal,
-    lines?.subTotal,
-  );
+  const amountCheck = await runShipmentAmountCheck(claimed._id, shiprocketOrderId, lines?.declaredTotal, {
+    goodsTotal: lines?.subTotal,
+    cod: claimed.paymentMethod === "COD",
+  });
   return { outcome: "created", order: await OrderModel.findById(claimed._id), amountCheck };
 };
 
@@ -762,7 +767,10 @@ export const linkExistingShipment = async (orderId, { shiprocketOrderId, shipmen
   const capabilities = await getShippingCapabilities();
   const amountCheck =
     capabilities.shipments && capabilities.configured && expected !== null
-      ? await runShipmentAmountCheck(orderId, shiprocketOrderId, expected, goodsTotal)
+      ? await runShipmentAmountCheck(orderId, shiprocketOrderId, expected, {
+          goodsTotal,
+          cod: updated.paymentMethod === "COD",
+        })
       : await recordUnverifiedAmount(orderId, expected);
   return { outcome: "linked", order: await OrderModel.findById(orderId), amountCheck };
 };
@@ -810,15 +818,17 @@ export const confirmShipmentNotCreated = async (orderId) => {
 
 /**
  * Admin acknowledgement of an amount mismatch, which unblocks AWB assignment.
- * Only a CURRENT, unacknowledged mismatch can be acknowledged.
+ * Only a CURRENT, unacknowledged mismatch on a COD order can be acknowledged — a prepaid
+ * order collects nothing and its mismatch blocks nothing.
  *
- * @returns {Promise<{outcome: "acknowledged"|"already_acknowledged"|"not_mismatch"|"not_found", order?: object}>}
+ * @returns {Promise<{outcome: "acknowledged"|"already_acknowledged"|"not_mismatch"|"not_cod"|"not_found", order?: object}>}
  */
 export const acknowledgeAmountMismatch = async (orderId, actorId) => {
   if (!orderId) return { outcome: "not_found" };
   const updated = await OrderModel.findOneAndUpdate(
     {
       _id: orderId,
+      paymentMethod: "COD",
       "shiprocket.amountCheck.status": "mismatch",
       "shiprocket.amountCheck.acknowledgedAt": null,
     },
@@ -833,6 +843,7 @@ export const acknowledgeAmountMismatch = async (orderId, actorId) => {
   if (updated) return { outcome: "acknowledged", order: updated };
   const current = await OrderModel.findById(orderId);
   if (!current) return { outcome: "not_found" };
+  if (current.paymentMethod !== "COD") return { outcome: "not_cod", order: current };
   if (current.shiprocket?.amountCheck?.status === "mismatch") {
     return { outcome: "already_acknowledged", order: current };
   }
@@ -870,6 +881,24 @@ export const assignOrderAwb = async (order, { courierId = null, source = "admin"
       statusCode: 409,
       code: "COD_AMOUNT_MISMATCH",
       message: `Shiprocket has ₹${amountCheck.reported} recorded for this COD order, but ₹${amountCheck.expected} should be collected. Correct the amount in Shiprocket, then acknowledge the mismatch on this order before assigning an AWB.`,
+      expected: amountCheck.expected,
+      reported: amountCheck.reported,
+    };
+  }
+  // Shiprocket's figure leaves out shipping, so what the courier will collect is not
+  // confirmed either way. An admin may assign by hand after checking; automatic
+  // assignment must not book a courier on it unseen.
+  if (
+    source !== "admin" &&
+    order.paymentMethod === "COD" &&
+    amountCheck?.status === "unverified" &&
+    amountCheck.reason === "goods_only_total"
+  ) {
+    return {
+      outcome: "cod_amount_unconfirmed",
+      statusCode: 409,
+      code: "COD_AMOUNT_UNCONFIRMED",
+      message: `Shiprocket shows ₹${amountCheck.reported} for this COD order, which leaves out shipping; ₹${amountCheck.expected} should be collected. Check the COD amount in Shiprocket`,
       expected: amountCheck.expected,
       reported: amountCheck.reported,
     };

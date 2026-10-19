@@ -1366,9 +1366,13 @@ export const readReportedOrderTotal = (data) => {
  * The goods-only rule applies only when the order has a shipping charge; without one
  * the two figures are the same and the first rule already covers it.
  *
+ * On a COD order, `cod_amount` — the field most likely to be the cash the courier
+ * collects — decides alone when present: equal to `expected` is ok, anything else is a
+ * mismatch, whatever the other fields say.
+ *
  * @returns {{status: "ok"|"mismatch"|"unverified", reported: number|null, matchedField: string|null, reason: string|null}}
  */
-export const classifyReportedAmount = ({ amounts = {}, expected, goodsTotal = null, tolerance = 0.5 }) => {
+export const classifyReportedAmount = ({ amounts = {}, expected, goodsTotal = null, cod = false, tolerance = 0.5 }) => {
   const totals = REPORTED_TOTAL_FIELDS.filter((field) => field in amounts);
   const first = totals[0] ?? null;
   if (!first) {
@@ -1378,6 +1382,11 @@ export const classifyReportedAmount = ({ amounts = {}, expected, goodsTotal = nu
     return { status: "unverified", reported: amounts[first], matchedField: first, reason: "expected_unknown" };
   }
   const near = (a, b) => Math.abs(a - b) <= tolerance;
+
+  if (cod && "cod_amount" in amounts) {
+    const reported = amounts.cod_amount;
+    return { status: near(reported, expected) ? "ok" : "mismatch", reported, matchedField: "cod_amount", reason: null };
+  }
 
   const full = totals.find((field) => near(amounts[field], expected));
   if (full) return { status: "ok", reported: amounts[full], matchedField: full, reason: null };
