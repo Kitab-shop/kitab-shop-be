@@ -843,6 +843,12 @@ const OrderSchema = new mongoose.Schema(
         },
         expected: { type: Number, default: null },
         reported: { type: Number, default: null },
+        // Why the check reads as it does (e.g. "goods_only_total"), which Shiprocket
+        // field `reported` came from, and every amount field Shiprocket returned. No
+        // defaults, so orders checked before these existed are left untouched.
+        reason: { type: String },
+        matchedField: { type: String },
+        fields: { type: mongoose.Schema.Types.Mixed },
         checkedAt: { type: Date, default: null },
         acknowledgedAt: { type: Date, default: null },
         acknowledgedBy: {

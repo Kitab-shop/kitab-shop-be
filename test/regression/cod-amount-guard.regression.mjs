@@ -376,6 +376,75 @@ try {
       JSON.stringify(after.shiprocket.amountCheck),
     );
   }
+
+  section("6. A figure that leaves out shipping is not a mismatch");
+  // The live order that raised a false alarm: ₹429 of books + ₹99 shipping = ₹528, and
+  // Shiprocket's first total field held ₹429.
+  const booksPlusShipping = (fields = {}) =>
+    makeOrder({
+      items: [item(bookA, 429, 1)],
+      subtotal: 429,
+      shippingCharge: 99,
+      totalAmount: 528,
+      ...fields,
+    });
+  {
+    resetStubs();
+    const order = await booksPlusShipping();
+    sr.show = () => jsonResponse({ data: { net_total: "429.00" } });
+    await createShipment(order);
+    const after = await fresh(order);
+    const check = after.shiprocket.amountCheck || {};
+    ok(
+      "a goods-only figure on a COD order reads unverified, with the reason",
+      check.status === "unverified" && check.expected === 528 && check.reported === 429 && check.reason === "goods_only_total",
+      JSON.stringify(check),
+    );
+    ok(
+      "which field it came from, and what Shiprocket sent, are recorded",
+      check.matchedField === "net_total" && check.fields?.net_total === 429,
+      JSON.stringify(check),
+    );
+    const awb = await assignAwb(order);
+    ok("it does not block the AWB", awb.statusCode === 200 && sr.awbCalls.length === 1, `${awb.statusCode} ${awb.body?.code}`);
+  }
+  {
+    resetStubs();
+    const order = await booksPlusShipping();
+    sr.show = () => jsonResponse({ data: { net_total: "429.00", total: "528.00" } });
+    await createShipment(order);
+    const check = (await fresh(order)).shiprocket.amountCheck || {};
+    ok(
+      "when another field holds goods + shipping, the check is ok and names that field",
+      check.status === "ok" && check.reported === 528 && check.matchedField === "total",
+      JSON.stringify(check),
+    );
+  }
+  {
+    resetStubs();
+    const order = await booksPlusShipping();
+    sr.show = () => jsonResponse({ data: { net_total: 300 } });
+    await createShipment(order);
+    const check = (await fresh(order)).shiprocket.amountCheck || {};
+    const blocked = await assignAwb(order);
+    ok(
+      "a figure matching neither total still blocks a COD AWB",
+      check.status === "mismatch" && blocked.statusCode === 409 && blocked.body?.code === "COD_AMOUNT_MISMATCH",
+      `${check.status} ${blocked.statusCode} ${blocked.body?.code}`,
+    );
+  }
+  {
+    resetStubs();
+    const order = await booksPlusShipping({ paymentMethod: "RAZORPAY", paymentStatus: "Paid" });
+    sr.show = () => jsonResponse({ data: { net_total: 429 } });
+    await createShipment(order);
+    const check = (await fresh(order)).shiprocket.amountCheck || {};
+    ok(
+      "the same figure on a prepaid order is no longer recorded as a mismatch",
+      check.status === "unverified" && check.reason === "goods_only_total",
+      JSON.stringify(check),
+    );
+  }
 } catch (error) {
   console.error(`\nSUITE ABORTED: ${error?.stack || error}`);
   ok("suite ran to completion", false, error?.message);

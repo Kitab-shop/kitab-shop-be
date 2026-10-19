@@ -11,7 +11,8 @@ import {
   createShiprocketOrder,
   getShiprocketOrder,
   isDefiniteShiprocketRejection,
-  readReportedOrderTotal,
+  classifyReportedAmount,
+  readReportedAmounts,
 } from "../shipping/shiprocket.service.js";
 import { logLifecycleEvent, logLifecycleError } from "../../utils/lifecycle-logger.service.js";
 import { INDIAN_PINCODE_REGEX } from "../../config/india-geo.config.js";
@@ -401,28 +402,45 @@ const AMOUNT_TOLERANCE = 0.5;
  * that cannot be made records `unverified`, which warns but does not block, because
  * blocking every COD shipment on an API we cannot read would stop the store.
  *
- * @returns {Promise<{status: "ok"|"mismatch"|"unverified", expected: number, reported: number|null}>}
+ * `goodsTotal` is the goods without shipping (the payload's sub_total). A reported
+ * figure equal to it is a field that excludes shipping, not a wrong amount, so it reads
+ * `unverified` rather than `mismatch` — see classifyReportedAmount. Every amount field
+ * Shiprocket returned is stored in `fields` so the real one can be identified.
+ *
+ * @returns {Promise<{status: "ok"|"mismatch"|"unverified", expected: number|null, reported: number|null, reason: string|null}>}
  */
-export const runShipmentAmountCheck = async (orderId, shiprocketOrderId, expected) => {
-  let reported = null;
-  let reason = null;
+export const runShipmentAmountCheck = async (orderId, shiprocketOrderId, expected, goodsTotal = null) => {
+  const toAmount = (value) =>
+    value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Number(value);
+  const expectedAmount = toAmount(expected);
+
+  let amounts = {};
+  let verdict;
   try {
-    reported = readReportedOrderTotal(await getShiprocketOrder(shiprocketOrderId));
-    if (reported === null) reason = "total_not_found_in_response";
+    amounts = readReportedAmounts(await getShiprocketOrder(shiprocketOrderId));
+    verdict = classifyReportedAmount({
+      amounts,
+      expected: expectedAmount ?? NaN,
+      goodsTotal: toAmount(goodsTotal) ?? NaN,
+      tolerance: AMOUNT_TOLERANCE,
+    });
   } catch (error) {
-    reason = error?.message || "request_failed";
+    verdict = {
+      status: "unverified",
+      reported: null,
+      matchedField: null,
+      reason: String(error?.message || "request_failed").slice(0, 200),
+    };
   }
 
-  const status =
-    reported === null || !Number.isFinite(Number(expected))
-      ? "unverified"
-      : Math.abs(reported - Number(expected)) > AMOUNT_TOLERANCE
-        ? "mismatch"
-        : "ok";
+  const { status, reported, matchedField, reason } = verdict;
   const amountCheck = {
     status,
-    expected: Number.isFinite(Number(expected)) ? Number(expected) : null,
+    expected: expectedAmount,
     reported,
+    reason,
+    matchedField,
+    fields: amounts,
     checkedAt: new Date(),
     acknowledgedAt: null,
     acknowledgedBy: null,
@@ -434,7 +452,15 @@ export const runShipmentAmountCheck = async (orderId, shiprocketOrderId, expecte
     logLifecycleError("shipping", "shiprocket_amount_check_write_failed", error, { orderId });
   }
 
-  const context = { orderId, shiprocketOrderId, expected: amountCheck.expected, reported, reason };
+  const context = {
+    orderId,
+    shiprocketOrderId,
+    expected: amountCheck.expected,
+    reported,
+    reason,
+    matchedField,
+    fields: amounts,
+  };
   if (status === "mismatch") {
     logLifecycleError(
       "shipping",
@@ -445,7 +471,7 @@ export const runShipmentAmountCheck = async (orderId, shiprocketOrderId, expecte
   } else {
     logLifecycleEvent("shipping", `shiprocket_amount_${status}`, context);
   }
-  return { status, expected: amountCheck.expected, reported };
+  return { status, expected: amountCheck.expected, reported, reason };
 };
 
 /** Statuses from which a forward shipment may be CLAIMED. */
@@ -606,7 +632,12 @@ export const createForwardShipment = async (
     return { outcome: "created", order: await OrderModel.findById(claimed._id), amountCheck: null };
   }
 
-  const amountCheck = await runShipmentAmountCheck(claimed._id, shiprocketOrderId, lines?.declaredTotal);
+  const amountCheck = await runShipmentAmountCheck(
+    claimed._id,
+    shiprocketOrderId,
+    lines?.declaredTotal,
+    lines?.subTotal,
+  );
   return { outcome: "created", order: await OrderModel.findById(claimed._id), amountCheck };
 };
 
@@ -722,15 +753,16 @@ export const linkExistingShipment = async (orderId, { shiprocketOrderId, shipmen
   // checked exactly like a fresh one. Skipped (unverified) when Shiprocket may not be
   // called at all, and when the order cannot be priced — never blocks the link itself.
   let expected = null;
+  let goodsTotal = null;
   try {
-    expected = computeShipmentLines(updated).declaredTotal;
+    ({ declaredTotal: expected, subTotal: goodsTotal } = computeShipmentLines(updated));
   } catch {
     expected = null;
   }
   const capabilities = await getShippingCapabilities();
   const amountCheck =
     capabilities.shipments && capabilities.configured && expected !== null
-      ? await runShipmentAmountCheck(orderId, shiprocketOrderId, expected)
+      ? await runShipmentAmountCheck(orderId, shiprocketOrderId, expected, goodsTotal)
       : await recordUnverifiedAmount(orderId, expected);
   return { outcome: "linked", order: await OrderModel.findById(orderId), amountCheck };
 };

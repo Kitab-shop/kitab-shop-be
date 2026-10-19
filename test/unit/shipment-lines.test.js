@@ -3,7 +3,9 @@ import test from "node:test";
 import {
   ShiprocketError,
   computeOrderPackage,
+  classifyReportedAmount,
   computeShipmentLines,
+  readReportedAmounts,
   readReportedOrderTotal,
 } from "../../src/modules/shipping/shiprocket.service.js";
 
@@ -209,4 +211,45 @@ test("readReportedOrderTotal is tolerant but never guesses", () => {
   assert.equal(readReportedOrderTotal({ data: { net_total: "", total: null } }), null);
   assert.equal(readReportedOrderTotal({ data: { something: 5 } }), null);
   assert.equal(readReportedOrderTotal(null), null);
+});
+
+test("readReportedAmounts collects every amount field, and only numeric ones", () => {
+  assert.deepEqual(
+    readReportedAmounts({ data: { net_total: "429.00", total: 528, sub_total: "429", shipping_charges: "99", id: 7, cod_amount: "" } }),
+    { net_total: 429, total: 528, sub_total: 429, shipping_charges: 99 },
+  );
+  assert.deepEqual(readReportedAmounts({ data: { products: [] } }), {});
+  assert.deepEqual(readReportedAmounts(null), {});
+});
+
+test("classifyReportedAmount: a field holding goods + shipping is ok, whichever it is", () => {
+  const verdict = classifyReportedAmount({ amounts: { net_total: 429, total: 528 }, expected: 528, goodsTotal: 429 });
+  assert.deepEqual(verdict, { status: "ok", reported: 528, matchedField: "total", reason: null });
+});
+
+test("classifyReportedAmount: a goods-only figure (no shipping) warns instead of blocking", () => {
+  // The live order that raised a false mismatch: ₹429 books + ₹99 shipping.
+  const verdict = classifyReportedAmount({ amounts: { net_total: 429 }, expected: 528, goodsTotal: 429 });
+  assert.deepEqual(verdict, { status: "unverified", reported: 429, matchedField: "net_total", reason: "goods_only_total" });
+});
+
+test("classifyReportedAmount: a figure matching neither is still a mismatch", () => {
+  const verdict = classifyReportedAmount({ amounts: { net_total: 1040 }, expected: 890, goodsTotal: 850 });
+  assert.deepEqual(verdict, { status: "mismatch", reported: 1040, matchedField: "net_total", reason: null });
+});
+
+test("classifyReportedAmount: without a shipping charge there is no goods-only escape", () => {
+  const verdict = classifyReportedAmount({ amounts: { net_total: 250 }, expected: 300, goodsTotal: 300 });
+  assert.equal(verdict.status, "mismatch");
+});
+
+test("classifyReportedAmount: nothing readable, or nothing to compare with, is unverified", () => {
+  assert.deepEqual(classifyReportedAmount({ amounts: { sub_total: 429 }, expected: 528, goodsTotal: 429 }), {
+    status: "unverified",
+    reported: null,
+    matchedField: null,
+    reason: "total_not_found_in_response",
+  });
+  assert.equal(classifyReportedAmount({ amounts: { net_total: 528 }, expected: NaN }).status, "unverified");
+  assert.equal(classifyReportedAmount({ amounts: { net_total: 528.4 }, expected: 528, goodsTotal: 429 }).status, "ok");
 });

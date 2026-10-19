@@ -98,6 +98,9 @@ export const buildShippingExceptions = async ({ now = Date.now() } = {}) => {
         const { rows, capped } = await findLimited(
           OrderModel,
           {
+            // Only COD needs action: nothing is collected on a prepaid order, and its
+            // mismatch does not block the AWB.
+            paymentMethod: "COD",
             "shiprocket.amountCheck.status": "mismatch",
             "shiprocket.amountCheck.acknowledgedAt": null,
             orderStatus: { $nin: FINISHED },

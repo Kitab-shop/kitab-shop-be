@@ -1308,34 +1308,86 @@ export const actOnNdr = (awbCode, { action, comment = "" } = {}) =>
 export const getShiprocketOrder = (shiprocketOrderId) =>
   request(`/orders/show/${encodeURIComponent(Number(shiprocketOrderId))}`);
 
-const REPORTED_TOTAL_FIELDS = ["net_total", "total", "order_total", "cod_amount"];
+export const REPORTED_TOTAL_FIELDS = ["net_total", "total", "order_total", "cod_amount"];
+
+// Recorded with every amount check so the real field can be identified from production
+// data, but never used to decide it.
+const REPORTED_DIAGNOSTIC_FIELDS = [...REPORTED_TOTAL_FIELDS, "sub_total", "shipping_charges"];
+
+/** A number or numeric string ("1,234.50" included) as a number; anything else null. */
+const readAmount = (raw) => {
+  // Number("") and Number(null) are 0 — a blank field must not read as "₹0 total".
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const value = Number(raw.replace(/,/g, "").trim());
+  return Number.isFinite(value) ? value : null;
+};
 
 /**
- * The order total Shiprocket reports, or null when it cannot be found.
+ * Every amount-like field Shiprocket's order record carries, as `{ field: number }`.
+ * Fields that are missing or not numeric are left out, so `{}` means nothing was found.
+ */
+export const readReportedAmounts = (data) => {
+  const record = data?.data ?? data;
+  if (!record || typeof record !== "object") return {};
+  const amounts = {};
+  for (const field of REPORTED_DIAGNOSTIC_FIELDS) {
+    const value = readAmount(record[field]);
+    if (value !== null) amounts[field] = value;
+  }
+  return amounts;
+};
+
+/**
+ * The first order total Shiprocket reports, or null when it cannot be found.
  *
  * ⚠ UNVERIFIED FIELD NAME. The endpoint is documented; which field holds the
- * collectable total is not, so this tries the plausible names in a fixed order and
- * accepts numbers or numeric strings ("1,234.50" included). Anything else is null —
- * and null makes the amount check `unverified` (a warning), never `ok`. An unexpected
- * shape must not read as "the amounts agree".
- *
- * Correct this list (one line) once a sandbox response confirms the real field.
+ * collectable total is not. A live prepaid order (₹429 of books + ₹99 shipping) came
+ * back with ₹429 in the first field found, so at least one of these holds the goods
+ * WITHOUT shipping. Decisions therefore go through classifyReportedAmount, which looks
+ * at every field; this stays for callers that only want a single figure.
  */
 export const readReportedOrderTotal = (data) => {
-  const record = data?.data ?? data;
-  if (!record || typeof record !== "object") return null;
-  for (const field of REPORTED_TOTAL_FIELDS) {
-    const raw = record[field];
-    // Number("") and Number(null) are 0 — a blank field must not read as "₹0 total".
-    if (typeof raw === "number") {
-      if (Number.isFinite(raw)) return raw;
-      continue;
-    }
-    if (typeof raw !== "string" || !raw.trim()) continue;
-    const value = Number(raw.replace(/,/g, "").trim());
-    if (Number.isFinite(value)) return value;
+  const amounts = readReportedAmounts(data);
+  const field = REPORTED_TOTAL_FIELDS.find((name) => name in amounts);
+  return field ? amounts[field] : null;
+};
+
+/**
+ * Decides what Shiprocket's reported amounts say about the order. Pure.
+ *
+ *   - some total field equals `expected` (goods + shipping)       → ok
+ *   - none does, but one equals `goodsTotal` (goods, no shipping) → unverified,
+ *     reason "goods_only_total": the field read is not the collectable amount, so it
+ *     proves nothing either way. Warns, does not block.
+ *   - neither                                                      → mismatch
+ *   - no total field at all, or no expected amount                → unverified
+ *
+ * The goods-only rule applies only when the order has a shipping charge; without one
+ * the two figures are the same and the first rule already covers it.
+ *
+ * @returns {{status: "ok"|"mismatch"|"unverified", reported: number|null, matchedField: string|null, reason: string|null}}
+ */
+export const classifyReportedAmount = ({ amounts = {}, expected, goodsTotal = null, tolerance = 0.5 }) => {
+  const totals = REPORTED_TOTAL_FIELDS.filter((field) => field in amounts);
+  const first = totals[0] ?? null;
+  if (!first) {
+    return { status: "unverified", reported: null, matchedField: null, reason: "total_not_found_in_response" };
   }
-  return null;
+  if (!Number.isFinite(expected)) {
+    return { status: "unverified", reported: amounts[first], matchedField: first, reason: "expected_unknown" };
+  }
+  const near = (a, b) => Math.abs(a - b) <= tolerance;
+
+  const full = totals.find((field) => near(amounts[field], expected));
+  if (full) return { status: "ok", reported: amounts[full], matchedField: full, reason: null };
+
+  const hasShipping = Number.isFinite(goodsTotal) && !near(goodsTotal, expected);
+  const goodsOnly = hasShipping ? totals.find((field) => near(amounts[field], goodsTotal)) : undefined;
+  if (goodsOnly) {
+    return { status: "unverified", reported: amounts[goodsOnly], matchedField: goodsOnly, reason: "goods_only_total" };
+  }
+  return { status: "mismatch", reported: amounts[first], matchedField: first, reason: null };
 };
 
 export const trackAwb = (awbCode) =>
