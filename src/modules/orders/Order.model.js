@@ -278,6 +278,17 @@ const OrderSchema = new mongoose.Schema(
       default: null,
     },
 
+    // When the order first became Confirmed — at placement (COD), at capture
+    // (prepaid), or when an admin approved it under ORDER_MANUAL_CONFIRMATION_ENABLED.
+    // With manual confirmation the two can be days apart, and the courier
+    // reconciler's auto-push windows have to count from this rather than from
+    // createdAt. Null on orders confirmed before the field existed; readers fall
+    // back to createdAt for those.
+    confirmedAt: {
+      type: Date,
+      default: null,
+    },
+
     /**
      * The bill of supply issued for this order, minted once when it is delivered.
      *

@@ -19,6 +19,7 @@ import {
 } from "../inventory/inventory-reservation.service.js";
 import { decrementStock, resolveVariantId } from "../inventory/variant.service.js";
 import { syncOrderToShiprocketIfEnabled } from "../orders/order-shipping.service.js";
+import { initialOrderStatus } from "../orders/order-confirmation.service.js";
 import { clearOrderedItemsFromCart } from "../cart/cart-cleanup.service.js";
 import { logLifecycleEvent } from "../../utils/lifecycle-logger.service.js";
 
@@ -161,28 +162,39 @@ export const completeCapturedIntentWithOutcome = async ({
       // awaiting payment is not this function's to promote; losing here routes the
       // capture to the orphaned-capture refund below, which is the correct outcome
       // for money that arrived after the order was cancelled.
+      //
+      // Under ORDER_MANUAL_CONFIRMATION_ENABLED the payment still settles here —
+      // paymentStatus must say Paid the moment the money is captured — but the order
+      // stays Pending for an admin to approve, so no status move is recorded.
+      const promotedStatus = initialOrderStatus();
+      const promotedAt = new Date();
       if (currentIntent.pendingOrder) {
         storeOrder = await OrderModel.findOneAndUpdate(
           { _id: currentIntent.pendingOrder, paymentStatus: "Pending", orderStatus: "Pending" },
           {
             $set: {
               paymentStatus: "Paid",
-              orderStatus: "Confirmed",
+              orderStatus: promotedStatus,
+              confirmedAt: promotedStatus === "Confirmed" ? promotedAt : null,
               razorpayOrderId: currentIntent.razorpayOrderId,
               razorpayPaymentId: capturedPayment.id,
               razorpaySignature: signature,
-              paymentVerifiedAt: new Date(),
+              paymentVerifiedAt: promotedAt,
               paymentExpiresAt: null,
             },
-            $push: {
-              statusHistory: {
-                from: "Pending",
-                to: "Confirmed",
-                changedBy: currentIntent.user,
-                source: "payment_verified",
-                changedAt: new Date(),
-              },
-            },
+            ...(promotedStatus === "Confirmed"
+              ? {
+                  $push: {
+                    statusHistory: {
+                      from: "Pending",
+                      to: "Confirmed",
+                      changedBy: currentIntent.user,
+                      source: "payment_verified",
+                      changedAt: promotedAt,
+                    },
+                  },
+                }
+              : {}),
           },
           { session, returnDocument: "after" },
         );
@@ -218,7 +230,8 @@ export const completeCapturedIntentWithOutcome = async ({
               shippingAddress: currentIntent.shippingAddress,
               paymentMethod: "RAZORPAY",
               paymentStatus: "Paid",
-              orderStatus: "Confirmed",
+              orderStatus: promotedStatus,
+              confirmedAt: promotedStatus === "Confirmed" ? promotedAt : null,
               subtotal: currentIntent.subtotal,
               shippingCharge: currentIntent.shippingCharge,
               tax: currentIntent.tax,
@@ -230,14 +243,14 @@ export const completeCapturedIntentWithOutcome = async ({
               razorpayOrderId: currentIntent.razorpayOrderId,
               razorpayPaymentId: capturedPayment.id,
               razorpaySignature: signature,
-              paymentVerifiedAt: new Date(),
+              paymentVerifiedAt: promotedAt,
               statusHistory: [
                 {
                   from: "",
-                  to: "Confirmed",
+                  to: promotedStatus,
                   changedBy: currentIntent.user,
                   source: "payment_verified",
-                  changedAt: new Date(),
+                  changedAt: promotedAt,
                 },
               ],
             },
@@ -316,7 +329,9 @@ export const completeCapturedIntentWithOutcome = async ({
   // second notification and email tell the customer about one order twice. The
   // execution that lost the promotion returns the same order without them.
   if (promotedNow) {
-    await syncOrderToShiprocketIfEnabled(storeOrder);
+    // An order held for admin approval is pushed when it is approved
+    // (runConfirmationSideEffects), not here.
+    if (storeOrder.orderStatus === "Confirmed") await syncOrderToShiprocketIfEnabled(storeOrder);
     await notifyPaymentSuccess(storeOrder);
     await notifyOrderPlaced(storeOrder);
 

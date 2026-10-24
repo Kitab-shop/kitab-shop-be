@@ -170,6 +170,10 @@ const itemsTable = (order) => {
 export const sendOrderPlacedEmail = async ({ order, email }) => {
   const isCod = String(order?.paymentMethod || "").toUpperCase() === "COD";
   const total = money(order?.totalAmount);
+  // Under ORDER_MANUAL_CONFIRMATION_ENABLED the order is still Pending here, and
+  // "Order confirmed" would be untrue until an admin approves it — which sends
+  // sendOrderConfirmedEmail below.
+  const awaitingApproval = order?.orderStatus === "Pending";
 
   const paymentLine = isCod
     ? `<p style="font-size:15px;color:#555;">Payment: <strong>Cash on Delivery</strong>. Please have ${total} ready for the courier.</p>`
@@ -177,7 +181,7 @@ export const sendOrderPlacedEmail = async ({ order, email }) => {
 
   await sendOrderEmail({
     email,
-    subject: `Order confirmed ${orderRef(order)}`,
+    subject: awaitingApproval ? `Order received ${orderRef(order)}` : `Order confirmed ${orderRef(order)}`,
     title: "Thank you for your order",
     text: [
       `Thank you for your order.`,
@@ -188,14 +192,39 @@ export const sendOrderPlacedEmail = async ({ order, email }) => {
         ? `Payment: Cash on Delivery — please have ${total} ready for the courier.`
         : `Payment received.`,
       ``,
-      `We will email you again with tracking as soon as it ships.`,
+      awaitingApproval
+        ? `We will email you as soon as the store confirms it, and again with tracking when it ships.`
+        : `We will email you again with tracking as soon as it ships.`,
     ].join("\n"),
     bodyHtml: `
-      <p style="font-size:15px;color:#555;">We have your order <strong>${orderRef(order)}</strong> and are getting it ready.</p>
+      <p style="font-size:15px;color:#555;">${
+        awaitingApproval
+          ? `We have received your order <strong>${orderRef(order)}</strong>. The store will confirm it shortly.`
+          : `We have your order <strong>${orderRef(order)}</strong> and are getting it ready.`
+      }</p>
       ${itemsTable(order)}
       <p style="font-size:16px;color:#333;"><strong>Total: ${total}</strong></p>
       ${paymentLine}
       <p style="font-size:15px;color:#555;">We will email you again with tracking as soon as it ships.</p>`,
+  });
+};
+
+/**
+ * Sent when an admin approves an order that ORDER_MANUAL_CONFIRMATION_ENABLED held
+ * at Pending. The placed email for such an order said "received", not "confirmed",
+ * so this is the customer's first word that it is going ahead.
+ */
+export const sendOrderConfirmedEmail = async ({ order, email }) => {
+  await sendOrderEmail({
+    email,
+    subject: `Order confirmed ${orderRef(order)}`,
+    title: "Your order is confirmed",
+    text: `Your order ${orderRef(order)} has been confirmed and is being prepared. We will email you again with tracking as soon as it ships.`,
+    bodyHtml: `
+      <p style="font-size:15px;color:#555;">Your order <strong>${orderRef(order)}</strong> has been confirmed and is being prepared.</p>
+      ${itemsTable(order)}
+      <p style="font-size:15px;color:#555;">We will email you again with tracking as soon as it ships.</p>
+      ${orderLinkHtml(order)}`,
   });
 };
 

@@ -231,6 +231,12 @@ const checkoutChecks = async () => {
       : check("checkout.cancelWindow", "Cancellation window", OFF, "No time limit — customers can cancel any time before dispatch.", "Set a window under Operations → Checkout if you want to limit this."),
   );
 
+  checks.push(
+    getFeatures().orders.manualConfirmation
+      ? check("checkout.manualConfirm", "Order confirmation", OK, "Manual — every new order (COD and prepaid) waits at Pending until an admin confirms it from Orders.", "Nothing ships or is pushed to the courier until then. Set ORDER_MANUAL_CONFIRMATION_ENABLED=false to confirm automatically.")
+      : check("checkout.manualConfirm", "Order confirmation", OFF, "Automatic — COD orders are confirmed when placed and prepaid orders when the payment is captured.", "Set ORDER_MANUAL_CONFIRMATION_ENABLED=true to require an admin to approve every order."),
+  );
+
   if (settings.codEnabled && settings.codServiceabilityCheckEnabled) {
     // Credentials only — deliberately NOT gated on shipping.enabled, because that is
     // what the order path itself requires. SHIPROCKET_ENABLED governs post-order

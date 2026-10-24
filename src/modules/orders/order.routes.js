@@ -34,6 +34,7 @@ import {
 import { RecordManualShipment } from "../shipping/manual-shipment.controller.js";
 import { linkShipmentSchema, shipmentOrderParamSchema } from "../shipping/shipping.schema.js";
 import { SendCodOtp, VerifyCodOtp } from "./cod-verification.controller.js";
+import { BulkConfirmOrders } from "./order-confirmation.controller.js";
 import { TokenVerify } from "../../middleware/auth.middleware.js";
 import {
   adminOrderActionRateLimit,
@@ -45,6 +46,7 @@ import { requirePermission } from "../../middleware/require-permission.middlewar
 import { validate } from "../../middleware/validate.middleware.js";
 import {
   addOrderNoteSchema,
+  bulkConfirmOrdersSchema,
   orderIdParamSchema,
   orderPricingPreviewSchema,
   partialCancelSchema,
@@ -73,6 +75,17 @@ routes.post("/cod/send-otp", TokenVerify, SendCodOtp);
 routes.post("/cod/verify-otp", TokenVerify, VerifyCodOtp);
 routes.get("/my-orders", TokenVerify, GetMyOrders);
 routes.get("/all", TokenVerify, canManageOrders, GetAllOrders);
+// Approves Pending orders (ORDER_MANUAL_CONFIRMATION_ENABLED) — the selected ids, or
+// everything matching the admin list's filters. Validated per order; see
+// order-confirmation.service.js.
+routes.post(
+  "/bulk-confirm",
+  adminOrderActionRateLimit,
+  TokenVerify,
+  canManageOrders,
+  validate(bulkConfirmOrdersSchema),
+  BulkConfirmOrders,
+);
 routes.post("/:orderId/shipment", TokenVerify, canManageOrders, CreateShipment);
 routes.get("/:orderId/shipment/couriers", TokenVerify, canManageOrders, GetCourierOptions);
 routes.post("/:orderId/shipment/awb", TokenVerify, canManageOrders, AssignAwb);

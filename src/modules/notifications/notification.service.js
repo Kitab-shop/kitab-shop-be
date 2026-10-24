@@ -145,6 +145,16 @@ export const notifyOrderCancelled = ({ orderId, userId, reason, source }) =>
     message: `${cancelledMessage(source)}${reason ? ` — ${reason}` : ""}`,
   });
 
+// An admin approving an order held by ORDER_MANUAL_CONFIRMATION_ENABLED. Never
+// sent for an order that confirmed itself at placement or capture — order.placed
+// already covered that.
+export const notifyOrderConfirmed = ({ orderId, userId }) =>
+  queueNotification("order.confirmed", {
+    orderId,
+    userId,
+    message: "Order confirmed by the store",
+  });
+
 // The success sign-off (Delivered → Completed). Distinct from order.closed,
 // which is an RTO case being settled.
 export const notifyOrderCompleted = ({ orderId, userId }) =>

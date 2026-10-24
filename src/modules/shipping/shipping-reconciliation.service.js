@@ -227,6 +227,14 @@ const reconcileCancellations = async ({ now, settings, summary, scope }) => {
 };
 
 // ── c. auto-push retries ────────────────────────────────────────────────────
+// Both windows count from when the order was CONFIRMED. Under
+// ORDER_MANUAL_CONFIRMATION_ENABLED an order can wait days for an admin, so counting
+// from createdAt would race the push its approval just made, and miss one approved
+// after the 48 h window entirely. Orders from before confirmedAt existed use createdAt.
+const confirmedWithin = (range) => ({
+  $or: [{ confirmedAt: range }, { confirmedAt: null, createdAt: range }],
+});
+
 const reconcileAutoPush = async ({ now, settings, summary, scope }) => {
   const graceCutoff = new Date(now - AUTO_PUSH_GRACE_MS);
   const missedWindowStart = new Date(now - AUTO_PUSH_MISSED_WINDOW_MS);
@@ -235,15 +243,15 @@ const reconcileAutoPush = async ({ now, settings, summary, scope }) => {
     orderStatus: { $in: ["Confirmed", "Packed"] },
     "shiprocket.orderId": null,
     "shipment.trackingNumber": { $in: [null, ""] },
-    createdAt: { $lte: graceCutoff },
     "shiprocket.attempts": { $not: { $gte: settings.maxRetryAttempts } },
     $and: [
+      confirmedWithin({ $lte: graceCutoff }),
       {
         $or: [
           { "shiprocket.syncStatus": "failed" },
           {
             "shiprocket.syncStatus": { $in: ["not_created", null] },
-            createdAt: { $gte: missedWindowStart, $lte: graceCutoff },
+            ...confirmedWithin({ $gte: missedWindowStart, $lte: graceCutoff }),
           },
         ],
       },

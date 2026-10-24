@@ -148,3 +148,38 @@ export const manualShipmentSchema = {
     trackingNumber: boundedString({ label: "Tracking number", max: 100 }),
   }),
 };
+
+// The shape check alone let "2026-13-45" through, which became an Invalid Date
+// and a database cast error. A real calendar date is required.
+const isoDate = (label) =>
+  z
+    .string()
+    .trim()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, `${label} must be a date (YYYY-MM-DD)`)
+    .refine((value) => !Number.isNaN(new Date(value).getTime()), `${label} is not a valid date`)
+    .or(z.literal(""))
+    .optional();
+
+/**
+ * Bulk admin confirmation. `scope: "selected"` confirms the listed ids;
+ * `scope: "filtered"` confirms every confirmable order matching the admin list's
+ * status/date filters, so "confirm all" does not depend on how many rows the
+ * browser happened to load. The cap mirrors BULK_CONFIRM_LIMIT.
+ */
+export const bulkConfirmOrdersSchema = {
+  body: looseBody({
+    scope: z.enum(["selected", "filtered"], { error: 'Scope must be "selected" or "filtered"' }),
+    orderIds: z
+      .array(objectId("Order id"))
+      .max(500, "Select at most 500 orders at a time")
+      .optional(),
+    filters: looseBody({
+      status: z.string().trim().max(60).optional(),
+      from: isoDate("From"),
+      to: isoDate("To"),
+    }).optional(),
+  }).refine((body) => body.scope !== "selected" || (body.orderIds?.length ?? 0) > 0, {
+    message: "Select at least one order to confirm",
+    path: ["orderIds"],
+  }),
+};

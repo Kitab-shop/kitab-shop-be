@@ -82,7 +82,9 @@
     "test:order-emails": "node test/regression/order-emails.regression.mjs",
     "test:coupon-availability": "node test/regression/coupon-availability.regression.mjs",
     "test:coupon-global-cap": "node test/regression/coupon-global-cap.regression.mjs",
-    "test:variant-pricing": "node test/regression/variant-pricing.regression.mjs"
+    "test:variant-pricing": "node test/regression/variant-pricing.regression.mjs",
+    "test:manual-confirmation": "node test/regression/manual-confirmation.regression.mjs",
+    "test:feedback": "node test/regression/feedback.regression.mjs"
   },
   "keywords": [],
   "author": "",

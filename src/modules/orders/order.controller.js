@@ -4,7 +4,10 @@ import UserProfile from "../profiles/UserProfile.model.js";
 import ReferralSetting from "../referral/ReferralSetting.model.js";
 import CheckoutSetting from "./CheckoutSetting.model.js";
 import CodVerification from "./CodVerification.model.js";
-import { isStockEnforced } from "../../config/features.config.js";
+import {
+  isManualOrderConfirmationEnabled,
+  isStockEnforced,
+} from "../../config/features.config.js";
 import {
   notifyOrderCancelled,
   notifyOrderClosed,
@@ -71,6 +74,12 @@ import { canTransitionOrderStatus } from "./order-status.rules.js";
 // cancellation path.
 import { adminHasPermission } from "../../config/admin-access.service.js";
 import { ensureBillNumber } from "./bill-number.service.js";
+import {
+  buildAdminOrderFilter,
+  countConfirmableOrders,
+  initialOrderStatus,
+  runConfirmationSideEffects,
+} from "./order-confirmation.service.js";
 import { logLifecycleError } from "../../utils/lifecycle-logger.service.js";
 
 const ADMIN_PURCHASE_MESSAGE =
@@ -256,6 +265,9 @@ export const PlaceOrder = async (req, res) => {
       });
     }
 
+    // Pending under ORDER_MANUAL_CONFIRMATION_ENABLED: placed, stock and coupon
+    // taken, but held for an admin to approve before anything ships.
+    const orderStatus = initialOrderStatus();
     session = await OrderModel.startSession();
     let order;
     await session.withTransaction(async () => {
@@ -299,7 +311,8 @@ export const PlaceOrder = async (req, res) => {
           shippingAddress: preparedOrder.shippingAddress,
           paymentMethod: "COD",
           paymentStatus: "Pending",
-          orderStatus: "Confirmed",
+          orderStatus,
+          confirmedAt: orderStatus === "Confirmed" ? new Date() : null,
           subtotal: preparedOrder.subtotal,
           shippingCharge: preparedOrder.shippingCharge,
           tax: preparedOrder.tax,
@@ -362,7 +375,8 @@ export const PlaceOrder = async (req, res) => {
     // to a re-submitted idempotencyKey above cannot subtract twice.
     await clearOrderedItemsFromCart({ order });
 
-    await syncOrderToShiprocketIfEnabled(order);
+    // An order held for approval is pushed when an admin confirms it.
+    if (order.orderStatus === "Confirmed") await syncOrderToShiprocketIfEnabled(order);
     await notifyOrderPlaced(order);
 
     // The confirmation. Fire-and-forget, after the order is durable — a mail
@@ -469,28 +483,13 @@ export const GetAllOrders = async (req, res) => {
     // Hidden by default so counts and totals on this screen mean what they say.
     // `?includeAwaitingPayment=true` opts in, for diagnosing a stuck checkout.
     const includeAwaitingPayment = String(req.query.includeAwaitingPayment) === "true";
-    const filter = includeAwaitingPayment ? {} : { ...EXCLUDE_AWAITING_PAYMENT };
-
-    if (req.query.status) filter.orderStatus = req.query.status;
-
-    if (req.query.from || req.query.to) {
-      filter.createdAt = {};
-      if (req.query.from) {
-        const from = new Date(req.query.from);
-        from.setHours(0, 0, 0, 0);
-        filter.createdAt.$gte = from;
-      }
-      if (req.query.to) {
-        const to = new Date(req.query.to);
-        to.setHours(23, 59, 59, 999);
-        filter.createdAt.$lte = to;
-      }
-    }
+    const listFilters = { status: req.query.status, from: req.query.from, to: req.query.to };
+    const filter = buildAdminOrderFilter(listFilters, { includeAwaitingPayment });
 
     const sortDir = req.query.sort === "oldest" ? 1 : -1;
     const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || DEFAULT_ORDERS_LIMIT, 1), MAX_ORDERS_LIMIT);
 
-    const [orders, total] = await Promise.all([
+    const [orders, total, confirmableTotal] = await Promise.all([
       OrderModel.find(filter)
         .populate("user", "email roles")
         .populate("items.product", "name image price mrp brand author category_id returnPolicy")
@@ -498,16 +497,21 @@ export const GetAllOrders = async (req, res) => {
         .limit(limit)
         .lean(),
       OrderModel.countDocuments(filter),
+      // What "Confirm all matching" would reach — counted server-side because the
+      // list itself is capped at `limit` rows.
+      countConfirmableOrders(listFilters),
     ]);
 
     return res.status(200).json({
       success: true,
       total,
       returned: orders.length,
+      confirmableTotal,
+      manualConfirmation: isManualOrderConfirmationEnabled(),
       orders,
     });
   } catch (error) {
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
     });
@@ -850,6 +854,12 @@ export const UpdateOrderStatus = async (req, res) => {
     if (orderStatus === "Delivered" && !order.deliveredAt) {
       set.deliveredAt = changedAt;
     }
+    // Leaving Pending for the fulfilment queue is the admin approving the order —
+    // the same thing BulkConfirmOrders does — so it gets the same timestamp and,
+    // below, the same courier push and customer message.
+    const isConfirmation =
+      previousStatus === "Pending" && ["Confirmed", "Packed"].includes(orderStatus);
+    if (isConfirmation) set.confirmedAt = changedAt;
     // `shipment.status` mirrors the order's own status and is written only in the
     // same operation that sets it (see the schema). An order with no provider has no
     // shipment to describe, so its mirror stays null rather than inventing one.
@@ -1009,6 +1019,10 @@ export const UpdateOrderStatus = async (req, res) => {
     if (SHIPMENT_NOTIFY_STATUSES.includes(orderStatus)) {
       notifyShipmentUpdated({ orderId: order._id, status: orderStatus }).catch(() => {});
     }
+
+    // Only the request that won the status CAS gets here, so a double-click pushes
+    // and emails once.
+    if (isConfirmation) await runConfirmationSideEffects(order);
 
     // The success sign-off: tell the customer their order completed. Fire-and-
     // forget, after the status write is durable.

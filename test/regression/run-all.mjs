@@ -70,6 +70,8 @@ const suites = [
   "return-refund-flow.regression.mjs",
   "order-auto-complete.regression.mjs",
   "order-emails.regression.mjs",
+  "manual-confirmation.regression.mjs",
+  "feedback.regression.mjs",
 ];
 
 const run = (file) =>

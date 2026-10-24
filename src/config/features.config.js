@@ -28,6 +28,11 @@ export const getFeatures = () => ({
     autoCreateOrder: readBool("SHIPROCKET_AUTO_CREATE_ORDER", false),
     webhookEnabled: readBool("SHIPROCKET_WEBHOOK_ENABLED", false),
   },
+  orders: {
+    // Off ⇒ COD orders are created Confirmed and a captured payment confirms its
+    // order, as before. On ⇒ both stop at Pending until an admin confirms them.
+    manualConfirmation: readBool("ORDER_MANUAL_CONFIRMATION_ENABLED", false),
+  },
   inventory: {
     enforceStock: readBool("INVENTORY_ENFORCE_STOCK", true),
     reserveDuringPayment: readBool("INVENTORY_RESERVE_DURING_PAYMENT", true),
@@ -66,6 +71,9 @@ export const isShippingWebhookEnabled = () => {
   const { shipping } = getFeatures();
   return isShippingEnabled() && shipping.webhookEnabled;
 };
+
+export const isManualOrderConfirmationEnabled = () =>
+  getFeatures().orders.manualConfirmation;
 
 export const isStockEnforced = () => getFeatures().inventory.enforceStock;
 
