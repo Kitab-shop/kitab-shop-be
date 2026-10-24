@@ -5,10 +5,19 @@ import mongoose from "mongoose";
  * experience — as distinct from a ContactMessage, which is a support request that
  * expects a reply about the customer's own order or question.
  *
- * Login-required, so `user` is always set and cannot be claimed from the request
- * body. `userEmail` is a snapshot for the admin list, taken at submission.
+ * Open to guests as well as signed-in customers (the footer form). `user` is set
+ * only from a verified login token, never from the request body; a guest's
+ * optional name and email are self-reported and shown to admins as such.
+ * `userEmail` is the account's address, snapshotted at submission.
  */
 export const FEEDBACK_CATEGORIES = ["suggestion", "feedback", "bug", "compliment", "other"];
+
+// Shared with the schema and the storefront form, so the three cannot disagree.
+export const FEEDBACK_MESSAGE_MIN = 20;
+export const FEEDBACK_MESSAGE_MAX = 3000;
+
+// Where the form was opened from.
+export const FEEDBACK_SOURCES = ["footer", "account"];
 
 // new → in_review → planned/resolved/dismissed. Not a strict state machine: an
 // admin may reopen or re-file a submission, and nothing hangs off the transition.
@@ -16,11 +25,39 @@ export const FEEDBACK_STATUSES = ["new", "in_review", "planned", "resolved", "di
 
 const feedbackSchema = new mongoose.Schema(
   {
+    // null for a guest.
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "UserAuthenticationModel",
-      required: true,
+      default: null,
       index: true,
+    },
+    // A guest's self-reported contact details, both optional. Unverified.
+    guestName: {
+      type: String,
+      trim: true,
+      maxlength: 120,
+      default: "",
+    },
+    guestEmail: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      maxlength: 254,
+      default: "",
+    },
+    source: {
+      type: String,
+      enum: FEEDBACK_SOURCES,
+      default: "account",
+    },
+    // The storefront path the form was opened on, e.g. "/product/abc". A path
+    // only — never a full URL — so nothing off-site is ever stored or linked.
+    pagePath: {
+      type: String,
+      trim: true,
+      maxlength: 300,
+      default: "",
     },
     userEmail: {
       type: String,
@@ -51,8 +88,8 @@ const feedbackSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      minlength: 5,
-      maxlength: 3000,
+      minlength: FEEDBACK_MESSAGE_MIN,
+      maxlength: FEEDBACK_MESSAGE_MAX,
     },
     status: {
       type: String,

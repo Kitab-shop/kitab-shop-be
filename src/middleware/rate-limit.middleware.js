@@ -107,6 +107,17 @@ export const contentWriteRateLimit = createRateLimit({
   message: "Too many submissions. Please slow down and try again shortly.",
 });
 
+/**
+ * The feedback form, which accepts guests: the one unauthenticated write besides
+ * contact, so it gets its own, tighter budget rather than sharing content-write's.
+ */
+export const feedbackRateLimit = createRateLimit({
+  name: "feedback",
+  windowMs: 10 * MINUTE,
+  max: 5,
+  message: "You have sent a lot of feedback in a short time. Please try again in a few minutes.",
+});
+
 /** Read endpoints that hit the database on every keystroke. */
 export const searchRateLimit = createRateLimit({
   name: "search",

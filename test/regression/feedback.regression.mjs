@@ -130,6 +130,103 @@ try {
     ok("an unknown status is refused", !update({ status: "archived" }).success);
   }
 
+  section("5b — guests and the footer form");
+  {
+    const guest = await callController(controller.CreateFeedback, {
+      user: undefined,
+      body: {
+        category: "bug",
+        message: `${MARKER} the search box on mobile hides the first result behind the keyboard`,
+        name: "Ravi",
+        email: "Ravi@Example.com",
+        source: "footer",
+        pagePath: "/search?q=tagore",
+      },
+    });
+    const guestId = guest.body?.feedback?.id;
+    if (guestId) created.push(guestId);
+    ok("a guest can send feedback", guest.statusCode === 201, JSON.stringify(guest.body?.message));
+    const stored = await Feedback.findById(guestId).lean();
+    ok("it has no account", stored?.user === null);
+    ok("it keeps the guest's name and lower-cased email", stored?.guestName === "Ravi" && stored?.guestEmail === "ravi@example.com");
+    ok("it records the footer and the page", stored?.source === "footer" && stored?.pagePath === "/search?q=tagore");
+    ok(
+      "a missing subject is taken from the message's opening words",
+      stored?.subject.startsWith(`${MARKER} the search box`) && stored.subject.length <= 61,
+      stored?.subject,
+    );
+
+    const signedIn = await callController(controller.CreateFeedback, {
+      user: customer,
+      body: { category: "feedback", message: "Lovely packaging and quick delivery, thank you!", name: "Not Me", email: "spoof@example.com", source: "footer" },
+    });
+    if (signedIn.body?.feedback?.id) created.push(signedIn.body.feedback.id);
+    const signedInStored = await Feedback.findById(signedIn.body?.feedback?.id).lean();
+    ok(
+      "a signed-in customer's own account is used, not body-supplied guest details",
+      String(signedInStored?.user) === customer.id && signedInStored?.guestEmail === "" && signedInStored?.guestName === "",
+    );
+
+    const before = await Feedback.countDocuments();
+    const bot = await callController(controller.CreateFeedback, {
+      user: undefined,
+      body: { category: "other", message: "Buy cheap watches at an amazing price today", website: "http://spam.example" },
+    });
+    ok("a filled bot-trap field gets an ordinary-looking success", bot.statusCode === 201);
+    ok("but nothing is stored", (await Feedback.countDocuments()) === before);
+
+    const admin = { id: String(new mongoose.Types.ObjectId()), roles: ["admin"] };
+    const guestsOnly = await callController(controller.GetAdminFeedback, {
+      user: admin,
+      query: { from: "guest", search: MARKER },
+    });
+    const row = guestsOnly.body?.feedback?.[0];
+    ok("admins can filter to guest feedback", guestsOnly.body?.feedback?.length === 1);
+    ok("admins see the guest's details and page", row?.isGuest && row?.guestEmail === "ravi@example.com" && row?.pagePath === "/search?q=tagore");
+    ok(
+      "admin search also matches a guest's email",
+      (await callController(controller.GetAdminFeedback, { user: admin, query: { search: "ravi@example" } })).body?.feedback?.length >= 1,
+    );
+
+    const parse = (body) => createFeedbackSchema.body.safeParse({ category: "feedback", ...body });
+    const long = "This message is comfortably longer than twenty characters.";
+    ok("a 19-character message is refused", !parse({ message: "x".repeat(19) }).success);
+    ok("a 20-character message is accepted", parse({ message: "x".repeat(20) }).success);
+    ok("a bad guest email is refused", !parse({ message: long, email: "not-an-email" }).success);
+    ok("an empty guest email is fine", parse({ message: long, email: "" }).success);
+    ok("an off-site page URL is refused", !parse({ message: long, pagePath: "https://evil.example/x" }).success);
+    ok("a protocol-relative page URL is refused", !parse({ message: long, pagePath: "//evil.example/x" }).success);
+    ok("an unknown source is refused", !parse({ message: long, source: "api" }).success);
+  }
+
+  section("5c — the real route: optional login");
+  {
+    const express = (await import("express")).default;
+    const routes = (await import("../../src/modules/feedback/feedback.routes.js")).default;
+    const app = express();
+    app.use(express.json());
+    app.use("/feedback", routes);
+    const server = app.listen(0);
+    const base = `http://127.0.0.1:${server.address().port}/feedback`;
+    const post = (body, headers = {}) =>
+      fetch(base, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+    try {
+      const guestRes = await post({ category: "suggestion", message: `${MARKER} please add a gift-card option at checkout` });
+      const guestBody = await guestRes.json();
+      if (guestBody?.feedback?.id) created.push(guestBody.feedback.id);
+      ok("a guest with no token is accepted over HTTP", guestRes.status === 201, String(guestRes.status));
+      const badToken = await post(
+        { category: "suggestion", message: "This should never be stored at all, ever." },
+        { Authorization: "Bearer not-a-real-token" },
+      );
+      ok("a forged or expired token is refused, not treated as a guest", badToken.status === 401, String(badToken.status));
+      const short = await post({ category: "suggestion", message: "too short" });
+      ok("a short message is refused by validation (400)", short.status === 400, String(short.status));
+    } finally {
+      server.close();
+    }
+  }
+
   section("6 — deletion");
   {
     const response = await callController(controller.DeleteFeedback, {

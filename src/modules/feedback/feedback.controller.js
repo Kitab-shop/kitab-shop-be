@@ -10,6 +10,7 @@ const formatFeedback = (doc, { includeInternal = false } = {}) => ({
   id: doc._id,
   userId: doc.user?._id || doc.user || "",
   userEmail: doc.userEmail || doc.user?.email || "",
+  isGuest: !doc.user,
   category: doc.category,
   rating: doc.rating ?? null,
   subject: doc.subject,
@@ -26,6 +27,10 @@ const formatFeedback = (doc, { includeInternal = false } = {}) => ({
     : null,
   ...(includeInternal
     ? {
+        guestName: doc.guestName || "",
+        guestEmail: doc.guestEmail || "",
+        source: doc.source || "account",
+        pagePath: doc.pagePath || "",
         internalNote: doc.internalNote || "",
         reviewedBy: doc.reviewedBy?.email || doc.reviewedBy || "",
         reviewedAt: doc.reviewedAt,
@@ -35,21 +40,47 @@ const formatFeedback = (doc, { includeInternal = false } = {}) => ({
   updatedAt: doc.updatedAt,
 });
 
+// A title for the admin list when the form did not ask for one: the message's
+// opening words, cut at a word boundary.
+const subjectFromMessage = (message) => {
+  const flat = String(message).replace(/\s+/g, " ").trim();
+  if (flat.length <= 60) return flat;
+  const cut = flat.slice(0, 60);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${(lastSpace > 30 ? cut.slice(0, lastSpace) : cut).trim()}…`;
+};
+
 export const CreateFeedback = async (req, res) => {
   try {
-    const account = await UserModel.findById(req.user.id).select("email").lean();
+    const thanks = "Thank you — your feedback has been sent.";
+
+    // Bot trap: a hidden field a person never fills. Answered like a success so a
+    // script learns nothing, and nothing is stored.
+    if (req.body.website) {
+      return res.status(201).json({ success: true, message: thanks });
+    }
+
+    // req.user exists only when optionalTokenVerify verified a token; a guest's
+    // identity can never come from the body.
+    const userId = req.user?.id || null;
+    const account = userId ? await UserModel.findById(userId).select("email").lean() : null;
+
     const feedback = await Feedback.create({
-      user: req.user.id,
+      user: userId,
       userEmail: account?.email || "",
+      guestName: userId ? "" : req.body.name || "",
+      guestEmail: userId ? "" : String(req.body.email || "").toLowerCase(),
+      source: req.body.source || (userId ? "account" : "footer"),
+      pagePath: req.body.pagePath || "",
       category: req.body.category,
       rating: req.body.rating ?? null,
-      subject: req.body.subject,
+      subject: req.body.subject || subjectFromMessage(req.body.message),
       message: req.body.message,
     });
 
     return res.status(201).json({
       success: true,
-      message: "Thank you — your feedback has been sent.",
+      message: thanks,
       feedback: formatFeedback(feedback.toObject()),
     });
   } catch (error) {
@@ -83,9 +114,17 @@ export const GetAdminFeedback = async (req, res) => {
 
     if (FEEDBACK_STATUSES.includes(status)) filter.status = status;
     if (FEEDBACK_CATEGORIES.includes(category)) filter.category = category;
+    if (req.query.from === "guest") filter.user = null;
+    if (req.query.from === "customer") filter.user = { $ne: null };
     if (search) {
       const pattern = { $regex: escapeRegex(search), $options: "i" };
-      filter.$or = [{ subject: pattern }, { message: pattern }, { userEmail: pattern }];
+      filter.$or = [
+        { subject: pattern },
+        { message: pattern },
+        { userEmail: pattern },
+        { guestEmail: pattern },
+        { guestName: pattern },
+      ];
     }
 
     const [total, statusCounts, items] = await Promise.all([
