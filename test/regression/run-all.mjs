@@ -72,6 +72,7 @@ const suites = [
   "order-emails.regression.mjs",
   "manual-confirmation.regression.mjs",
   "feedback.regression.mjs",
+  "footer-contact-migration.regression.mjs",
 ];
 
 const run = (file) =>

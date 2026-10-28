@@ -32,6 +32,7 @@ import themeRoutes from "./modules/theme/theme.routes.js";
 import contactRoutes from "./modules/contact/contact.routes.js";
 import { router as feedbackRoutes } from "./modules/feedback/index.js";
 import footerRoutes from "./modules/footer/footer.routes.js";
+import { migrateLegacyFooterContact } from "./modules/footer/footer-contact-migration.js";
 import aboutPageRoutes from "./modules/about-page/aboutPage.routes.js";
 import { router as cmsRoutes } from "./modules/cms/index.js";
 import festivalRoutes from "./modules/festival/festival.routes.js";
@@ -57,6 +58,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(__dirname, "../.env") });
 
 await db();
+// The footer record still held the old Kitab Shop contact block, which the site and
+// every bill of supply read. Replaces only fields still holding those old values.
+await migrateLegacyFooterContact();
 await ensureUploadDirs();
 startStockReservationCleanup();
 // Courier safety net: re-reads tracking the webhook went quiet on and retries courier

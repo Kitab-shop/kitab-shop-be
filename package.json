@@ -84,7 +84,8 @@
     "test:coupon-global-cap": "node test/regression/coupon-global-cap.regression.mjs",
     "test:variant-pricing": "node test/regression/variant-pricing.regression.mjs",
     "test:manual-confirmation": "node test/regression/manual-confirmation.regression.mjs",
-    "test:feedback": "node test/regression/feedback.regression.mjs"
+    "test:feedback": "node test/regression/feedback.regression.mjs",
+    "test:footer-contact-migration": "node test/regression/footer-contact-migration.regression.mjs"
   },
   "keywords": [],
   "author": "",
