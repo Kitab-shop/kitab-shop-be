@@ -13,10 +13,11 @@ import { bulkConfirmOrders } from "./order-confirmation.service.js";
  */
 export const BulkConfirmOrders = async (req, res) => {
   try {
-    const { scope, orderIds, filters = {} } = req.body;
+    const { scope, orderIds, filters = {}, listedAt } = req.body;
     const result = await bulkConfirmOrders({
       orderIds: scope === "selected" ? orderIds : undefined,
       filters,
+      listedAt,
       actorId: req.user?.id || null,
     });
 

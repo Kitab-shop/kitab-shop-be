@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createRateLimit } from "../../src/middleware/rate-limit.middleware.js";
+import { clientKeyForIp, createRateLimit } from "../../src/middleware/rate-limit.middleware.js";
 
 const callLimiter = async (limiter, ip = "1.2.3.4", path = "/login") => {
   let nextCalled = false;
@@ -128,4 +128,22 @@ test("RateLimit-Remaining counts down and floors at zero", async () => {
 
   const third = await callLimiter(limiter, "10.0.0.5");
   assert.equal(third.headers["RateLimit-Remaining"], 0, "never goes negative");
+});
+
+test("an IPv6 client is limited per /64, so rotating addresses inside it does not help", async () => {
+  assert.equal(clientKeyForIp("2401:4900:1c5a:9e2b:aaaa:bbbb:cccc:dddd"), "2401:4900:1c5a:9e2b::/64");
+  assert.equal(clientKeyForIp("2401:4900:1c5a:9e2b::1"), "2401:4900:1c5a:9e2b::/64");
+  assert.notEqual(clientKeyForIp("2401:4900:1c5a:9e2c::1"), clientKeyForIp("2401:4900:1c5a:9e2b::1"));
+
+  const limiter = createRateLimit({ name: `ipv6-${Date.now()}`, windowMs: 60_000, max: 2 });
+  await callLimiter(limiter, "2401:db8:1:2::a");
+  await callLimiter(limiter, "2401:db8:1:2::b");
+  const third = await callLimiter(limiter, "2401:db8:1:2:ffff::c");
+  assert.equal(third.statusCode, 429);
+});
+
+test("IPv4 and IPv4-mapped addresses keep their exact address as the key", () => {
+  assert.equal(clientKeyForIp("49.36.1.2"), "49.36.1.2");
+  assert.equal(clientKeyForIp("::ffff:49.36.1.2"), "49.36.1.2");
+  assert.equal(clientKeyForIp(""), "unknown");
 });

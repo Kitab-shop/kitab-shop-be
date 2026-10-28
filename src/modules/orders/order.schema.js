@@ -178,8 +178,16 @@ export const bulkConfirmOrdersSchema = {
       from: isoDate("From"),
       to: isoDate("To"),
     }).optional(),
-  }).refine((body) => body.scope !== "selected" || (body.orderIds?.length ?? 0) > 0, {
-    message: "Select at least one order to confirm",
-    path: ["orderIds"],
-  }),
+    // When the admin's list was loaded (GetAllOrders' listedAt). "Confirm all
+    // matching" reaches only orders placed by then — the ones they could see.
+    listedAt: z.iso.datetime({ offset: true, error: "listedAt must be a timestamp" }).optional(),
+  })
+    .refine((body) => body.scope !== "selected" || (body.orderIds?.length ?? 0) > 0, {
+      message: "Select at least one order to confirm",
+      path: ["orderIds"],
+    })
+    .refine((body) => body.scope !== "filtered" || Boolean(body.listedAt), {
+      message: "Reload the order list and try again",
+      path: ["listedAt"],
+    }),
 };

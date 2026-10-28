@@ -140,7 +140,7 @@ try {
         name: "Ravi",
         email: "Ravi@Example.com",
         source: "footer",
-        pagePath: "/search?q=tagore",
+        pagePath: "/search/tagore",
       },
     });
     const guestId = guest.body?.feedback?.id;
@@ -149,7 +149,7 @@ try {
     const stored = await Feedback.findById(guestId).lean();
     ok("it has no account", stored?.user === null);
     ok("it keeps the guest's name and lower-cased email", stored?.guestName === "Ravi" && stored?.guestEmail === "ravi@example.com");
-    ok("it records the footer and the page", stored?.source === "footer" && stored?.pagePath === "/search?q=tagore");
+    ok("it records the footer and the page", stored?.source === "footer" && stored?.pagePath === "/search/tagore");
     ok(
       "a missing subject is taken from the message's opening words",
       stored?.subject.startsWith(`${MARKER} the search box`) && stored.subject.length <= 61,
@@ -182,7 +182,7 @@ try {
     });
     const row = guestsOnly.body?.feedback?.[0];
     ok("admins can filter to guest feedback", guestsOnly.body?.feedback?.length === 1);
-    ok("admins see the guest's details and page", row?.isGuest && row?.guestEmail === "ravi@example.com" && row?.pagePath === "/search?q=tagore");
+    ok("admins see the guest's details and page", row?.isGuest && row?.guestEmail === "ravi@example.com" && row?.pagePath === "/search/tagore");
     ok(
       "admin search also matches a guest's email",
       (await callController(controller.GetAdminFeedback, { user: admin, query: { search: "ravi@example" } })).body?.feedback?.length >= 1,
@@ -197,6 +197,12 @@ try {
     ok("an off-site page URL is refused", !parse({ message: long, pagePath: "https://evil.example/x" }).success);
     ok("a protocol-relative page URL is refused", !parse({ message: long, pagePath: "//evil.example/x" }).success);
     ok("an unknown source is refused", !parse({ message: long, source: "api" }).success);
+    // Each of these resolves OFF-SITE when rendered as an href on the admin page.
+    ok("a backslash-host page path is refused", !parse({ message: long, pagePath: "/\\evil.example/login" }).success);
+    ok("a tab-host page path is refused", !parse({ message: long, pagePath: "/\t/evil.example" }).success);
+    ok("a page path with a query string is refused (reset tokens live there)", !parse({ message: long, pagePath: "/reset-password?token=abc" }).success);
+    ok("a plain on-site page path is accepted", parse({ message: long, pagePath: "/product/abc-123" }).success);
+    ok("an email carrying mailto parameters is refused", !parse({ message: long, email: "a@b.co?cc=x%40evil.com" }).success);
   }
 
   section("5c — the real route: optional login");

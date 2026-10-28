@@ -374,10 +374,10 @@ try {
     const preview = await countConfirmableOrders(filters);
     ok("the confirmable count for the filters is 3", preview === 3, String(preview));
 
-    const wrongStatus = await bulk({ scope: "filtered", filters: { ...filters, status: "Confirmed" } });
+    const wrongStatus = await bulk({ scope: "filtered", filters: { ...filters, status: "Confirmed" }, listedAt: new Date().toISOString() });
     ok("a status filter that excludes Pending confirms nothing", wrongStatus.body?.confirmedCount === 0, JSON.stringify(wrongStatus.body));
 
-    const response = await bulk({ scope: "filtered", filters });
+    const response = await bulk({ scope: "filtered", filters, listedAt: new Date().toISOString() });
     ok("all 3 confirmable orders in range are confirmed", response.body?.confirmedCount === 3, JSON.stringify(response.body));
     ok("nothing is left matching", response.body?.remaining === 0, String(response.body?.remaining));
     const states = await OrderModel.find({ _id: { $in: inRange.map((o) => o._id) } }).select("orderStatus").lean();
@@ -404,7 +404,7 @@ try {
       scope: "selected",
       orderIds: Array.from({ length: 501 }, () => String(new mongoose.Types.ObjectId())),
     }).success);
-    ok("a well-formed filtered request is accepted", parse({ scope: "filtered", filters: { status: "Pending", from: "2001-01-01", to: "" } }).success);
+    ok("a well-formed filtered request is accepted", parse({ scope: "filtered", filters: { status: "Pending", from: "2001-01-01", to: "" }, listedAt: new Date().toISOString() }).success);
     ok("an impossible calendar date is refused", !parse({ scope: "filtered", filters: { from: "2026-13-45" } }).success);
     ok("a status sent as an operator object is refused", !parse({ scope: "filtered", filters: { status: { $ne: "Cancelled" } } }).success);
 
@@ -413,7 +413,7 @@ try {
       query: { from: "2026-13-45" },
     });
     ok("the order list answers an impossible date with 400, not 500", listBadDate.statusCode === 400, String(listBadDate.statusCode));
-    const bulkBadDate = await bulk({ scope: "filtered", filters: { from: "2026-13-45" } });
+    const bulkBadDate = await bulk({ scope: "filtered", filters: { from: "2026-13-45" }, listedAt: new Date().toISOString() });
     ok("bulk confirm refuses it too, confirming nothing", bulkBadDate.statusCode === 400, String(bulkBadDate.statusCode));
   }
 
@@ -441,6 +441,62 @@ try {
       JSON.stringify(after.refunds),
     );
     ok("its stock is returned", stockAfter === stockBefore + 1, `${stockBefore} → ${stockAfter}`);
+  }
+  section("9 — confirm-all reaches only orders the admin could see");
+  {
+    const day = (d) => new Date(`2001-02-0${d}T12:00:00`);
+    const seen = await makeOrder({ createdAt: day(2) });
+    const listedAt = new Date("2001-02-03T00:00:00Z").toISOString();
+    const placedAfter = await makeOrder({ createdAt: day(4) });
+    const filters = { status: "Pending", from: "2001-02-01", to: "2001-02-07" };
+
+    const response = await bulk({ scope: "filtered", filters, listedAt });
+    ok("only the order listed before listedAt is confirmed", response.body?.confirmedCount === 1, JSON.stringify(response.body));
+    ok("it is the one the admin saw", (await OrderModel.findById(seen._id).lean()).orderStatus === "Confirmed");
+    ok(
+      "an order placed after the list loaded stays Pending",
+      (await OrderModel.findById(placedAfter._id).lean()).orderStatus === "Pending",
+    );
+
+    ok(
+      "the schema refuses a filtered confirm with no listedAt",
+      !bulkConfirmOrdersSchema.body.safeParse({ scope: "filtered", filters }).success,
+    );
+    const noListedAt = await bulk({ scope: "filtered", filters });
+    ok("and so does the service, with a 400 rather than a crash", noListedAt.statusCode === 400, String(noListedAt.statusCode));
+
+    const list = await callController(orderController.GetAllOrders, { user: admin(), query: { status: "Pending" } });
+    ok("the order list returns listedAt for the client to send back", !Number.isNaN(Date.parse(list.body?.listedAt)));
+  }
+
+  section("10 — no shipment can be recorded before the order is confirmed");
+  {
+    const { RecordManualShipment } = await import("../../src/modules/shipping/manual-shipment.controller.js");
+    const record = (order) =>
+      callController(RecordManualShipment, {
+        params: { orderId: String(order._id) },
+        body: { carrierName: "Fixture Courier", trackingNumber: `TRK-${MARKER}-${(seq += 1)}` },
+        user: admin(),
+      });
+
+    for (const [label, fields] of [
+      ["a Pending COD order", {}],
+      ["a Pending order that is already paid", { paymentMethod: "RAZORPAY", paymentStatus: "Paid" }],
+    ]) {
+      const order = await makeOrder(fields);
+      const response = await record(order);
+      const after = await OrderModel.findById(order._id).lean();
+      ok(
+        `${label} is refused (ORDER_NOT_CONFIRMED)`,
+        response.statusCode === 409 && response.body?.code === "ORDER_NOT_CONFIRMED",
+        `${response.statusCode} ${response.body?.code}`,
+      );
+      ok(`${label} gets no tracking number`, !after.shipment?.trackingNumber);
+    }
+
+    const confirmed = await makeOrder({ orderStatus: "Confirmed" });
+    const allowed = await record(confirmed);
+    ok("a Confirmed order can still be recorded as shipped", allowed.statusCode === 200, `${allowed.statusCode} ${allowed.body?.message}`);
   }
 } finally {
   setManual(false);

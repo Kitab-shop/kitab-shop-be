@@ -482,6 +482,9 @@ export const GetAllOrders = async (req, res) => {
   try {
     // Hidden by default so counts and totals on this screen mean what they say.
     // `?includeAwaitingPayment=true` opts in, for diagnosing a stuck checkout.
+    // Taken before the queries, so every order this response can show was placed
+    // by then. "Confirm all matching" sends it back to bound what it may reach.
+    const listedAt = new Date().toISOString();
     const includeAwaitingPayment = String(req.query.includeAwaitingPayment) === "true";
     const listFilters = { status: req.query.status, from: req.query.from, to: req.query.to };
     const filter = buildAdminOrderFilter(listFilters, { includeAwaitingPayment });
@@ -507,6 +510,7 @@ export const GetAllOrders = async (req, res) => {
       total,
       returned: orders.length,
       confirmableTotal,
+      listedAt,
       manualConfirmation: isManualOrderConfirmationEnabled(),
       orders,
     });

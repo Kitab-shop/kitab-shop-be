@@ -1,6 +1,14 @@
 import Feedback, { FEEDBACK_CATEGORIES, FEEDBACK_STATUSES } from "./Feedback.model.js";
 import UserModel from "../../model/User.model.js";
 import { createAuditLog } from "../audit/audit-log.js";
+import { logLifecycleError } from "../../utils/lifecycle-logger.service.js";
+
+// Driver and validation text stays in the server log; the caller — possibly an
+// anonymous visitor — gets a fixed message.
+const serverError = (res, error, action) => {
+  logLifecycleError("feedback", action, error);
+  return res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
+};
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -84,7 +92,7 @@ export const CreateFeedback = async (req, res) => {
       feedback: formatFeedback(feedback.toObject()),
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return serverError(res, error, "create_failed");
   }
 };
 
@@ -99,7 +107,7 @@ export const GetMyFeedback = async (req, res) => {
       feedback: items.map((item) => formatFeedback(item)),
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return serverError(res, error, "list_mine_failed");
   }
 };
 
@@ -152,7 +160,7 @@ export const GetAdminFeedback = async (req, res) => {
       feedback: items.map((item) => formatFeedback(item, { includeInternal: true })),
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return serverError(res, error, "admin_list_failed");
   }
 };
 
@@ -208,7 +216,7 @@ export const UpdateFeedback = async (req, res) => {
       feedback: formatFeedback(updated, { includeInternal: true }),
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return serverError(res, error, "update_failed");
   }
 };
 
@@ -229,6 +237,6 @@ export const DeleteFeedback = async (req, res) => {
     }).catch(() => null);
     return res.status(200).json({ success: true, message: "Feedback deleted.", id: removed._id });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return serverError(res, error, "delete_failed");
   }
 };

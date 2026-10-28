@@ -30,19 +30,27 @@ export const createFeedbackSchema = {
     message: boundedString({ label: "Message", min: FEEDBACK_MESSAGE_MIN, max: FEEDBACK_MESSAGE_MAX }),
     // Guest contact details. Ignored for a signed-in customer, whose account is used.
     name: optionalText(120, "Name must be 120 characters or fewer"),
+    // Strict on purpose: the address is rendered into a mailto: link on the admin
+    // page, where "?", "&" or "%" would smuggle in extra cc/body parameters.
     email: z
       .string()
       .trim()
       .max(254, "Email is too long")
-      .refine((value) => value === "" || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value), "Enter a valid email address")
+      .refine(
+        (value) => value === "" || /^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/.test(value),
+        "Enter a valid email address",
+      )
       .optional(),
     source: z.enum(FEEDBACK_SOURCES).optional(),
-    // A storefront path only ("/product/x"), so no off-site URL is ever stored.
+    // A storefront PATH only ("/product/x"): rendered as a link on the admin page,
+    // so it must never resolve off-site. "//host", "/\\host" and "/<tab>/host" all
+    // did with a startsWith("/") check. No query string either — a reset-password
+    // or verify-email link carries its token there.
     pagePath: z
       .string()
       .trim()
       .max(300)
-      .refine((value) => value === "" || (value.startsWith("/") && !value.startsWith("//")), "Invalid page")
+      .refine((value) => value === "" || /^\/(?![/\\])[A-Za-z0-9\-._~%/]*$/.test(value), "Invalid page")
       .optional(),
     // Bot trap: a visually hidden field people never fill. Checked in the controller,
     // which answers a filled one with a normal-looking success and stores nothing.

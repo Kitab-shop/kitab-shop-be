@@ -1,5 +1,6 @@
 import { isAuthSecurityEnabled, isRateLimitEnabled } from "../config/features.config.js";
 import { incrementRateLimit } from "../utils/redis-rate-limit.service.js";
+import { isIPv6 } from "node:net";
 
 const buckets = new Map();
 
@@ -7,8 +8,27 @@ const buckets = new Map();
 // running process with many distinct client keys does not leak indefinitely.
 const MEMORY_BUCKET_SWEEP_THRESHOLD = 5000;
 
+// An IPv6 subscriber is normally given a whole /64, so keying by the full address
+// let one client rotate through 2^64 of them and never hit a limit. Keyed by the
+// /64 instead; IPv4 (including IPv4-mapped "::ffff:1.2.3.4") is unchanged.
+const ipv6Prefix64 = (ip) => {
+  const [head, tail = ""] = ip.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = ip.includes("::")
+    ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right]
+    : left;
+  return `${groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, "")).join(":")}::/64`;
+};
+
+export const clientKeyForIp = (ip) => {
+  if (!ip) return "unknown";
+  if (/^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(ip)) return ip.slice(7);
+  return isIPv6(ip) ? ipv6Prefix64(ip) : ip;
+};
+
 const getClientKey = (req) =>
-  req.ip || req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown";
+  clientKeyForIp(req.ip || req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "");
 
 const sweepExpiredMemoryBuckets = (now) => {
   for (const [key, bucket] of buckets) {

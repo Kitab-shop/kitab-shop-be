@@ -133,10 +133,10 @@ const itemsTable = (order) => {
     .map((item) => {
       // `author` is snapshotted onto the line at placement, so this renders what
       // was sold even if the book is later renamed or re-attributed.
-      const byline = item.author ? `<br><span style="color:#888;font-size:13px;">${item.author}</span>` : "";
+      const byline = item.author ? `<br><span style="color:#888;font-size:13px;">${esc(item.author)}</span>` : "";
       return `
       <tr>
-        <td style="padding:8px 0;border-bottom:1px solid #eee;font-size:14px;">${item.name || "Item"}${byline}</td>
+        <td style="padding:8px 0;border-bottom:1px solid #eee;font-size:14px;">${esc(item.name || "Item")}${byline}</td>
         <td style="padding:8px 0;border-bottom:1px solid #eee;font-size:14px;text-align:center;">${item.quantity || 1}</td>
         <td style="padding:8px 0;border-bottom:1px solid #eee;font-size:14px;text-align:right;">${money((item.price || 0) * (item.quantity || 1))}</td>
       </tr>`;

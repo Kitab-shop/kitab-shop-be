@@ -87,6 +87,21 @@ export const RecordManualShipment = async (req, res) => {
       });
     }
 
+    // Not before the order is confirmed (checked after the unpaid case above, whose
+    // reason is the more specific one). Under ORDER_MANUAL_CONFIRMATION_ENABLED a
+    // Pending order can be COD or already paid, and Pending → Shipped is not a legal
+    // move — so the tracking number used to land while the order stayed Pending: the
+    // customer could still cancel it (and be refunded) with the parcel already out,
+    // and confirming it later would book a second, Shiprocket, parcel on top.
+    if (order.orderStatus === "Pending") {
+      return res.status(409).json({
+        success: false,
+        message: "Confirm this order before recording a shipment for it.",
+        code: "ORDER_NOT_CONFIRMED",
+        currentStatus: order.orderStatus,
+      });
+    }
+
     // A live Shiprocket shipment is not something this endpoint may relabel. The
     // courier identifiers behind it — orderId, shipmentId, and whatever the webhook
     // resolves against — remain real, so calling the parcel MANUAL would describe

@@ -185,14 +185,21 @@ export const BULK_CONFIRM_LIMIT = 500;
  *
  * @returns {Promise<{confirmed: Array<{orderId: string}>, skipped: Array<{orderId: string, code: string, message: string}>, remaining: number}>}
  */
-export const bulkConfirmOrders = async ({ orderIds, filters, actorId = null }) => {
+export const bulkConfirmOrders = async ({ orderIds, filters, listedAt, actorId = null }) => {
   let ids;
   let filterMatch = null;
 
   if (Array.isArray(orderIds)) {
     ids = [...new Set(orderIds.map(String))].slice(0, BULK_CONFIRM_LIMIT);
   } else {
-    filterMatch = { $and: [buildAdminOrderFilter(filters), CONFIRMABLE_ORDER_MATCH] };
+    // Only orders placed before the admin's list was loaded. Without this bound the
+    // filter was re-run at click time, so every order placed in between — which the
+    // admin never saw — was approved and pushed to the courier too, defeating the
+    // review this flag exists for.
+    const listedBefore = parseFilterDate(listedAt, "listedAt");
+    filterMatch = {
+      $and: [buildAdminOrderFilter(filters), CONFIRMABLE_ORDER_MATCH, { createdAt: { $lte: listedBefore } }],
+    };
     const rows = await OrderModel.find(filterMatch)
       .select("_id")
       .sort({ createdAt: 1 })
